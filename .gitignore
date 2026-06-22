@@ -3,3 +3,6 @@ Cargo.lock
 .DS_Store
 .vscode
 tmp
+linalg/bench_results/
+*.thc
+*.thc*.part

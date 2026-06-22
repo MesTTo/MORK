@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-use std::{hint::black_box, mem, ptr, time::Instant};
+use std::{hint::black_box, ptr, time::Instant};
 #[allow(unused_imports)]
 use pathmap::ring::Lattice;
 use mork_interning::*;
@@ -18,9 +18,9 @@ use pathmap::PathMap;
 struct IdentityDataParser { count: u64 }
 
 impl Parser for IdentityDataParser {
-    fn tokenizer<'r>(&mut self, s: &[u8]) -> &'r [u8] {
+    fn tokenizer<'r>(&'r mut self, s: &'r [u8]) -> &'r [u8] {
         self.count += 1;
-        return unsafe { std::mem::transmute(s) };
+        return s;
     }
 }
 
@@ -93,7 +93,7 @@ Involuntary context switches: 4513
 struct SequentialDataParser {
     count: u64,
     symbols: PathMap<u64>,
-    strings: PathMap<&'static [u8]>,
+    strings: PathMap<Vec<u8>>,
 }
 
 impl SequentialDataParser {
@@ -109,7 +109,7 @@ impl SequentialDataParser {
 }
 
 impl Parser for SequentialDataParser {
-    fn tokenizer<'r>(&mut self, s: &[u8]) -> &'r [u8] {
+    fn tokenizer<'r>(&'r mut self, s: &'r [u8]) -> &'r [u8] {
         if s.len() == 0 { return Self::EMPTY }
         let mut z = self.symbols.write_zipper_at_path(s);
         let r = z.get_value_or_insert_with(|| {
@@ -119,7 +119,7 @@ impl Parser for SequentialDataParser {
         let bs = (8 - r.trailing_zeros()/8) as usize;
         let l = bs.max(1);
         let interned: &[u8] = unsafe { std::slice::from_raw_parts_mut((r as *mut u64 as *mut u8).byte_offset((8 - l) as isize), l) };
-        self.strings.insert(interned, unsafe { mem::transmute(s) });
+        self.strings.insert(interned, s.to_vec());
         interned
     }
 }
@@ -189,9 +189,9 @@ unsafe impl Send for PromiseSafe {}
 struct IdentityDataParser { count: u64 }
 
 impl Parser for IdentityDataParser {
-    fn tokenizer<'r>(&mut self, s: &[u8]) -> &'r [u8] {
+    fn tokenizer<'r>(&'r mut self, s: &'r [u8]) -> &'r [u8] {
         self.count += 1;
-        return unsafe { std::mem::transmute(s) };
+        return s;
     }
 }
 
@@ -299,11 +299,10 @@ unsafe impl Send for PromiseSafe {}
 struct ParDataParser<'a> { count: u64, buf: [u8; 8], write_permit: WritePermit<'a> }
 
 impl <'a> Parser for ParDataParser<'a> {
-    fn tokenizer<'r>(&mut self, s: &[u8]) -> &'r [u8] {
+    fn tokenizer<'r>(&'r mut self, s: &'r [u8]) -> &'r [u8] {
         self.count += 1;
-        // FIXME hack until either the parser is rewritten or we can take a pointer of the symbol
         self.buf = self.write_permit.get_sym_or_insert(s);
-        return unsafe { std::mem::transmute(&self.buf[..]) };
+        return &self.buf[..];
     }
 }
 
@@ -414,11 +413,10 @@ unsafe impl Send for PromiseSafe {}
 struct ParDataParser<'a> { count: u64, buf: [u8; 8], write_permit: naive_map::WritePermit<'a> }
 
 impl <'a> Parser for ParDataParser<'a> {
-    fn tokenizer<'r>(&mut self, s: &[u8]) -> &'r [u8] {
+    fn tokenizer<'r>(&'r mut self, s: &'r [u8]) -> &'r [u8] {
         self.count += 1;
-        // FIXME hack until either the parser is rewritten or we can take a pointer of the symbol
         self.buf = (self.write_permit.get_sym_or_insert(s) as u64).to_be_bytes();
-        return unsafe { std::mem::transmute(&self.buf[..]) };
+        return &self.buf[..];
     }
 }
 

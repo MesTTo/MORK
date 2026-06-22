@@ -1,6 +1,4 @@
-use tracking_allocator::{
-    AllocationGroupId, AllocationGroupToken, AllocationTracker, Allocator,
-};
+use tracking_allocator::{AllocationGroupId, AllocationTracker, Allocator};
 
 use std::alloc::System;
 

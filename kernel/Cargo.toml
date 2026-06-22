@@ -9,6 +9,7 @@ eval-ffi = { workspace=true }
 mork-frontend = { workspace=true }
 mork-expr = { workspace=true }
 mork-interning = { workspace = true }
+linalg = { workspace = true, optional = true, features = ["jit"] }
 pathmap = { workspace = true, features = ["nightly"] }
 log = { workspace=true }
 env_logger = { workspace=true }
@@ -28,12 +29,25 @@ hex = "0.4.3"
 subprocess = { version = "0.2.13" }
 
 [features]
-default = ["grounding", "specialize_io"]
+default = ["grounding", "specialize_io", "einsum", "sidecar_bridge_emit"]
 neo4j = ["dep:neo4rs", "dep:tokio"]
 interning = []
 wasm = ["dep:wasmtime"]
+einsum = ["dep:linalg"]
+einsum_blas = ["einsum", "linalg/blas"]
 z3 = []
 no_search = []
 grounding = []
 specialize_io = []
 periodic_merkleize = []
+inline_unify_stack = []
+nightly = []
+experimental_dnf = ["pathmap/zipper_alg"]
+sidecar_bridge = []
+sidecar_bridge_emit = []
+semi_naive_fixpoint = []
+
+[[test]]
+name = "einsum_sink"
+path = "tests/einsum_sink.rs"
+required-features = ["einsum"]

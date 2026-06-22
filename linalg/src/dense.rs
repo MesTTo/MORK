@@ -33,8 +33,15 @@ impl<T: Default + Clone> Dense<T> {
     /// For a 0-dimensional (scalar) tensor, pass `vec![]` — the storage
     /// holds a single element accessed via `&[]`.
     pub fn zeros(shape: Vec<usize>) -> Self {
-        let n: usize = if shape.is_empty() { 1 } else { shape.iter().product() };
-        Self { data: vec![T::default(); n], shape }
+        let n: usize = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
+        Self {
+            data: vec![T::default(); n],
+            shape,
+        }
     }
 }
 

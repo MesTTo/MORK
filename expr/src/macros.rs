@@ -1,6 +1,5 @@
-use ::core::convert::TryFrom;
-use std::ptr::slice_from_raw_parts;
 use crate::{Expr, Tag, byte_item, item_byte};
+use std::ptr::slice_from_raw_parts;
 
 /// A macro to destructure a mork-bytestring expression into its components.
 ///
@@ -31,14 +30,13 @@ macro_rules! destruct {
         $crate::destruct!($expr, { $var: $ty } , _length => $good, $err => $bad);
     };
     ($expr:expr, { $var:ident : $ty:ty }, $length:ident => $good:expr, $err:ident => $bad:expr) => {
-        use $crate::macros::{DeserializableExpr};
         let expr = Expr { ptr: $expr.ptr };
-        if !<$ty as DeserializableExpr>::check(expr) {
+        if !<$ty as $crate::macros::DeserializableExpr>::check(expr) {
             let $err: String = format!("expression did not match expected type");
             $bad
         } else {
-            let $length = <$ty as DeserializableExpr>::advanced(expr);
-            let $var: $ty = <$ty as DeserializableExpr>::deserialize_unchecked(expr);
+            let $length = <$ty as $crate::macros::DeserializableExpr>::advanced(expr);
+            let $var: $ty = <$ty as $crate::macros::DeserializableExpr>::deserialize_unchecked(expr);
             $good
         }
     };
@@ -47,9 +45,7 @@ macro_rules! destruct {
     };
     ($expr:expr, ( $($pattern:tt)* ), $length:ident => $good:expr, $err:ident => $bad:expr) => {
         {
-            use ::core::convert::TryFrom;
-            use $crate::{Tag, Expr, byte_item, parse};
-            use $crate::macros::{DeserializableExpr};
+            use $crate::{Tag, Expr, byte_item};
             let mut length = 0;
             let rv = 'ret: loop {
                 unsafe {
@@ -155,8 +151,8 @@ macro_rules! destruct {
         //     break $label Err(format!("{rv:?} did not match expected variable $$"));
         // }
         let expr = Expr { ptr: $expr.ptr.add($offset) };
-        let $var = <$ty as DeserializableExpr>::deserialize_unchecked(expr);
-        $offset += <$ty as DeserializableExpr>::advanced(expr);
+        let $var = <$ty as $crate::macros::DeserializableExpr>::deserialize_unchecked(expr);
+        $offset += <$ty as $crate::macros::DeserializableExpr>::advanced(expr);
         $crate::destruct!(@chomp, $label, $expr, $offset, $( $rest )*);
     };
     // 4) If it sees nothing, the destructuring is complete.
@@ -164,7 +160,6 @@ macro_rules! destruct {
 
     };
 }
-
 
 pub trait DeserializableExpr {
     fn advanced(e: Expr) -> usize;
@@ -174,33 +169,54 @@ pub trait DeserializableExpr {
 
 impl DeserializableExpr for Expr {
     #[inline(always)]
-    fn advanced(e: Expr) -> usize { e.span().len() }
+    fn advanced(e: Expr) -> usize {
+        e.span().len()
+    }
     #[inline(always)]
-    fn check(e: Expr) -> bool { true }
+    fn check(_e: Expr) -> bool {
+        true
+    }
     #[inline(always)]
-    fn deserialize_unchecked(e: Expr) -> Self { e }
+    fn deserialize_unchecked(e: Expr) -> Self {
+        e
+    }
 }
 
 impl DeserializableExpr for &str {
     #[inline(always)]
     fn advanced(e: Expr) -> usize {
         unsafe {
-            let Tag::SymbolSize(arity) = byte_item(*e.ptr) else { panic!("wrong symbol for str") };
+            let Tag::SymbolSize(arity) = byte_item(*e.ptr) else {
+                panic!("wrong symbol for str")
+            };
             1usize + (arity as usize)
         }
     }
     #[inline(always)]
     fn check(e: Expr) -> bool {
         unsafe {
-            let Tag::SymbolSize(arity) = byte_item(*e.ptr) else { unreachable!() };
-            str::from_utf8(slice_from_raw_parts(e.ptr.add(1), arity as _).as_ref().unwrap()).is_ok()
+            let Tag::SymbolSize(arity) = byte_item(*e.ptr) else {
+                unreachable!()
+            };
+            str::from_utf8(
+                slice_from_raw_parts(e.ptr.add(1), arity as _)
+                    .as_ref()
+                    .unwrap(),
+            )
+            .is_ok()
         }
     }
     #[inline(always)]
     fn deserialize_unchecked(e: Expr) -> Self {
         unsafe {
-            let Tag::SymbolSize(arity) = byte_item(*e.ptr) else { unreachable!() };
-            str::from_utf8_unchecked(slice_from_raw_parts(e.ptr.add(1), arity as _).as_ref().unwrap())
+            let Tag::SymbolSize(arity) = byte_item(*e.ptr) else {
+                unreachable!()
+            };
+            str::from_utf8_unchecked(
+                slice_from_raw_parts(e.ptr.add(1), arity as _)
+                    .as_ref()
+                    .unwrap(),
+            )
         }
     }
 }
@@ -209,21 +225,37 @@ macro_rules! impl_deserializable {
     (be $t:ty) => {
         impl DeserializableExpr for $t {
             #[inline(always)]
-            fn advanced(e: Expr) -> usize { 1 + core::mem::size_of::<Self>() }
+            fn advanced(_e: Expr) -> usize {
+                1 + core::mem::size_of::<Self>()
+            }
             #[inline(always)]
-            fn check(e: Expr) -> bool { unsafe { *e.ptr == item_byte(Tag::SymbolSize(core::mem::size_of::<Self>() as _)) } }
+            fn check(e: Expr) -> bool {
+                unsafe { *e.ptr == item_byte(Tag::SymbolSize(core::mem::size_of::<Self>() as _)) }
+            }
             #[inline(always)]
-            fn deserialize_unchecked(e: Expr) -> Self { unsafe { std::ptr::read_unaligned(e.ptr.add(1) as *const Self).swap_bytes() } }
+            fn deserialize_unchecked(e: Expr) -> Self {
+                unsafe { std::ptr::read_unaligned(e.ptr.add(1) as *const Self).swap_bytes() }
+            }
         }
     };
-    ($t:ty as be $sb:ty) => {
+    ($t:ident from_bits be $sb:ty) => {
         impl DeserializableExpr for $t {
             #[inline(always)]
-            fn advanced(e: Expr) -> usize { 1 + core::mem::size_of::<Self>() }
+            fn advanced(_e: Expr) -> usize {
+                1 + core::mem::size_of::<Self>()
+            }
             #[inline(always)]
-            fn check(e: Expr) -> bool { unsafe { *e.ptr == item_byte(Tag::SymbolSize(core::mem::size_of::<Self>() as _)) } }
+            fn check(e: Expr) -> bool {
+                unsafe { *e.ptr == item_byte(Tag::SymbolSize(core::mem::size_of::<Self>() as _)) }
+            }
             #[inline(always)]
-            fn deserialize_unchecked(e: Expr) -> Self { unsafe { std::mem::transmute::<_, $t>(std::ptr::read_unaligned(e.ptr.add(1) as *const $sb).swap_bytes()) } }
+            fn deserialize_unchecked(e: Expr) -> Self {
+                unsafe {
+                    <$t>::from_bits(
+                        std::ptr::read_unaligned(e.ptr.add(1) as *const $sb).swap_bytes(),
+                    )
+                }
+            }
         }
     };
 }
@@ -239,8 +271,8 @@ impl_deserializable!(be i32);
 impl_deserializable!(be i64);
 impl_deserializable!(be i128);
 impl_deserializable!(be usize);
-impl_deserializable!(f32 as be u32);
-impl_deserializable!(f64 as be u64);
+impl_deserializable!(f32 from_bits be u32);
+impl_deserializable!(f64 from_bits be u64);
 
 /// A trait for types that can be serialized into a mork-bytestring expression.
 /// This is used by the `construct!` macro to handle different kinds of inputs.
@@ -299,7 +331,9 @@ impl SerializableExpr for &str {
 }
 
 impl SerializableExpr for i32 {
-    fn size(&self) -> usize { core::mem::size_of::<Self>() + 1 }
+    fn size(&self) -> usize {
+        core::mem::size_of::<Self>() + 1
+    }
     fn serialize<W: std::io::Write>(&self, buf: &mut W) -> Result<(), std::io::Error> {
         let size = core::mem::size_of::<Self>();
         buf.write_all(&[item_byte(Tag::SymbolSize(size as u8))])?;
@@ -308,7 +342,9 @@ impl SerializableExpr for i32 {
 }
 
 impl SerializableExpr for usize {
-    fn size(&self) -> usize { core::mem::size_of::<Self>() + 1 }
+    fn size(&self) -> usize {
+        core::mem::size_of::<Self>() + 1
+    }
     fn serialize<W: std::io::Write>(&self, buf: &mut W) -> Result<(), std::io::Error> {
         let size = core::mem::size_of::<Self>();
         buf.write_all(&[item_byte(Tag::SymbolSize(size as u8))])?;
@@ -392,18 +428,15 @@ macro_rules! construct_impl {
     (@write, $label:lifetime, $cursor:ident, $literal:literal $($rest:tt)* ) => {
         let value = $literal;
         let size = SerializableExpr::size(&$literal);
-        let pattern_len: u8 = if size > 63 {
+        if size > 63 {
             break $label Err(format!("pattern length {} exceeds 63", size));
-        } else {
-            size.try_into().unwrap()
-        };
+        }
         if let Err(e) = SerializableExpr::serialize(&value, &mut $cursor) {
             break $label Err(e.to_string());
         }
         $crate::construct_impl!(@write, $label, $cursor, $($rest)*);
     };
     (@write, $label:lifetime, $cursor:ident, $var:ident $($rest:tt)* ) => {
-        let var_size = SerializableExpr::size(&$var);
         if let Err(e) = SerializableExpr::serialize(&$var, &mut $cursor) {
             break $label Err(e.to_string());
         }
@@ -436,22 +469,22 @@ macro_rules! apply_e_clears_stacks_and_cycles_check {
         let mut cycled = std::collections::BTreeMap::<(u8, u8), u8>::new();
         $stack.clear();
         $assignments.clear();
-        let (l,r) = $crate::apply_e($n, $original_intros, $new_intros, $pat_expr, $bindings, &mut std::pin::pin!(snk), &mut cycled, &mut $stack, &mut $assignments);
+        let (l,r) = $crate::apply_e($n, $original_intros, $new_intros, $pat_expr, $bindings, &mut snk, &mut cycled, &mut $stack, &mut $assignments);
 
         (l,r,cycled.is_empty())
-        // $crate::apply_e_clears_stacks_and_cycles_check_takes_coroutine!($n,$original_intros,$new_intros,$pat_expr,$bindings,snk,$stack,$assignments)
     }};
 }
 
-
 #[cfg(test)]
 mod tests {
-    use crate::{Tag, Expr, parse, construct, destruct};
+    use crate::{Expr, parse};
 
     #[test]
     fn test_parse_simple() {
         let mut expr = parse!("[3] a 42 69");
-        let expr = Expr { ptr: expr.as_mut_ptr() };
+        let expr = Expr {
+            ptr: expr.as_mut_ptr(),
+        };
         destruct!(
             expr, ("a" out_1 out_2),
             {
@@ -466,10 +499,11 @@ mod tests {
     #[test]
     fn test_parse_typed() {
         let a = 42_i32;
-        let buf = construct!( "a" a 69_i32 )
-            .expect("construct failed");
+        let buf = construct!( "a" a 69_i32 ).expect("construct failed");
         eprintln!("constructed: {buf:?}");
-        let expr = Expr { ptr: buf.as_ptr() as *mut u8 };
+        let expr = Expr {
+            ptr: buf.as_ptr() as *mut u8,
+        };
         destruct!(
             expr, ("a" {out_1:i32} {out_2:i32}),
             {
@@ -484,11 +518,12 @@ mod tests {
     fn test_parse_typed_top() {
         use crate::macros::SerializableExpr;
         let mut buf = Vec::new();
-        SerializableExpr::serialize(&42_i32, &mut buf)
-            .expect("construct failed");
+        SerializableExpr::serialize(&42_i32, &mut buf).expect("construct failed");
 
         eprintln!("constructed: {buf:?}");
-        let expr = Expr { ptr: buf.as_ptr() as *mut u8 };
+        let expr = Expr {
+            ptr: buf.as_ptr() as *mut u8,
+        };
         destruct!(
             expr, {out_1:i32},
             assert_eq!(out_1, 42),
@@ -497,11 +532,12 @@ mod tests {
     }
     #[test]
     fn test_parse_typed_top_length() {
-        let buf = construct!( 42_i32 )
-            .expect("construct failed");
+        let buf = construct!(42_i32).expect("construct failed");
 
         eprintln!("constructed: {buf:?}");
-        let expr = Expr { ptr: unsafe { buf.as_ptr().add(1) } as *mut u8 };
+        let expr = Expr {
+            ptr: unsafe { buf.as_ptr().add(1) } as *mut u8,
+        };
         destruct!(
             expr, {out_1:i32},
             len => assert_eq!((len, out_1), (5, 42)),
@@ -512,7 +548,9 @@ mod tests {
     #[test]
     fn test_parse_2p2e4() {
         let mut expr = parse!("[3] eq? [3] + 2 2 4");
-        let expr = Expr { ptr: expr.as_mut_ptr() };
+        let expr = Expr {
+            ptr: expr.as_mut_ptr(),
+        };
         destruct!(
             expr, ("eq?" ("+" out_1 out_2) out_3),
             {
@@ -528,7 +566,9 @@ mod tests {
     #[test]
     fn test_parse_2p2e4_expr() {
         let mut expr = parse!("[3] eq? [3] + 2 2 4");
-        let expr = Expr { ptr: expr.as_mut_ptr() };
+        let expr = Expr {
+            ptr: expr.as_mut_ptr(),
+        };
         destruct!(
             expr, ("eq?" out_1 out_2),
             {
@@ -542,31 +582,36 @@ mod tests {
 
     #[test]
     fn test_construct() {
-        let buf = construct!( "eq?" ( "+" "2" "2" ) "4" )
-            .expect("construct failed");
+        let buf = construct!( "eq?" ( "+" "2" "2" ) "4" ).expect("construct failed");
         eprintln!("constructed: {buf:?}");
-        let expr = Expr { ptr: buf.as_ptr() as *mut u8 };
+        let expr = Expr {
+            ptr: buf.as_ptr() as *mut u8,
+        };
         eprintln!("expr: {expr:?}");
     }
 
     #[test]
     fn test_construct_nested() {
         let a = construct!( "+" "2" "2" ).expect("construct failed");
-        let a = Expr { ptr: a.as_ptr() as *mut u8 };
+        let a = Expr {
+            ptr: a.as_ptr() as *mut u8,
+        };
         let b = "4";
-        let buf = construct!( "eq?" a b )
-            .expect("construct failed");
+        let buf = construct!( "eq?" a b ).expect("construct failed");
         eprintln!("constructed: {buf:?}");
-        let expr = Expr { ptr: buf.as_ptr() as *mut u8 };
+        let expr = Expr {
+            ptr: buf.as_ptr() as *mut u8,
+        };
         eprintln!("expr: {expr:?}");
     }
 
     #[test]
     fn test_round_trip() {
-        let mut buf = construct!( "eq?" ( "+" "2" "2" ) "4" )
-            .expect("construct failed");
+        let mut buf = construct!( "eq?" ( "+" "2" "2" ) "4" ).expect("construct failed");
         eprintln!("constructed: {buf:?}");
-        let expr = Expr { ptr: buf.as_mut_ptr() };
+        let expr = Expr {
+            ptr: buf.as_mut_ptr(),
+        };
         destruct!(
             expr, ("eq?" ("+" out_1 out_2) out_3),
             {

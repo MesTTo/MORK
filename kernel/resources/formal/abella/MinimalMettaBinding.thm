@@ -1,0 +1,36 @@
+%% Minimal MeTTa binding/freshness proof seed.
+%%
+%% This intentionally models only the binding boundary used by `chain`: an
+%% evaluated atom is substituted into a template with one scoped variable. Abella
+%% represents that scoped variable with lambda-tree syntax, so alpha-renaming and
+%% capture avoidance are delegated to the meta-language rather than encoded with
+%% byte offsets or De Bruijn arithmetic.
+
+Kind atom type.
+
+Type sym atom.
+Type unit atom.
+Type empty atom.
+Type not_reducible atom.
+Type err atom -> atom -> atom.
+Type pair atom -> atom -> atom.
+Type chain atom -> (atom -> atom) -> atom.
+Type ret atom -> atom.
+
+Define name : atom -> prop by
+  nabla x, name x.
+
+Define fresh : atom -> atom -> prop by
+  nabla x, fresh x A.
+
+Theorem fresh_nominal_input : forall Input,
+  nabla x, fresh x Input.
+intros. search.
+
+Theorem chain_binder_is_nominal :
+  nabla x, name x.
+intros. search.
+
+Theorem chain_alpha_template : forall Input (K:atom -> atom),
+  chain Input (x\ K x) = chain Input (y\ K y).
+intros. search.

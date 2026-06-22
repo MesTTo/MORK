@@ -1,4 +1,4 @@
-use mork_expr::{Tag, item_byte, SourceItem};
+use mork_expr::{SourceItem, Tag, item_byte};
 
 #[repr(C)]
 pub struct ExprSink {
@@ -8,7 +8,11 @@ pub struct ExprSink {
 }
 impl Default for ExprSink {
     fn default() -> Self {
-        Self { ptr: core::ptr::null_mut(), len: 0, capacity: 0}
+        Self {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        }
     }
 }
 
@@ -17,7 +21,7 @@ use alloc::vec::Vec;
 
 impl ExprSink {
     pub fn expr(&self) -> mork_expr::Expr {
-        mork_expr::Expr{ ptr: self.ptr }
+        mork_expr::Expr { ptr: self.ptr }
     }
     #[cfg(feature = "std")]
     pub fn new(vec: Vec<u8>) -> Self {

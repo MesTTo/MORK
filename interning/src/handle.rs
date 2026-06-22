@@ -1,11 +1,11 @@
 use crate::*;
 
 /// WritePermit is a form of soft guard, the lifetime encourages scoped usage.
-pub struct WritePermit<'a>(&'a SharedMappingHandle, PhantomData<*const (/* we do not want this to be Send or Sync */)>);
+pub struct WritePermit<'a>(&'a SharedMappingHandle, PhantomData<*const ()>);
 
 impl<'a> core::ops::Drop for WritePermit<'a> {
   fn drop(&mut self) {
-    let permits = LIVE_PERMIT_HANDLES.get()-1;
+    let permits = LIVE_PERMIT_HANDLES.get() - 1;
     LIVE_PERMIT_HANDLES.set(permits);
 
     if permits == 0 {
@@ -17,23 +17,19 @@ impl<'a> core::ops::Drop for WritePermit<'a> {
 impl<'a> core::ops::Deref for WritePermit<'a> {
   type Target = SharedMapping;
   fn deref(&self) -> &Self::Target {
-    unsafe {&*self.0.0.as_ptr()}
+    unsafe { &*self.0.0.as_ptr() }
   }
 }
 
 impl<'a> WritePermit<'a> {
-  pub fn get_sym_or_insert(&self, bytes : &[u8]) -> Symbol {
-    const LOAD_ORDER  : atomic::Ordering = atomic::Ordering::Relaxed;
-    const STORE_ORDER : atomic::Ordering = atomic::Ordering::Relaxed;
+  pub fn get_sym_or_insert(&self, bytes: &[u8]) -> Symbol {
+    const LOAD_ORDER: atomic::Ordering = atomic::Ordering::Relaxed;
+    const STORE_ORDER: atomic::Ordering = atomic::Ordering::Relaxed;
 
     // the ordering of most of the atomics here use Relaxed, when one would expect Release.
     // the reason is that these atomics are not under contention, once a thread has a permission it is the only one allowed to change those atomic fields.
     // the alternative is to mutate under an `UnsafeCell`, but atomics already do that.
 
-    // try first
-    if let Some(sym) = self.get_sym(bytes) {
-        return sym;
-    }
     let index = MAPPING_THREAD_INDEX.get().unwrap();
     let thread_permission = &self.permissions[index as usize].0;
 
@@ -41,15 +37,15 @@ impl<'a> WritePermit<'a> {
     // So we eagerly write to the Slab if the currently allocated one has space.
     // If we find out someone else has beat us to adding it to the store, we want to revert
     // our eager write.
-    let mut eager_and_recovery : Option<(ThinBytes, (*mut Slab, Slab))> = None;
+    let mut eager_and_recovery: Option<(ThinBytes, (*mut Slab, Slab))> = None;
 
     let mut slab_ptr = thread_permission.symbol_table_last.load(LOAD_ORDER);
 
-    if !thread_permission.symbol_table_start.load(LOAD_ORDER).is_null() {      
-      unsafe {  
-        if (*slab_ptr).slab_len-(*slab_ptr).write_pos >= bytes.len() + U64_BYTES {
+    if !thread_permission.symbol_table_start.load(LOAD_ORDER).is_null() {
+      unsafe {
+        if (*slab_ptr).slab_len - (*slab_ptr).write_pos >= bytes.len() + U64_BYTES {
           let recovery = (slab_ptr, *slab_ptr);
-          eager_and_recovery = Some((Slab::register_bytes(slab_ptr,bytes) ,recovery));
+          eager_and_recovery = Some((Slab::register_bytes(slab_ptr, bytes), recovery));
         }
       }
     }
@@ -59,38 +55,37 @@ impl<'a> WritePermit<'a> {
     // as minimal as it might be, we want the critical section as small as posible, so we index first
     let sym_table_lock = &self.to_symbol[hash as usize % MAX_WRITER_THREADS].0;
     let bytes_guard_lock = &self.to_bytes[MAPPING_THREAD_INDEX.get().unwrap() as usize].0;
-    let sym = 'lock_scope_sym : {
+    let sym = 'lock_scope_sym: {
       let mut sym_guard = sym_table_lock.write().unwrap();
-      // try once more to see if we need to make the symbol
+      // Writer paths deduplicate under the bucket write lock.  Avoiding an
+      // optimistic read-lock probe here keeps PathMap's temporary read refs out
+      // of the contended insertion race.
       if let Some(s) = sym_guard.get(bytes) {
         // Another thread beat us to it. yay!
         break 'lock_scope_sym *s;
       }
 
-      let thin_bytes_ptr = if let Some((thin_bytes,_)) = eager_and_recovery {
+      let thin_bytes_ptr = if let Some((thin_bytes, _)) = eager_and_recovery {
         // the eager write pays off.
         eager_and_recovery = None;
         thin_bytes
       } else {
         // We need to hold the lock while allocating, otherwise our allocation goes to waste.
         if slab_ptr.is_null() {
-          let allocation = unsafe {Slab::allocate((bytes.len() + U64_BYTES) as u64)};
+          let allocation = unsafe { Slab::allocate((bytes.len() + U64_BYTES) as u64) };
           thread_permission.symbol_table_start.store(allocation, STORE_ORDER);
           thread_permission.symbol_table_last.store(allocation, STORE_ORDER);
           slab_ptr = allocation;
         }
-        unsafe {
-          Slab::register_bytes(slab_ptr,bytes)
-        }
+        unsafe { Slab::register_bytes(slab_ptr, bytes) }
       };
       let new_sym = thread_permission.next_symbol.fetch_add(1, atomic::Ordering::Relaxed).to_be_bytes();
 
-      '_lock_scope_bytes : {
+      '_lock_scope_bytes: {
         let mut bytes_guard = bytes_guard_lock.write().unwrap();
 
         let old_thin = bytes_guard.insert(new_sym.as_slice(), thin_bytes_ptr);
         core::debug_assert!(matches!(old_thin, Option::None));
-
       }
       let old_sym = sym_guard.insert(bytes, new_sym);
       core::debug_assert!(matches!(old_sym, Option::None));
@@ -100,40 +95,46 @@ impl<'a> WritePermit<'a> {
 
     // similarly to entering the critical section, we do cleanup after, even though normally we would prefer to do it as locally as possible
     if !slab_ptr.is_null() {
-      let next = unsafe {(*slab_ptr).next};
+      let next = unsafe { (*slab_ptr).next };
       if !next.is_null() {
         thread_permission.symbol_table_last.store(next, STORE_ORDER);
       }
     }
 
-    if let Some((_,(recovery_ptr, recovery_data))) = eager_and_recovery {
+    if let Some((_, (recovery_ptr, recovery_data))) = eager_and_recovery {
       // if we ever reach this point the ponter never changed, but we need to revert the `Slab` header
-      unsafe {*recovery_ptr = recovery_data;}
+      unsafe {
+        *recovery_ptr = recovery_data;
+      }
     }
 
     sym
   }
 }
- 
+
 thread_local! {
-  static MAPPING_THREAD_INDEX : core::cell::Cell<Option<u8>> = core::cell::Cell::new(None);
-  static THREAD_ID : u64 = unsafe {core::mem::transmute::<_,u64> (std::thread::current().id()) };
-  static LIVE_PERMIT_HANDLES : core::cell::Cell<usize> = core::cell::Cell::new(0)
+  static MAPPING_THREAD_INDEX : core::cell::Cell<Option<u8>> = const { core::cell::Cell::new(None) };
+  static THREAD_ID : u64 = allocate_thread_id();
+  static LIVE_PERMIT_HANDLES : core::cell::Cell<usize> = const { core::cell::Cell::new(0) }
 }
 
+static NEXT_THREAD_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
+fn allocate_thread_id() -> u64 {
+  let id = NEXT_THREAD_ID.fetch_add(1, atomic::Ordering::Relaxed);
+  assert_ne!(id, 0, "thread permit id allocator overflowed");
+  id
+}
 
 pub struct SharedMappingHandle(pub(crate) core::ptr::NonNull<SharedMapping>);
 unsafe impl Send for SharedMappingHandle {}
 unsafe impl Sync for SharedMappingHandle {}
 
 impl SharedMappingHandle {
-
-
   /// Falure of this method marks a that all permissions were tried and it failed to aquire any.
-  /// Failure can be spurious if there are a high number of threads (> [`MAX_THREADS`]), it is recommended to 
+  /// Failure can be spurious if there are a high number of threads (> [`MAX_THREADS`]), it is recommended to
   /// retry even if there are many threads as this only competes with writer threads.
-  pub fn try_aquire_permission<'a>(&'a self)->Result<WritePermit<'a>, ()> {
+  pub fn try_aquire_permission<'a>(&'a self) -> Result<WritePermit<'a>, ()> {
     // A thred can only have one permission at a time
     if let Some(_) = MAPPING_THREAD_INDEX.get() {
       LIVE_PERMIT_HANDLES.set(LIVE_PERMIT_HANDLES.get() + 1);
@@ -142,7 +143,7 @@ impl SharedMappingHandle {
 
     for each in 0..MAX_WRITER_THREADS {
       let p = &self.permissions[each];
-      if let Ok(_) = p.0.thread_id.compare_exchange(0, THREAD_ID.with(|x|*x)+1, atomic::Ordering::Acquire, atomic::Ordering::Relaxed) {
+      if let Ok(_) = p.0.thread_id.compare_exchange(0, THREAD_ID.with(|x| *x), atomic::Ordering::Acquire, atomic::Ordering::Relaxed) {
         MAPPING_THREAD_INDEX.set(Some(each as u8));
         LIVE_PERMIT_HANDLES.set(LIVE_PERMIT_HANDLES.get() + 1);
         return Ok(WritePermit(self, PhantomData));
@@ -153,25 +154,23 @@ impl SharedMappingHandle {
   }
 }
 
-
-
 impl core::ops::Deref for SharedMappingHandle {
   type Target = SharedMapping;
   fn deref(&self) -> &Self::Target {
-    unsafe {&*self.0.as_ptr()}
+    unsafe { &*self.0.as_ptr() }
   }
 }
 
 impl Clone for SharedMappingHandle {
-    fn clone(&self) -> Self {
-      self.count.fetch_add(1, atomic::Ordering::Relaxed);
-      Self(self.0.clone())
-    }
+  fn clone(&self) -> Self {
+    self.count.fetch_add(1, atomic::Ordering::Relaxed);
+    Self(self.0.clone())
+  }
 }
 
 impl core::ops::Drop for SharedMappingHandle {
   fn drop(&mut self) {
-    if 1 != self.count.fetch_sub(1, atomic::Ordering::Release){
+    if 1 != self.count.fetch_sub(1, atomic::Ordering::Release) {
       return;
     };
 

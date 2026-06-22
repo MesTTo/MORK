@@ -50,7 +50,7 @@
 //! ```
 
 #[cfg(feature = "blocked")]
-use crate::blocked::{Blocked16, Blocked8};
+use crate::blocked::{Blocked8, Blocked16};
 use crate::csr::{Csr, Value};
 #[cfg(feature = "dense")]
 use crate::dense::Dense;
@@ -163,7 +163,7 @@ impl<'a> NDIndex<f32> for TensorF32<'a> {
             TensorF32::Dense(d) => d.ndim(),
             #[cfg(feature = "dense")]
             TensorF32::DenseMut(d) => d.ndim(),
-            
+
             TensorF32::Csr(c) => c.ndim(),
             #[cfg(feature = "blocked")]
             TensorF32::Blocked8(b) => b.ndim(),
@@ -182,7 +182,7 @@ impl<'a> NDIndex<f32> for TensorF32<'a> {
             TensorF32::Dense(d) => d.dim(axis),
             #[cfg(feature = "dense")]
             TensorF32::DenseMut(d) => d.dim(axis),
-            
+
             TensorF32::Csr(c) => c.dim(axis),
             #[cfg(feature = "blocked")]
             TensorF32::Blocked8(b) => b.dim(axis),
@@ -201,7 +201,7 @@ impl<'a> NDIndex<f32> for TensorF32<'a> {
             TensorF32::Dense(d) => d.get(ix),
             #[cfg(feature = "dense")]
             TensorF32::DenseMut(d) => d.get(ix),
-            
+
             TensorF32::Csr(c) => NDIndex::get(*c, ix),
             #[cfg(feature = "blocked")]
             TensorF32::Blocked8(b) => b.get(ix),
@@ -220,7 +220,7 @@ impl<'a> NDIndex<f32> for TensorF32<'a> {
             TensorF32::Dense(d) => d.get_opt(ix),
             #[cfg(feature = "dense")]
             TensorF32::DenseMut(d) => d.get_opt(ix),
-            
+
             TensorF32::Csr(c) => NDIndex::get_opt(*c, ix),
             #[cfg(feature = "blocked")]
             TensorF32::Blocked8(b) => b.get_opt(ix),
@@ -243,7 +243,7 @@ impl<'a> NDIndex<f32> for TensorF32<'a> {
             TensorF32::Blocked16Mut(b) => b.set(ix, v),
             #[cfg(feature = "dense")]
             TensorF32::Dense(_) => panic!("set on shared TensorF32::Dense"),
-            
+
             TensorF32::Csr(_) => panic!("Csr is immutable after construction"),
             #[cfg(feature = "blocked")]
             TensorF32::Blocked8(_) => panic!("set on shared TensorF32::Blocked8"),
@@ -254,7 +254,6 @@ impl<'a> NDIndex<f32> for TensorF32<'a> {
 
     fn as_sparse_2d(&self) -> Option<&dyn Sparse2D<f32>> {
         match self {
-            
             TensorF32::Csr(c) => NDIndex::as_sparse_2d(*c),
             _ => None,
         }
@@ -272,9 +271,7 @@ mod tests {
 
     #[test]
     fn tensor_csr_x_dense_via_einsum() {
-        let a = Csr::<u32, f32>::from_coo(3, &mut vec![
-            (0, 1, 1.0), (1, 2, 1.0), (2, 0, 1.0),
-        ]);
+        let a = Csr::<u32, f32>::from_coo(3, &mut vec![(0, 1, 1.0), (1, 2, 1.0), (2, 0, 1.0)]);
         let mut x = Dense::<f32>::zeros(vec![3, 2]);
         x.fill_from(&[1., 2., 3., 4., 5., 6.]);
         let mut y = Dense::<f32>::zeros(vec![3, 2]);
@@ -298,7 +295,10 @@ mod tests {
         let dense = Dense::<f32>::zeros(vec![3, 3]);
         let t_csr = Tensor::Csr(&a);
         let t_dense = Tensor::Dense(&dense);
-        assert!(t_csr.as_sparse_2d().is_some(), "Csr variant should expose Sparse2D");
+        assert!(
+            t_csr.as_sparse_2d().is_some(),
+            "Csr variant should expose Sparse2D"
+        );
         assert!(t_dense.as_sparse_2d().is_none(), "Dense variant should not");
     }
 

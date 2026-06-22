@@ -1,0 +1,148 @@
+;; Dense f32 einsum from a MORK program.
+;;
+;; The ordinary pathmap facts below are interpreted as tensor cells.  The
+;; tensor-op-f32 materializes result cells after an exec rule matches the source
+;; cells.  Build with `--features einsum_blas` to let the planner choose OpenBLAS
+;; for dense matmul/attention shapes.
+;;
+;; Run all examples with:
+;;   cargo +nightly run -p mork --features einsum_blas -- run \
+;;     kernel/resources/einsum_f32_attention.mm2 --steps 7 --instrumentation 0
+
+(A 0 0 1)
+(A 0 1 2)
+(A 0 2 3)
+(A 1 0 4)
+(A 1 1 5)
+(A 1 2 6)
+
+(B 0 0 7)
+(B 0 1 8)
+(B 1 0 9)
+(B 1 1 10)
+(B 2 0 11)
+(B 2 1 12)
+(CT 0 0 999)
+
+(exec matmul
+  (, (A $i $k $av)
+     (B $k $j $bv))
+  (O (einsum-f32 ab,bc->ac
+        (A 2 3)
+        (B 3 2)
+        (C 2 2)
+        (A $i $k $av)
+        (B $k $j $bv))))
+
+(exec matmul-op
+  (, (A $i $k $av)
+     (B $k $j $bv))
+  (O (tensor-op-f32
+        (op einsum ab,bc->ac)
+        (inputs (A dense 2 3)
+                (B dense 3 2))
+        (output (C2 dense))
+        (from (A $i $k $av)
+              (B $k $j $bv))
+        (backend auto))))
+
+(exec matmul-op-threshold
+  (, (A $i $k $av)
+     (B $k $j $bv))
+  (O (tensor-op-f32
+        (op einsum ab,bc->ac)
+        (inputs (A dense 2 3)
+                (B dense 3 2))
+        (output (CT dense 2 2))
+        (from (A $i $k $av)
+              (B $k $j $bv))
+        (emit threshold 100)
+        (backend auto))))
+
+(AS 0 1 2)
+(AS 0 2 3)
+(AS 1 0 1)
+
+(X 0 0 10)
+(X 0 1 20)
+(X 1 0 30)
+(X 1 1 40)
+(X 2 0 50)
+(X 2 1 60)
+
+(exec sparse-dense
+  (, (AS $i $k $av)
+     (X $k $j $xv))
+  (O (einsum-f32 ab,bc->ac
+        (csr AS 3 3)
+        (X 3 2)
+        (nonzero Y 3 2)
+        (AS $i $k $av)
+        (X $k $j $xv))))
+
+(Q 0 0 0 0 1)
+(Q 0 0 0 1 2)
+(Q 0 0 0 2 3)
+(Q 0 0 1 0 4)
+(Q 0 0 1 1 5)
+(Q 0 0 1 2 6)
+
+(K 0 0 0 0 7)
+(K 0 0 0 1 8)
+(K 0 0 0 2 9)
+(K 0 0 1 0 10)
+(K 0 0 1 1 11)
+(K 0 0 1 2 12)
+
+(exec attention
+  (, (Q $b $h $q $d $qv)
+     (K $b $h $k $d $kv))
+  (O (einsum-f32 bhqd,bhkd->bhqk
+        (Q 1 1 2 3)
+        (K 1 1 2 3)
+        (Score 1 1 2 2)
+        (Q $b $h $q $d $qv)
+        (K $b $h $k $d $kv))))
+
+(Q0 0 0 0 0 0)
+(Q0 0 0 0 1 0)
+(Q0 0 0 1 0 0)
+(Q0 0 0 1 1 0)
+
+(K0 0 0 0 0 1)
+(K0 0 0 0 1 2)
+(K0 0 0 1 0 3)
+(K0 0 0 1 1 4)
+
+(V 0 0 0 0 10)
+(V 0 0 0 1 20)
+(V 0 0 1 0 14)
+(V 0 0 1 1 28)
+
+(exec full-attention
+  (, (Q0 $b $h $q $d $qv)
+     (K0 $b $h $k $d $kv)
+     (V $b $h $k $vd $vv))
+  (O (attention-f32
+        (Q0 1 1 2 2)
+        (K0 1 1 2 2)
+        (V 1 1 2 2)
+        (Ctx 1 1 2 2)
+        (Q0 $b $h $q $d $qv)
+        (K0 $b $h $k $d $kv)
+        (V $b $h $k $vd $vv))))
+
+(exec full-attention-op
+  (, (Q0 $b $h $q $d $qv)
+     (K0 $b $h $k $d $kv)
+     (V $b $h $k $vd $vv))
+  (O (tensor-op-f32
+        (op attention scaled-dot)
+        (inputs (Q0 dense 1 1 2 2)
+                (K0 dense 1 1 2 2)
+                (V dense 1 1 2 2))
+        (output (Ctx2 dense))
+        (from (Q0 $b $h $q $d $qv)
+              (K0 $b $h $k $d $kv)
+              (V $b $h $k $vd $vv))
+        (backend auto))))

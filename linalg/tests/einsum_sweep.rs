@@ -124,8 +124,14 @@ fn output_arrangements(union: &[u8]) -> Vec<Vec<u8>> {
 /// Deterministic small-integer values in `-2..=2`. Including 0 so the sparse
 /// path actually skips structural zeros. Range stays inside f32 exact ints.
 fn fill_input(shape: &[usize], seed: u64) -> Vec<f32> {
-    let n: usize = if shape.is_empty() { 1 } else { shape.iter().product() };
-    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0xDEAD_BEEF);
+    let n: usize = if shape.is_empty() {
+        1
+    } else {
+        shape.iter().product()
+    };
+    let mut state = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0xDEAD_BEEF);
     let mut data = Vec::with_capacity(n);
     for _ in 0..n {
         state = state
@@ -169,13 +175,20 @@ fn naive_einsum(
     out_pattern: &[u8],
     out_shape: &[usize],
 ) -> Vec<f32> {
-    let out_len: usize = if out_shape.is_empty() { 1 } else { out_shape.iter().product() };
+    let out_len: usize = if out_shape.is_empty() {
+        1
+    } else {
+        out_shape.iter().product()
+    };
     let mut out = vec![0.0f32; out_len];
 
     // Union of all slots used, with their dims.
     let mut seen = [false; 4];
     let mut slots = Vec::new();
-    for p in input_patterns.iter().chain(std::iter::once(&out_pattern.to_vec())) {
+    for p in input_patterns
+        .iter()
+        .chain(std::iter::once(&out_pattern.to_vec()))
+    {
         for &s in p {
             if !seen[s as usize] {
                 seen[s as usize] = true;
@@ -249,7 +262,13 @@ fn check_case(input_patterns: &[Vec<u8>], out_pattern: &[u8], sparse_mask: &[boo
         .map(|(i, s)| fill_input(s, (i as u64) * 7 + 1))
         .collect();
 
-    let expected = naive_einsum(input_patterns, &in_shapes, &in_data, out_pattern, &out_shape);
+    let expected = naive_einsum(
+        input_patterns,
+        &in_shapes,
+        &in_data,
+        out_pattern,
+        &out_shape,
+    );
 
     // Dense tensors (kept around for both VM and JIT to borrow).
     let dense_inputs: Vec<Dense<f32>> = in_shapes
@@ -308,7 +327,7 @@ fn check_case(input_patterns: &[Vec<u8>], out_pattern: &[u8], sparse_mask: &[boo
         })
         .collect();
 
-    match EinsumF32Jit::compile(&spec, &jit_inputs, &[out_shape.clone()]) {
+    match EinsumF32Jit::compile(&spec, &jit_inputs, std::slice::from_ref(&out_shape)) {
         Ok(jit) => {
             let mut jit_out = Dense::<f32>::zeros(out_shape.clone());
             jit.run(&jit_inputs, &mut [&mut jit_out]);
@@ -350,7 +369,9 @@ fn fmt_secs(secs: f64) -> String {
 fn enumerate_outputs_and_masks(inputs: &[Vec<u8>], sweep: &Sweep) {
     let union = union_slots(inputs);
     let arrangements = output_arrangements(&union);
-    let eligible: Vec<usize> = (0..inputs.len()).filter(|&i| inputs[i].len() >= 2).collect();
+    let eligible: Vec<usize> = (0..inputs.len())
+        .filter(|&i| inputs[i].len() >= 2)
+        .collect();
 
     let n_masks = 1usize << eligible.len();
     let mut sparse_mask = vec![false; inputs.len()];
@@ -403,9 +424,7 @@ fn total_cases(patterns: &[Vec<u8>]) -> usize {
         }
         seen.iter().filter(|&&b| b).count()
     };
-    let sparse_mult = |p: &[u8]| -> usize {
-        if p.len() >= 2 { 2 } else { 1 }
-    };
+    let sparse_mult = |p: &[u8]| -> usize { if p.len() >= 2 { 2 } else { 1 } };
     let mut total = 0usize;
     for p in patterns {
         total += a[distinct(p)] * sparse_mult(p);
@@ -464,5 +483,8 @@ fn exhaustive_einsum_sweep_up_to_2_inputs() {
         fmt_secs(sweep.start.elapsed().as_secs_f64()),
         final_count - after_n1,
     );
-    assert_eq!(final_count, total, "enumeration count diverged from precomputed total");
+    assert_eq!(
+        final_count, total,
+        "enumeration count diverged from precomputed total"
+    );
 }

@@ -212,8 +212,8 @@ fn gen_key<'a>(i: u64, buffer: *mut u8) -> &'a [u8] {
 
 // use pathmap::zipper::WriteZipper;
 impl Parser for DataParser {
-    fn tokenizer<'r>(&mut self, s: &[u8]) -> &'r [u8] {
-        return unsafe { std::mem::transmute(s) };
+    fn tokenizer<'r>(&'r mut self, s: &'r [u8]) -> &'r [u8] {
+        return s;
         #[allow(unreachable_code)]
         if s.len() == 0 { return Self::EMPTY }
         let mut z = self.symbols.write_zipper_at_path(s);

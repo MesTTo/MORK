@@ -15,7 +15,9 @@ fn naive_csr_matmul(a: &Csr<u32, u32>, b: &Csr<u32, u32>, n: usize) -> Vec<Vec<u
     for i in 0..n {
         for k in 0..n {
             let a_ik = a.get(i as u32, k as u32);
-            if a_ik == 0 { continue; }
+            if a_ik == 0 {
+                continue;
+            }
             for j in 0..n {
                 c[i][j] += a_ik * b.get(k as u32, j as u32);
             }
@@ -26,9 +28,19 @@ fn naive_csr_matmul(a: &Csr<u32, u32>, b: &Csr<u32, u32>, n: usize) -> Vec<Vec<u
 
 #[test]
 fn csr_x_csr_via_einsum_matches_native_matmul() {
-    let a = Csr::<u32, u32>::from_edges(6, &[
-        (0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (0, 3), (5, 0), (1, 4),
-    ]);
+    let a = Csr::<u32, u32>::from_edges(
+        6,
+        &[
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            (0, 3),
+            (5, 0),
+            (1, 4),
+        ],
+    );
     let native = a.matmul(&a);
 
     // Run the same multiply through einsum into a dense output.
@@ -49,11 +61,7 @@ fn csr_x_csr_via_einsum_matches_native_matmul() {
 #[test]
 fn csr_x_dense_mixed_via_einsum_dyn() {
     // 3-node triangle adjacency × 3×2 dense feature matrix.
-    let a = Csr::<u32, f32>::from_coo(3, &mut vec![
-        (0, 1, 1.0),
-        (1, 2, 1.0),
-        (2, 0, 1.0),
-    ]);
+    let a = Csr::<u32, f32>::from_coo(3, &mut vec![(0, 1, 1.0), (1, 2, 1.0), (2, 0, 1.0)]);
     let mut x = Dense::<f32>::zeros(vec![3, 2]);
     x.fill_from(&[1., 2., 3., 4., 5., 6.]);
 
@@ -86,7 +94,10 @@ fn compiled_program_reused_across_executions() {
     .unwrap();
 
     let plan = format!("{prog}");
-    assert!(plan.contains("SPARSE"), "VM should pick sparse loops:\n{plan}");
+    assert!(
+        plan.contains("SPARSE"),
+        "VM should pick sparse loops:\n{plan}"
+    );
 
     // Execute three times into fresh outputs.
     for _ in 0..3 {

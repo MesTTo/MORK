@@ -12,18 +12,21 @@
 //! ([ThinBytes] type).  The symbol's `permission_idx` selects which PathMap to perform the lookup in.
 //!
 //! The [SharedMapping::to_symbol] contains maps (PathMaps) to map from raw symbol bytes to a [`Symbol`] handle.
-//! The `MAX_WRITER_THREADS` pathmaps use a Pearson hash on the first 8 Bytes of the symbol to reduce contention
-//! over the `PathMaps`  TODO: We may want to revisit the first 8-Byte behavior if we end up with symbols that
-//! all contain the same prefix, e.g. a namespace.
+//! The `MAX_WRITER_THREADS` pathmaps use a bounded Pearson hash over the symbol length and samples from both ends
+//! of the symbol to reduce contention over the `PathMaps`, including namespace-heavy symbol families that share a
+//! long prefix.
 //!
 
 extern crate alloc;
 
-use core::{marker::PhantomData, mem::MaybeUninit, sync::atomic::{self, AtomicPtr, AtomicU64}};
+use core::{
+  marker::PhantomData,
+  mem::MaybeUninit,
+  sync::atomic::{self, AtomicPtr, AtomicU64},
+};
 use pathmap::PathMap;
 
 mod handle;
-use handle::*;
 pub use handle::SharedMappingHandle;
 pub use handle::WritePermit;
 
@@ -38,7 +41,7 @@ mod serialization;
 #[cfg(feature = "debug_api")]
 pub use serialization::Tables;
 
-const U64_BYTES : usize = u64::BITS as usize / 8;
+const U64_BYTES: usize = u64::BITS as usize / 8;
 
 /// Uniquely identifies a symbol in the table
 ///
@@ -46,44 +49,43 @@ const U64_BYTES : usize = u64::BITS as usize / 8;
 /// [2]: permission_idx.  Identifies which list in [SharedMapping::permissions] contains the symbol
 /// [3..=7]: unique symbol id within slab list.  Corresponds to insertion order in list
 ///
-type Symbol = [u8;SYM_LEN];
+type Symbol = [u8; SYM_LEN];
 #[doc(hidden)]
-pub const SYM_LEN : usize = 8;
+pub const SYM_LEN: usize = 8;
 
 /// it's important that the top bit is NOT set, as that would suggest it is a De Bruijn Level reference
-const MAX_WRITER_THREAD_INDEX : usize = i8::MAX as usize;
+const MAX_WRITER_THREAD_INDEX: usize = i8::MAX as usize;
 #[doc(hidden)]
-pub const MAX_WRITER_THREADS : usize = MAX_WRITER_THREAD_INDEX+1;
-const SYMBOL_THREAD_PERMIT_BYTE_POS : usize = 2;
+pub const MAX_WRITER_THREADS: usize = MAX_WRITER_THREAD_INDEX + 1;
+const SYMBOL_THREAD_PERMIT_BYTE_POS: usize = 2;
 
 /// We don't want locks to implicitly cause chache misses because they are too close together.
 #[repr(align(64 /* bytes; cache line */))]
 pub(crate) struct AlignCache<T>(pub(crate) T);
 type AlignArray<T> = [AlignCache<T>; MAX_WRITER_THREADS];
 
-
 #[repr(u64)]
 enum SharedMappingFlags {
   KeepSlabsAlive = 1 << 0,
-  HeapAllocated   = 1 << 1,
+  HeapAllocated = 1 << 1,
 }
-pub(crate) const PEARSON_BOUND : usize = 8;
+pub(crate) const PEARSON_BOUND: usize = 8;
 
 /// The [`SharedMapping`] is the datatype that holds buckets to split the maps that hold the symbols to reduce contention bewteen multiple threads.
 /// There can be a maximum of 128 threads that can write.
 
 pub struct SharedMapping {
-  pub(crate) count             : AtomicU64,
-  pub(crate) flags             : AtomicU64,
-  pub(crate) permissions       : AlignArray<ThreadPermission>,
-  pub(crate) to_symbol         : AlignArray<std::sync::RwLock<PathMap<Symbol>>>,
+  pub(crate) count: AtomicU64,
+  pub(crate) flags: AtomicU64,
+  pub(crate) permissions: AlignArray<ThreadPermission>,
+  pub(crate) to_symbol: AlignArray<std::sync::RwLock<PathMap<Symbol>>>,
   /// the path is a Symbol as __big endian bytes__.
-  pub(crate) to_bytes          : AlignArray<std::sync::RwLock<PathMap<ThinBytes>>>,
+  pub(crate) to_bytes: AlignArray<std::sync::RwLock<PathMap<ThinBytes>>>,
 }
 
 impl SharedMapping {
   /// This function will allocate a new SharedMapping returning back a reference counted handle
-  pub fn new()->SharedMappingHandle {
+  pub fn new() -> SharedMappingHandle {
     unsafe {
       let ptr = alloc::alloc::alloc(alloc::alloc::Layout::new::<MaybeUninit<SharedMapping>>()) as *mut MaybeUninit<SharedMapping>;
       SharedMapping::init(ptr, SharedMappingFlags::HeapAllocated as u64)
@@ -92,7 +94,7 @@ impl SharedMapping {
 
   /// This is unsafe because this could be done inside a stack frame, which makes safety guarantees more difficult.
   /// This has been made public for use in initializing a static.
-  pub const unsafe fn init(uninit : *mut MaybeUninit<SharedMapping>, init_flags: u64)-> SharedMappingHandle {
+  pub const unsafe fn init(uninit: *mut MaybeUninit<SharedMapping>, init_flags: u64) -> SharedMappingHandle {
     unsafe {
       let inner = (*uninit).as_mut_ptr();
 
@@ -105,21 +107,21 @@ impl SharedMapping {
         (&raw mut (*inner).to_symbol[i]).write(AlignCache(std::sync::RwLock::new(PathMap::new())));
         (&raw mut (*inner).to_bytes[i]).write(AlignCache(std::sync::RwLock::new(PathMap::new())));
 
-        i+=1;
+        i += 1;
       }
-      SharedMappingHandle( core::ptr::NonNull::new_unchecked(inner) )
+      SharedMappingHandle(core::ptr::NonNull::new_unchecked(inner))
     }
   }
 
   /// Aquire the bytes associated with a [`Symbol`]
-  pub fn get_bytes(&self, sym: Symbol)-> Option<&[u8]> {
+  pub fn get_bytes(&self, sym: Symbol) -> Option<&[u8]> {
     if sym[SYMBOL_THREAD_PERMIT_BYTE_POS] > i8::MIN as u8 {
       return None;
     }
     let bucket = sym[SYMBOL_THREAD_PERMIT_BYTE_POS];
 
     let res = self.to_bytes[bucket as usize].0.read().unwrap();
-    res.get_val_at(sym).map(|t| unsafe {&*t.as_raw_slice()})
+    res.get_val_at(sym).map(|t| unsafe { &*t.as_raw_slice() })
   }
 
   /// This function is not inherently unsafe, but should only be used as a last resort when
@@ -130,13 +132,12 @@ impl SharedMapping {
 
   /// try to get a [`Symbol`] if it is already in the map.
   /// If one requires a guaranteed [`Symbol`], then consider creating a [`WritePermit`] and using [`WritePermit::get_or_insert`].
-  pub fn get_sym(&self, bytes : &[u8]) -> Option<Symbol> {
-
+  pub fn get_sym(&self, bytes: &[u8]) -> Option<Symbol> {
     let hash = bounded_pearson_hash::<PEARSON_BOUND>(bytes);
 
     let trie_lock = &self.to_symbol[hash as usize % MAX_WRITER_THREADS].0;
 
-    '_lock_scope:{
+    '_lock_scope: {
       let lock_guard = trie_lock.read().unwrap();
 
       lock_guard.get(bytes).copied()
@@ -144,10 +145,8 @@ impl SharedMapping {
   }
 }
 
-
 impl core::ops::Drop for SharedMapping {
   fn drop(&mut self) {
-
     if self.flags.load(atomic::Ordering::Acquire) & SharedMappingFlags::KeepSlabsAlive as u64 != 0 {
       // leak the Slabs, but free the maps
       return;
@@ -155,32 +154,36 @@ impl core::ops::Drop for SharedMapping {
 
     for each in &self.permissions[..] {
       let slab = each.0.symbol_table_start.load(atomic::Ordering::Relaxed);
-      unsafe {Slab::free(slab)};
-    } 
+      unsafe { Slab::free(slab) };
+    }
   }
 }
 
-
 /// Represents the data that a thread can access after aquiring a [`WritePermit`], a thread can only have access to one permit.
 /// each Thread permit has an index built into the top byte of it's `next_symbol` field.
-pub(crate) struct ThreadPermission{
+pub(crate) struct ThreadPermission {
   // flags : AtomicU64,
-  /// [`std::thread::ThreadId`] holds an [`std::num::NonZeroU64`]. this Atomic represents an `Option<std::num::NonZeroU64>` where `Option::None == 0`
-  pub(crate) thread_id : AtomicU64, 
+  /// Nonzero per-thread owner token for this permit slot. `0` means no thread
+  /// currently owns the slot.
+  pub(crate) thread_id: AtomicU64,
   /// the leading byte represents the "thread number"
   /// the rest represents the symbol count
-  pub(crate) next_symbol : AtomicU64,
+  pub(crate) next_symbol: AtomicU64,
   /// this value should be null if a symbol table is not initialized
-  pub(crate) symbol_table_start   : std::sync::atomic::AtomicPtr<Slab>,
+  pub(crate) symbol_table_start: std::sync::atomic::AtomicPtr<Slab>,
   /// this value should be null if a symbol table is not initialized
-  pub(crate) symbol_table_last : std::sync::atomic::AtomicPtr<Slab>,
+  pub(crate) symbol_table_last: std::sync::atomic::AtomicPtr<Slab>,
 }
 
-
 impl ThreadPermission {
-  const fn init(index : u8) -> ThreadPermission {
+  const fn init(index: u8) -> ThreadPermission {
     core::debug_assert!(index < 0b_1000_0000, "The top bit of a symbol must be kept off.");
-    let next_symbol_val = if index == 0 {1 /* We want to leave the 0 case clear, as that represents the De Bruijn variable introduction */} else {(index as u64) << (u64::BITS - u8::BITS*3 /* leave the top two bytes free for encoding in the pathmap the type/len, the third byte has the map index, the last 5 bytes leave the possibility for 2^40 symbols */)};
+    let next_symbol_val = if index == 0 {
+      1 /* We want to leave the 0 case clear, as that represents the De Bruijn variable introduction */
+    } else {
+      (index as u64)
+        << (u64::BITS - u8::BITS * 3/* leave the top two bytes free for encoding in the pathmap the type/len, the third byte has the map index, the last 5 bytes leave the possibility for 2^40 symbols */)
+    };
     ThreadPermission {
       thread_id: AtomicU64::new(0),
       next_symbol: AtomicU64::new(next_symbol_val),
@@ -190,12 +193,10 @@ impl ThreadPermission {
   }
 }
 
-
 /// micro-Pearson hash, this is just to spread the buckets threads deposit into, hoping to avoid degenerate cases.
-/// `SELECTION` determines how many bytes will be selected for the hash.
-/// `SELECTION` must be greater than 1, otherwise it would always return 0 (defeating the purpose of the hash).
-fn bounded_pearson_hash<const SELECTION : usize>(bytes : &[u8]) -> u8 {
-  core::debug_assert_ne!(SELECTION,0);
+/// `SELECTION` determines the number of forward and reverse samples selected for long byte strings.
+fn bounded_pearson_hash<const SELECTION: usize>(bytes: &[u8]) -> u8 {
+  assert!(SELECTION > 0, "bounded Pearson hash requires at least one sample");
 
   // it's important that each value is unique;
   #[cfg_attr(rustfmt, rustfmt::skip)]
@@ -218,16 +219,31 @@ fn bounded_pearson_hash<const SELECTION : usize>(bytes : &[u8]) -> u8 {
     174,  193,  161,  129,  170,   75,  132,    9,  122,   32,   23,  246,  191,  117,  121,   40,
   ];
 
-  let mut selection = [0;SELECTION];
-  for each in 0..SELECTION.min(bytes.len()) {
-    selection[each] = bytes[each]
-  }
   let mut hash = 0;
-  for each in selection {
+
+  for each in bytes.len().to_le_bytes() {
     hash = PEARSON_TABLE[(hash ^ each) as usize]
+  }
+
+  if bytes.len() <= SELECTION {
+    for &each in bytes {
+      hash = PEARSON_TABLE[(hash ^ each) as usize]
+    }
+    return hash;
+  }
+
+  for sample in 0..SELECTION {
+    let forward_idx = sample * bytes.len() / SELECTION;
+    let reverse_idx = bytes.len() - 1 - forward_idx;
+
+    hash = PEARSON_TABLE[(hash ^ bytes[forward_idx]) as usize];
+    if reverse_idx != forward_idx {
+      hash = PEARSON_TABLE[(hash ^ bytes[reverse_idx]) as usize];
+    }
   }
 
   hash
 }
 
-#[cfg(test)] mod test;
+#[cfg(test)]
+mod test;

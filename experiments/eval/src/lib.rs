@@ -1,31 +1,46 @@
-#![feature(coroutine_trait)]
-#![feature(coroutines)]
-
-use std::collections::HashMap;
-use std::ops::{Coroutine, CoroutineState};
-use mork_expr::{item_source, SourceItem};
-use eval_ffi::{EvalError, ExprSink, ExprSource, FuncPtr, Tag};
+use eval_ffi::{EvalError, ExprSink, ExprSource, ExternFuncPtr, FuncPtr, Tag};
 use log::trace;
+use mork_expr::{SourceItem, item_source};
+use std::collections::HashMap;
 
-extern "C" fn nothing(src: *mut ExprSource, snk: *mut ExprSink) -> Result<(), EvalError> {
+fn nothing(_src: *mut ExprSource, _snk: *mut ExprSink) -> Result<(), EvalError> {
     Ok(())
 }
 
-extern "C" fn quote(src: *mut ExprSource, snk: *mut ExprSink) -> Result<(), EvalError> {
+fn quote(_src: *mut ExprSource, _snk: *mut ExprSink) -> Result<(), EvalError> {
     unreachable!()
+}
+
+#[derive(Clone, Copy)]
+enum Callable {
+    Rust(FuncPtr),
+    Extern(ExternFuncPtr),
+}
+
+impl Callable {
+    fn call(self, source: *mut ExprSource, sink: *mut ExprSink) -> Result<(), EvalError> {
+        match self {
+            Self::Rust(func) => func(source, sink),
+            Self::Extern(func) => func(source, sink).into_result(),
+        }
+    }
 }
 
 pub struct StackFrame {
     sink: ExprSink,
     // sink: SinkCoro,
     rest: usize,
-    func: FuncPtr
+    func: Callable,
 }
 
-pub enum FuncType { Macro, Pure }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FuncType {
+    Macro,
+    Pure,
+}
 
 pub struct Func {
-    func: FuncPtr,
+    func: Callable,
     ty: FuncType,
 }
 
@@ -39,21 +54,17 @@ pub struct EvalScope {
     alloc_pool: Vec<Vec<u8>>,
 }
 
-macro_rules! alloc {
-    (get $es:ident) => {
-        if let Some(mut rv) = $es.alloc_pool.pop() { rv.clear(); rv } else { Vec::with_capacity(EXPR_SIZE) }
-    };
-    (ret $es:ident $buf:ident) => {
-        $buf.clear();
-        self.alloc_pool.push($buf);
-    };
-}
-
 const EXPR_SIZE: usize = 1024 * 1024;
 impl EvalScope {
     pub fn new() -> Self {
         let mut hm = HashMap::new();
-        hm.insert(b"'".to_vec(), Func{ func: quote, ty: FuncType::Pure });
+        hm.insert(
+            b"'".to_vec(),
+            Func {
+                func: Callable::Rust(quote),
+                ty: FuncType::Macro,
+            },
+        );
         Self {
             fns: hm,
             stack: Vec::new(),
@@ -62,7 +73,22 @@ impl EvalScope {
         }
     }
     pub fn add_func(&mut self, name: &str, func: FuncPtr, ty: FuncType) {
-        self.fns.insert(name.as_bytes().to_vec(), Func { func, ty });
+        self.fns.insert(
+            name.as_bytes().to_vec(),
+            Func {
+                func: Callable::Rust(func),
+                ty,
+            },
+        );
+    }
+    pub fn add_extern_func(&mut self, name: &str, func: ExternFuncPtr, ty: FuncType) {
+        self.fns.insert(
+            name.as_bytes().to_vec(),
+            Func {
+                func: Callable::Extern(func),
+                ty,
+            },
+        );
     }
     #[inline]
     fn get_alloc(&mut self) -> Vec<u8> {
@@ -82,7 +108,11 @@ impl EvalScope {
         self.stack.clear();
         // self.alloc_pool.clear();
         let sink = ExprSink::new(self.get_alloc());
-        self.stack.push(StackFrame { sink, rest: 1, func: nothing });
+        self.stack.push(StackFrame {
+            sink,
+            rest: 1,
+            func: Callable::Rust(nothing),
+        });
         self.push_eval()?;
         self.eval_impl()?;
         let top = self.stack.pop().unwrap();
@@ -93,24 +123,32 @@ impl EvalScope {
         // take current expr item, and push a new frame to evaluate it.
         match self.expr.read() {
             SourceItem::Tag(Tag::Arity(arity)) => {
-                let SourceItem::Symbol(fn_name) = self.expr.read() else { return Err(EvalError::from("expected function symbol on the left")) };
+                let SourceItem::Symbol(fn_name) = self.expr.read() else {
+                    return Err(EvalError::from("expected function symbol on the left"));
+                };
                 let func = self.fns.get(fn_name).ok_or_else(|| {
                     trace!(target: "pure", "{:?} not in function registry", std::str::from_utf8(fn_name));
                     "unknown function"
-                })?.func;
-                if func == quote {
+                })?;
+                if func.ty == FuncType::Macro {
                     let top_frame = self.stack.last_mut().unwrap();
-                    let e = mork_expr::Expr { ptr: unsafe { self.expr.ptr.cast_mut().add(self.expr.position) } };
-                    let mut src = item_source(e);
-                    while let CoroutineState::Yielded(i) = std::pin::pin!(&mut src).resume(()) {
+                    let e = mork_expr::Expr {
+                        ptr: unsafe { self.expr.ptr.cast_mut().add(self.expr.position) },
+                    };
+                    for i in item_source(e) {
                         top_frame.sink.write(i)?;
                     }
                 } else {
                     let mut frame = StackFrame {
                         // yes this is just get_alloc but Rust is stupid
-                        sink: ExprSink::new(if let Some(mut rv) = self.alloc_pool.pop() { rv.clear(); rv } else { Vec::with_capacity(EXPR_SIZE) }),
+                        sink: ExprSink::new(if let Some(mut rv) = self.alloc_pool.pop() {
+                            rv.clear();
+                            rv
+                        } else {
+                            Vec::with_capacity(EXPR_SIZE)
+                        }),
                         rest: arity as usize - 1,
-                        func: func
+                        func: func.func,
                     };
                     frame.sink.write(SourceItem::Tag(Tag::Arity(arity)))?;
                     frame.sink.write(SourceItem::Symbol(fn_name))?;
@@ -134,11 +172,13 @@ impl EvalScope {
             // if the top frame is done, move its result into the parent frame.
             if top_frame.rest == 0 {
                 let prev_frame = parent_frames.last_mut().unwrap();
-                let mut data = core::mem::take(&mut top_frame.sink).finish();
+                let data = core::mem::take(&mut top_frame.sink).finish();
                 let offset = prev_frame.sink.as_ref().len();
-                (top_frame.func)(&mut ExprSource::new(data.as_ptr()), &mut prev_frame.sink)?;
+                top_frame
+                    .func
+                    .call(&mut ExprSource::new(data.as_ptr()), &mut prev_frame.sink)?;
                 trace!(target: "eval", "{:?} ==> {:?}", mork_expr::serialize(&data[..]), mork_expr::serialize(&prev_frame.sink.as_ref()[offset..]));
-                let top = self.stack.pop().unwrap();
+                self.stack.pop().unwrap();
                 // return buffer to pool
                 self.return_alloc(data);
                 continue;

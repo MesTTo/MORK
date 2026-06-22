@@ -313,7 +313,7 @@
         (predict $prediction)
         ((ctx $ctx) (total_gini_impurity $prediction $x) $i)
     )
-    (O  (min ((ctx $ctx) total_gini_impurity_choice $prediction min $y) $y $i)
+    (O  (fmin ((ctx $ctx) total_gini_impurity_choice $prediction min $y) $y $i)
     )
 )
 
@@ -545,4 +545,3 @@
 ;                  A lot of excess computation is not directly affecting the final result.
 ;                  I initially tried programming it in this way but had enough orthogonal issues that I decided to
 ;                     simplify and finish the project.
-

@@ -41,13 +41,25 @@ pub trait Index: Copy + Ord {
 }
 
 impl Index for u32 {
-    #[inline] fn to_usize(self) -> usize { self as usize }
-    #[inline] fn from_usize(x: usize) -> Self { x as u32 }
+    #[inline]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn from_usize(x: usize) -> Self {
+        x as u32
+    }
 }
 
 impl Index for u64 {
-    #[inline] fn to_usize(self) -> usize { self as usize }
-    #[inline] fn from_usize(x: usize) -> Self { x as u64 }
+    #[inline]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn from_usize(x: usize) -> Self {
+        x as u64
+    }
 }
 
 /// Value type — saturating arithmetic in matmul for integers, normal
@@ -61,27 +73,63 @@ pub trait Value: Copy + Default + PartialEq {
 }
 
 impl Value for u32 {
-    #[inline] fn one() -> Self { 1 }
-    #[inline] fn sat_add(a: Self, b: Self) -> Self { (Saturating(a) + Saturating(b)).0 }
-    #[inline] fn sat_mul(a: Self, b: Self) -> Self { (Saturating(a) * Saturating(b)).0 }
+    #[inline]
+    fn one() -> Self {
+        1
+    }
+    #[inline]
+    fn sat_add(a: Self, b: Self) -> Self {
+        (Saturating(a) + Saturating(b)).0
+    }
+    #[inline]
+    fn sat_mul(a: Self, b: Self) -> Self {
+        (Saturating(a) * Saturating(b)).0
+    }
 }
 
 impl Value for u64 {
-    #[inline] fn one() -> Self { 1 }
-    #[inline] fn sat_add(a: Self, b: Self) -> Self { (Saturating(a) + Saturating(b)).0 }
-    #[inline] fn sat_mul(a: Self, b: Self) -> Self { (Saturating(a) * Saturating(b)).0 }
+    #[inline]
+    fn one() -> Self {
+        1
+    }
+    #[inline]
+    fn sat_add(a: Self, b: Self) -> Self {
+        (Saturating(a) + Saturating(b)).0
+    }
+    #[inline]
+    fn sat_mul(a: Self, b: Self) -> Self {
+        (Saturating(a) * Saturating(b)).0
+    }
 }
 
 impl Value for f32 {
-    #[inline] fn one() -> Self { 1.0 }
-    #[inline] fn sat_add(a: Self, b: Self) -> Self { a + b }
-    #[inline] fn sat_mul(a: Self, b: Self) -> Self { a * b }
+    #[inline]
+    fn one() -> Self {
+        1.0
+    }
+    #[inline]
+    fn sat_add(a: Self, b: Self) -> Self {
+        a + b
+    }
+    #[inline]
+    fn sat_mul(a: Self, b: Self) -> Self {
+        a * b
+    }
 }
 
 impl Value for f64 {
-    #[inline] fn one() -> Self { 1.0 }
-    #[inline] fn sat_add(a: Self, b: Self) -> Self { a + b }
-    #[inline] fn sat_mul(a: Self, b: Self) -> Self { a * b }
+    #[inline]
+    fn one() -> Self {
+        1.0
+    }
+    #[inline]
+    fn sat_add(a: Self, b: Self) -> Self {
+        a + b
+    }
+    #[inline]
+    fn sat_mul(a: Self, b: Self) -> Self {
+        a * b
+    }
 }
 
 /// Compressed-sparse-row sparse tensor.
@@ -111,7 +159,9 @@ unsafe impl<T> Sync for SendPtr<T> {}
 #[cfg(feature = "rayon")]
 impl<T> SendPtr<T> {
     #[inline]
-    fn ptr(self) -> *mut T { self.0 }
+    fn ptr(self) -> *mut T {
+        self.0
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -143,7 +193,12 @@ impl<I: Index, V: Value> Csr<I, V> {
             values.push(one);
         }
         row_ptr.push(nu);
-        Self { shape: vec![nu, nu], row_ptr, col_idx, values }
+        Self {
+            shape: vec![nu, nu],
+            row_ptr,
+            col_idx,
+            values,
+        }
     }
 
     /// Build from a directed edge list — each edge contributes `V::one()`.
@@ -177,7 +232,9 @@ impl<I: Index, V: Value> Csr<I, V> {
         let mut cur_row = 0usize;
 
         for &(r, c, v) in &deduped {
-            if v == V::default() { continue; }
+            if v == V::default() {
+                continue;
+            }
             let ru = r.to_usize();
             while cur_row <= ru {
                 row_ptr[cur_row] = col_idx_out.len();
@@ -191,7 +248,12 @@ impl<I: Index, V: Value> Csr<I, V> {
             cur_row += 1;
         }
 
-        Self { shape: vec![nu, nu], row_ptr, col_idx: col_idx_out, values: values_out }
+        Self {
+            shape: vec![nu, nu],
+            row_ptr,
+            col_idx: col_idx_out,
+            values: values_out,
+        }
     }
 
     /// Build directly from CSR-style arrays for an arbitrary (rectangular or
@@ -214,8 +276,17 @@ impl<I: Index, V: Value> Csr<I, V> {
             row_ptr.len(),
             rows + 1
         );
-        assert_eq!(col_idx.len(), values.len(), "col_idx and values length differ");
-        Self { shape, row_ptr, col_idx, values }
+        assert_eq!(
+            col_idx.len(),
+            values.len(),
+            "col_idx and values length differ"
+        );
+        Self {
+            shape,
+            row_ptr,
+            col_idx,
+            values,
+        }
     }
 
     // ── Shape accessors ──
@@ -272,7 +343,9 @@ impl<I: Index, V: Value> Csr<I, V> {
 
 impl<I: Index, V: Value> Csr<I, V> {
     /// Number of structural non-zeros.
-    pub fn nnz(&self) -> usize { self.values.len() }
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
 
     /// Value at `(r, c)` via binary search within the row, or `V::default()`.
     /// Requires a 2D shape (rectangular is fine); panics otherwise.
@@ -352,7 +425,12 @@ impl<I: Index, V: Value> Csr<I, V> {
             row_ptr.push(col_idx.len());
         }
 
-        Self { shape: vec![nu, nu], row_ptr, col_idx, values }
+        Self {
+            shape: vec![nu, nu],
+            row_ptr,
+            col_idx,
+            values,
+        }
     }
 
     /// Parallel SpGEMM via rayon. Two-pass: symbolic (count nnz per row),
@@ -518,7 +596,12 @@ impl<I: Index, V: Value> Csr<I, V> {
             row_ptr.push(col_idx.len());
         }
 
-        Self { shape: self.shape.clone(), row_ptr, col_idx, values }
+        Self {
+            shape: self.shape.clone(),
+            row_ptr,
+            col_idx,
+            values,
+        }
     }
 }
 
@@ -546,7 +629,9 @@ impl<I: Index, V: Value> Csr<I, V> {
         fn union(parent: &mut [usize], rank: &mut [u8], a: usize, b: usize) {
             let ra = find(parent, a);
             let rb = find(parent, b);
-            if ra == rb { return; }
+            if ra == rb {
+                return;
+            }
             if rank[ra] < rank[rb] {
                 parent[ra] = rb;
             } else if rank[ra] > rank[rb] {
@@ -614,7 +699,9 @@ impl<I: Index, V: Value> Csr<I, V> {
         let deg = |row_ptr: &[usize], node: usize| row_ptr[node + 1] - row_ptr[node];
 
         for seed in 0..nu {
-            if visited[seed] { continue; }
+            if visited[seed] {
+                continue;
+            }
 
             // Pseudo-peripheral start: BFS from `seed`, take the last node visited.
             let start = {
@@ -708,9 +795,16 @@ impl<I: Index, V: Value> Csr<I, V> {
         for r in 0..nu {
             let s = new_row_ptr[r];
             let e = new_row_ptr[r + 1];
-            if e - s <= 1 { continue; }
+            if e - s <= 1 {
+                continue;
+            }
             pairs.clear();
-            pairs.extend(new_col[s..e].iter().copied().zip(new_val[s..e].iter().copied()));
+            pairs.extend(
+                new_col[s..e]
+                    .iter()
+                    .copied()
+                    .zip(new_val[s..e].iter().copied()),
+            );
             pairs.sort_unstable_by_key(|&(c, _)| c);
             for (i, &(c, v)) in pairs.iter().enumerate() {
                 new_col[s + i] = c;
@@ -774,8 +868,12 @@ impl<V: Value + 'static> NDIndex<V> for Csr<u32, V> {
 }
 
 impl<V: Value + 'static> Sparse2D<V> for Csr<u32, V> {
-    fn nnz(&self) -> usize { self.values.len() }
-    fn n_rows(&self) -> usize { self.row_ptr.len() - 1 }
+    fn nnz(&self) -> usize {
+        self.values.len()
+    }
+    fn n_rows(&self) -> usize {
+        self.row_ptr.len() - 1
+    }
     fn row_nnz(&self, row: usize) -> usize {
         self.row_ptr[row + 1] - self.row_ptr[row]
     }
@@ -851,10 +949,8 @@ mod tests {
     #[test]
     fn connected_components_two() {
         // Two triangles: {0,1,2} and {3,4,5}
-        let m: Csr<u32, u32> = Csr::from_edges(6, &[
-            (0, 1), (1, 2), (2, 0),
-            (3, 4), (4, 5), (5, 3),
-        ]);
+        let m: Csr<u32, u32> =
+            Csr::from_edges(6, &[(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3)]);
         let comps = m.connected_components();
         assert_eq!(comps[0], comps[1]);
         assert_eq!(comps[1], comps[2]);
@@ -866,10 +962,19 @@ mod tests {
     #[test]
     fn bandwidth_basic() {
         // Tridiagonal: entries on (i, i±1) only
-        let m: Csr<u32, u32> = Csr::from_edges(5, &[
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            (1, 0), (2, 1), (3, 2), (4, 3),
-        ]);
+        let m: Csr<u32, u32> = Csr::from_edges(
+            5,
+            &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (1, 0),
+                (2, 1),
+                (3, 2),
+                (4, 3),
+            ],
+        );
         let (max_bw, _avg) = m.bandwidth_stats();
         assert_eq!(max_bw, 1);
     }
@@ -885,7 +990,10 @@ mod tests {
         let (bw0, _) = m.bandwidth_stats();
         m.rcm();
         let (bw1, _) = m.bandwidth_stats();
-        assert!(bw1 <= bw0, "RCM should not increase bandwidth ({bw0} -> {bw1})");
+        assert!(
+            bw1 <= bw0,
+            "RCM should not increase bandwidth ({bw0} -> {bw1})"
+        );
     }
 
     #[test]
@@ -960,23 +1068,32 @@ mod tests {
     #[test]
     #[should_panic(expected = "square 2D")]
     fn connected_components_panics_on_batched() {
-        let m = Csr::<u32, u32>::from_parts(
-            vec![2, 2, 2],
-            vec![0, 1, 1, 2, 2],
-            vec![0, 1],
-            vec![1, 1],
-        );
+        let m =
+            Csr::<u32, u32>::from_parts(vec![2, 2, 2], vec![0, 1, 1, 2, 2], vec![0, 1], vec![1, 1]);
         let _ = m.connected_components();
     }
 
     #[cfg(feature = "rayon")]
     #[test]
     fn matmul_par_agrees_with_seq() {
-        let a: Csr<u32, u32> = Csr::from_edges(10, &[
-            (0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
-            (5, 6), (6, 7), (7, 8), (8, 9), (9, 0),
-            (0, 5), (1, 6), (2, 7),
-        ]);
+        let a: Csr<u32, u32> = Csr::from_edges(
+            10,
+            &[
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8),
+                (8, 9),
+                (9, 0),
+                (0, 5),
+                (1, 6),
+                (2, 7),
+            ],
+        );
         let r1 = a.matmul(&a);
         let r2 = a.matmul_par(&a);
         assert_eq!(r1.nnz(), r2.nnz());

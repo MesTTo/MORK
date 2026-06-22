@@ -45,14 +45,38 @@ use crate::tensor::{NDIndex, Sparse2D};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvalidSpec {
     MissingArrow,
-    InvalidIndex { ch: char },
-    WrongInputCount { expected: usize, got: usize },
-    EmptyInput { input: usize },
-    UnboundOutputIndex { index: char },
-    InputNdimMismatch { input: usize, array_ndim: usize, spec_ndim: usize },
-    DimensionMismatch { index: char, expected: usize, got: usize },
-    OutputNdimMismatch { array_ndim: usize, spec_ndim: usize },
-    OutputDimMismatch { axis: usize, expected: usize, got: usize },
+    InvalidIndex {
+        ch: char,
+    },
+    WrongInputCount {
+        expected: usize,
+        got: usize,
+    },
+    EmptyInput {
+        input: usize,
+    },
+    UnboundOutputIndex {
+        index: char,
+    },
+    InputNdimMismatch {
+        input: usize,
+        array_ndim: usize,
+        spec_ndim: usize,
+    },
+    DimensionMismatch {
+        index: char,
+        expected: usize,
+        got: usize,
+    },
+    OutputNdimMismatch {
+        array_ndim: usize,
+        spec_ndim: usize,
+    },
+    OutputDimMismatch {
+        axis: usize,
+        expected: usize,
+        got: usize,
+    },
 }
 
 fn slot_to_char(s: u8) -> char {
@@ -71,19 +95,40 @@ impl fmt::Display for InvalidSpec {
             Self::UnboundOutputIndex { index } => {
                 write!(f, "output index '{index}' does not appear in any input")
             }
-            Self::InputNdimMismatch { input, array_ndim, spec_ndim } => write!(
+            Self::InputNdimMismatch {
+                input,
+                array_ndim,
+                spec_ndim,
+            } => write!(
                 f,
                 "input {input} has {array_ndim} dimensions but spec has {spec_ndim} indices"
             ),
-            Self::DimensionMismatch { index, expected, got } => {
-                write!(f, "dimension mismatch for index '{index}': {expected} vs {got}")
+            Self::DimensionMismatch {
+                index,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "dimension mismatch for index '{index}': {expected} vs {got}"
+                )
             }
-            Self::OutputNdimMismatch { array_ndim, spec_ndim } => write!(
+            Self::OutputNdimMismatch {
+                array_ndim,
+                spec_ndim,
+            } => write!(
                 f,
                 "output has {array_ndim} dimensions but spec has {spec_ndim} output indices"
             ),
-            Self::OutputDimMismatch { axis, expected, got } => {
-                write!(f, "output dimension {axis} is {got} but expected {expected}")
+            Self::OutputDimMismatch {
+                axis,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "output dimension {axis} is {got} but expected {expected}"
+                )
             }
         }
     }
@@ -170,12 +215,61 @@ pub(crate) fn parse_spec(spec: &str, expected_inputs: usize) -> Result<Spec, Inv
     for out in &outputs {
         for &s in out {
             if !seen[s as usize] {
-                return Err(InvalidSpec::UnboundOutputIndex { index: slot_to_char(s) });
+                return Err(InvalidSpec::UnboundOutputIndex {
+                    index: slot_to_char(s),
+                });
             }
         }
     }
 
     Ok(Spec { inputs, outputs })
+}
+
+/// Infer output shapes for an explicit einsum spec from input shapes.
+///
+/// This follows the same explicit `lhs->rhs` contract used by [`einsum`]:
+/// every input subscript labels one input axis, repeated labels must have the
+/// same dimension, and each output subscript must be bound by an input.
+pub fn infer_output_shapes(
+    spec_str: &str,
+    input_shapes: &[&[usize]],
+) -> Result<Vec<Vec<usize>>, InvalidSpec> {
+    let spec = parse_spec(spec_str, input_shapes.len())?;
+    let mut dims = [0usize; 26];
+    let mut dim_set = [false; 26];
+
+    for (pi, inp_spec) in spec.inputs.iter().enumerate() {
+        let shape = input_shapes[pi];
+        if shape.len() != inp_spec.len() {
+            return Err(InvalidSpec::InputNdimMismatch {
+                input: pi,
+                array_ndim: shape.len(),
+                spec_ndim: inp_spec.len(),
+            });
+        }
+        for (pos, &s) in inp_spec.iter().enumerate() {
+            let si = s as usize;
+            let d = shape[pos];
+            if dim_set[si] {
+                if dims[si] != d {
+                    return Err(InvalidSpec::DimensionMismatch {
+                        index: slot_to_char(s),
+                        expected: dims[si],
+                        got: d,
+                    });
+                }
+            } else {
+                dims[si] = d;
+                dim_set[si] = true;
+            }
+        }
+    }
+
+    Ok(spec
+        .outputs
+        .iter()
+        .map(|out| out.iter().map(|&s| dims[s as usize]).collect())
+        .collect())
 }
 
 fn validate_output<T, Out: NDIndex<T> + ?Sized>(
@@ -209,7 +303,12 @@ fn validate_output<T, Out: NDIndex<T> + ?Sized>(
 enum VmOp {
     /// Iterate `slot` from 0 to `dim-1`. `end_pc` is one past the matching
     /// `LoopEnd`. `fused` = body is a single `MulAcc`; run inline.
-    DenseLoop { slot: u8, dim: usize, end_pc: usize, fused: bool },
+    DenseLoop {
+        slot: u8,
+        dim: usize,
+        end_pc: usize,
+        fused: bool,
+    },
     /// For each non-zero in `inputs[input_idx]`'s compound row — formed by
     /// flattening `leading` (row-major, using `leading_dims`) from the current
     /// `vals` — set `vals[col_slot]` to the column index. Same `end_pc`/`fused`
@@ -224,7 +323,11 @@ enum VmOp {
     },
     LoopEnd,
     /// Allocate dense accumulator of size `dim`, indexed by `acc_slot`.
-    AccStart { acc_slot: u8, acc_out_pos: u8, dim: usize },
+    AccStart {
+        acc_slot: u8,
+        acc_out_pos: u8,
+        dim: usize,
+    },
     /// Flush accumulator: scatter-gather write touched entries, then clear.
     AccFlush,
     /// Multiply input values at current slot positions and accumulate.
@@ -338,8 +441,7 @@ pub fn compile<T, In: NDIndex<T> + ?Sized>(
                 if let Some((leading, col)) = axes {
                     let leads_fixed = leading.iter().all(|&l| fixed[l as usize]);
                     if *col == s && !leading.contains(&s) && leads_fixed {
-                        let leading_dims =
-                            leading.iter().map(|&l| dims[l as usize]).collect();
+                        let leading_dims = leading.iter().map(|&l| dims[l as usize]).collect();
                         loop_order.push(VmOp::SparseRowLoop {
                             input_idx: idx,
                             leading: leading.clone(),
@@ -441,7 +543,11 @@ pub fn compile<T, In: NDIndex<T> + ?Sized>(
         ops.push(op);
         if let Some((acc_slot, acc_out_pos, dim, flush_idx)) = acc_info {
             if i == flush_idx {
-                ops.push(VmOp::AccStart { acc_slot, acc_out_pos, dim });
+                ops.push(VmOp::AccStart {
+                    acc_slot,
+                    acc_out_pos,
+                    dim,
+                });
             }
         }
     }
@@ -472,7 +578,10 @@ pub fn compile<T, In: NDIndex<T> + ?Sized>(
 
     // Fusion: a loop whose body is exactly `MulAcc` can call mul_acc inline.
     for pc in 0..ops.len() - 1 {
-        let is_loop = matches!(&ops[pc], VmOp::DenseLoop { .. } | VmOp::SparseRowLoop { .. });
+        let is_loop = matches!(
+            &ops[pc],
+            VmOp::DenseLoop { .. } | VmOp::SparseRowLoop { .. }
+        );
         if is_loop && matches!(&ops[pc + 1], VmOp::MulAcc) {
             match &mut ops[pc] {
                 VmOp::DenseLoop { fused, .. } => *fused = true,
@@ -564,7 +673,12 @@ impl Program {
         let ops = &self.ops;
         while pc < ops.len() {
             match &ops[pc] {
-                VmOp::DenseLoop { slot, dim, end_pc, fused } => {
+                VmOp::DenseLoop {
+                    slot,
+                    dim,
+                    end_pc,
+                    fused,
+                } => {
                     let s = *slot as usize;
                     if *fused {
                         for v in 0..*dim {
@@ -588,7 +702,14 @@ impl Program {
                     }
                     pc = *end_pc;
                 }
-                VmOp::SparseRowLoop { input_idx, leading, leading_dims, col_slot, end_pc, fused } => {
+                VmOp::SparseRowLoop {
+                    input_idx,
+                    leading,
+                    leading_dims,
+                    col_slot,
+                    end_pc,
+                    fused,
+                } => {
                     // Compound row: row-major flatten of the leading slots.
                     let mut row = 0usize;
                     for (k, &ls) in leading.iter().enumerate() {
@@ -626,7 +747,11 @@ impl Program {
                     pc = *end_pc;
                 }
                 VmOp::LoopEnd => return pc + 1,
-                VmOp::AccStart { acc_slot, acc_out_pos, dim } => {
+                VmOp::AccStart {
+                    acc_slot,
+                    acc_out_pos,
+                    dim,
+                } => {
                     *acc_state = Some(AccState {
                         acc: vec![T::default(); *dim],
                         touched: vec![false; *dim],
@@ -885,16 +1010,28 @@ impl fmt::Display for Program {
         for op in &self.ops {
             let pad = "  ".repeat(indent);
             match op {
-                VmOp::DenseLoop { slot, dim, fused, .. } => {
+                VmOp::DenseLoop {
+                    slot, dim, fused, ..
+                } => {
                     let ch = (slot + b'a') as char;
                     let tag = if *fused { "  [FUSED]" } else { "" };
                     writeln!(f, "{pad}FOR {ch} IN 0..{dim}{tag}")?;
                     indent += 1;
                 }
-                VmOp::SparseRowLoop { input_idx, leading, col_slot, fused, .. } => {
+                VmOp::SparseRowLoop {
+                    input_idx,
+                    leading,
+                    col_slot,
+                    fused,
+                    ..
+                } => {
                     let row_str: String = leading.iter().map(|&s| (s + b'a') as char).collect();
                     let col_ch = (col_slot + b'a') as char;
-                    let tag = if *fused { "  [SPARSE,FUSED]" } else { "  [SPARSE]" };
+                    let tag = if *fused {
+                        "  [SPARSE,FUSED]"
+                    } else {
+                        "  [SPARSE]"
+                    };
                     writeln!(
                         f,
                         "{pad}FOR ({col_ch}, val) IN input[{input_idx}].row({row_str}){tag}"
@@ -926,6 +1063,25 @@ impl fmt::Display for Program {
 mod tests {
     use super::*;
     use crate::dense::Dense;
+
+    #[test]
+    fn infer_output_shapes_from_explicit_spec() {
+        let shapes = infer_output_shapes("ab,bc->ac", &[&[2, 3], &[3, 4]]).unwrap();
+        assert_eq!(shapes, vec![vec![2, 4]]);
+    }
+
+    #[test]
+    fn infer_output_shapes_reports_dimension_mismatch() {
+        let err = infer_output_shapes("ab,bc->ac", &[&[2, 3], &[4, 4]]).unwrap_err();
+        assert_eq!(
+            err,
+            InvalidSpec::DimensionMismatch {
+                index: 'b',
+                expected: 3,
+                got: 4
+            }
+        );
+    }
 
     #[test]
     fn matmul_dense_dense() {
@@ -963,9 +1119,7 @@ mod tests {
         let mut a = Dense::<f32>::zeros(vec![2, 3]);
         a.fill_from(&[1., 2., 3., 4., 5., 6.]);
         let mut b = Dense::<f32>::zeros(vec![3, 4]);
-        b.fill_from(&[
-            1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.,
-        ]);
+        b.fill_from(&[1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.]);
         let mut c = Dense::<f32>::zeros(vec![4, 2]);
         c.fill_from(&[1., 2., 3., 4., 5., 6., 7., 8.]);
         let mut d = Dense::<f32>::zeros(vec![2, 2]);
@@ -1032,7 +1186,10 @@ mod tests {
                 .unwrap();
         let plan = format!("{prog}");
         assert!(plan.contains("[SPARSE]"), "expected a sparse loop:\n{plan}");
-        assert!(plan.contains(".row(bi)"), "expected compound (b,i) row:\n{plan}");
+        assert!(
+            plan.contains(".row(bi)"),
+            "expected compound (b,i) row:\n{plan}"
+        );
 
         // Result matches the all-dense VM.
         let mut out_sp = Dense::<f32>::zeros(vec![2, 2, 3]);
@@ -1058,7 +1215,12 @@ mod tests {
         use crate::csr::Csr;
 
         // Non-square sparse A (2×3) times dense X (3×4).
-        let a = Csr::<u32, f32>::from_parts(vec![2, 3], vec![0, 2, 3], vec![1, 2, 0], vec![2.0, 3.0, 1.0]);
+        let a = Csr::<u32, f32>::from_parts(
+            vec![2, 3],
+            vec![0, 2, 3],
+            vec![1, 2, 0],
+            vec![2.0, 3.0, 1.0],
+        );
         let mut a_dense = Dense::<f32>::zeros(vec![2, 3]);
         a_dense.fill_from(&[0., 2., 3., 1., 0., 0.]);
         let mut x = Dense::<f32>::zeros(vec![3, 4]);

@@ -28,11 +28,19 @@ use crate::tensor::NDIndex;
 // SIMD kernels
 // ─────────────────────────────────────────────────────────────────────────
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 use std::arch::x86_64::*;
 
 /// 8×8 `C += A·Bᵀ` via AVX2+FMA. One ymm per result row.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[inline(always)]
 unsafe fn avx2_matmul_acc_8x8(a: *const f32, b: *const f32, c: *mut f32) {
     unsafe {
@@ -63,7 +71,11 @@ unsafe fn avx2_matmul_acc_8x8(a: *const f32, b: *const f32, c: *mut f32) {
 }
 
 /// 16×16 `C += A·Bᵀ` via AVX2+FMA. Two ymm halves per row, 4-row tiles.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
 #[inline(always)]
 unsafe fn avx2_matmul_acc_16x16(a: *const f32, b: *const f32, c: *mut f32) {
     unsafe {
@@ -106,7 +118,11 @@ fn block_matmul_acc<const N: usize, const SQ: usize>(
     b: &[f32; SQ],
     c: &mut [f32; SQ],
 ) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
     {
         match N {
             8 => {
@@ -177,11 +193,21 @@ impl<const N: usize, const SQ: usize> Blocked<N, SQ> {
         let nd = shape.len();
         let n_block_rows = ceil_div(shape[nd - 2], N);
         let n_block_cols = ceil_div(shape[nd - 1], N);
-        let outer_size: usize = if nd > 2 { shape[..nd - 2].iter().product() } else { 1 };
+        let outer_size: usize = if nd > 2 {
+            shape[..nd - 2].iter().product()
+        } else {
+            1
+        };
         let total_blocks = outer_size * n_block_rows * n_block_cols;
         let mut blocks = Vec::with_capacity(total_blocks);
         blocks.resize_with(total_blocks, || None);
-        Self { shape, n_block_rows, n_block_cols, outer_size, blocks }
+        Self {
+            shape,
+            n_block_rows,
+            n_block_cols,
+            outer_size,
+            blocks,
+        }
     }
 
     /// Count of non-zero scalar entries inside present blocks.
@@ -233,7 +259,9 @@ impl<const N: usize, const SQ: usize> NDIndex<f32> for Blocked<N, SQ> {
             return 0.0;
         }
         let (block_idx, local_idx) = self.block_coords(ix);
-        self.blocks[block_idx].as_ref().map_or(0.0, |b| b[local_idx])
+        self.blocks[block_idx]
+            .as_ref()
+            .map_or(0.0, |b| b[local_idx])
     }
     fn set(&mut self, ix: &[usize], v: f32) {
         let (block_idx, local_idx) = self.block_coords(ix);
@@ -391,7 +419,10 @@ mod tests {
                 let a = out_blocked.get(&[0, 0, qi, ki]);
                 let b = out_naive.get(&[0, 0, qi, ki]);
                 let denom = a.abs().max(b.abs()).max(1e-6);
-                assert!((a - b).abs() / denom < 1e-3, "mismatch at ({qi},{ki}): {a} vs {b}");
+                assert!(
+                    (a - b).abs() / denom < 1e-3,
+                    "mismatch at ({qi},{ki}): {a} vs {b}"
+                );
             }
         }
     }
