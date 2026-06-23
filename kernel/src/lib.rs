@@ -8,3 +8,8 @@ pub mod space;
 mod sources;
 mod sinks;
 mod pure;
+
+pub use sinks::{
+    wasm_linear_memory_policy, WasmLinearMemoryPolicy, WASM_LINEAR_MEMORY_GUARD_BYTES,
+    WASM_LINEAR_MEMORY_RESERVATION_BYTES,
+};
