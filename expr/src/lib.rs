@@ -741,6 +741,42 @@ impl Expr {
     }
     #[doc(hidden)]
     #[deprecated]
+    pub fn unify_into(self, other: Expr, o: &mut ExprZipper) -> Result<(), UnificationFailure> {
+        let mut s = vec![(ExprEnv::new(0, self), ExprEnv::new(1, other))];
+
+        match unify(&mut s) {
+            Ok(bindings) => {
+                let mut cycled = BTreeMap::<(u8, u8), u8>::new();
+                let mut stack: Vec<(u8, u8)> = vec![];
+                let mut assignments: Vec<(u8, u8)> = vec![];
+                apply_bindings(
+                    0,
+                    0,
+                    0,
+                    &mut ExprZipper::new(self),
+                    &bindings,
+                    o,
+                    &mut cycled,
+                    &mut stack,
+                    &mut assignments,
+                );
+
+                // The lower-level unifier catches direct occurs failures. Applying
+                // bindings can expose indirect cycles, so keep this public path safe.
+                if !cycled.is_empty() {
+                    return Err(UnificationFailure::Occurs(
+                        cycled.first_key_value().unwrap().0.clone(),
+                        /* This value is only present to satisfy the historical error signature. */
+                        ExprEnv::new(1, other),
+                    ));
+                }
+
+                Ok(())
+            }
+            Err(f) => Err(f),
+        }
+    }
+
     pub fn _unify(self, other: Expr, o: &mut ExprZipper) -> Result<(), UnificationFailure> {
          let mut s = vec![(ExprEnv::new(0, self), ExprEnv::new(1, other))];
  
@@ -2206,6 +2242,206 @@ struct AuState {
 const AU_MAX_DEPTH: usize = 1000;
 
 #[inline(always)]
+fn apply_bindings(
+    n: u8,
+    mut original_intros: u8,
+    mut new_intros: u8,
+    ez: &mut ExprZipper,
+    bindings: &BTreeMap<ExprVar, ExprEnv>,
+    oz: &mut ExprZipper,
+    cycled: &mut BTreeMap<ExprVar, u8>,
+    stack: &mut Vec<ExprVar>,
+    assignments: &mut Vec<ExprVar>,
+) -> (u8, u8) {
+    let depth = stack.len();
+    if stack.len() > APPLY_DEPTH as usize {
+        panic!("apply depth > {APPLY_DEPTH}: {n} {original_intros} {new_intros}");
+    }
+    if PRINT_DEBUG {
+        println!(
+            "{}@ n={} original={} new={} ez={:?}",
+            "  ".repeat(depth),
+            n,
+            original_intros,
+            new_intros,
+            ez.subexpr()
+        );
+    }
+    loop {
+        match ez.item() {
+            Ok(Tag::NewVar) => {
+                match bindings.get(&(n, original_intros)) {
+                    None => {
+                        if PRINT_DEBUG {
+                            println!(
+                                "{}@ $ no binding for {:?}",
+                                "  ".repeat(depth),
+                                (n, original_intros)
+                            );
+                        }
+                        // println!("original {original_intros} new {new_intros}");
+                        if let Some(pos) =
+                            assignments.iter().position(|e| *e == (n, original_intros))
+                        {
+                            // println!("{}assignments _{} for {:?} (newvar)", "  ".repeat(depth), pos + 1, (n, original_intros));
+                            oz.write_var_ref(pos as u8);
+                        } else {
+                            oz.write_new_var();
+                            new_intros += 1;
+                            assignments.push((n, original_intros));
+                        }
+                        oz.loc += 1;
+                        original_intros += 1;
+                    }
+                    Some(rhs) => {
+                        if PRINT_DEBUG {
+                            println!(
+                                "{}@ $ with bindings +{} {} for {:?}",
+                                "  ".repeat(depth),
+                                rhs.n,
+                                rhs.show(),
+                                (n, original_intros)
+                            );
+                        }
+                        // println!("stack={stack:?}");
+                        if let Some(introduced) = cycled.get(&(n, original_intros)) {
+                            if PRINT_DEBUG {
+                                println!(
+                                    "{}cycled _{} for {:?} (newvar)",
+                                    "  ".repeat(depth),
+                                    *introduced + 1,
+                                    (n, original_intros)
+                                )
+                            };
+                            oz.write_var_ref(*introduced);
+                            // println!("nv cycled contains {:?}", (n, original_intros));
+                            oz.loc += 1;
+                        } else if stack.contains(&(n, original_intros)) {
+                            cycled.insert((n, original_intros), new_intros);
+                            // println!("nv cycled insert {:?}", (n, original_intros));
+                            oz.write_new_var();
+                            oz.loc += 1;
+                            new_intros += 1;
+                        } else {
+                            stack.push((n, original_intros));
+                            let (_evars_, nvars_) = apply_bindings(
+                                rhs.n,
+                                rhs.v,
+                                new_intros,
+                                &mut ExprZipper::new(rhs.subsexpr()),
+                                bindings,
+                                oz,
+                                cycled,
+                                stack,
+                                assignments,
+                            );
+                            new_intros = nvars_;
+                            stack.pop();
+                        }
+                        original_intros += 1;
+                    }
+                }
+            }
+            Ok(Tag::VarRef(i)) => {
+                match bindings.get(&(n, i)) {
+                    None => {
+                        if PRINT_DEBUG {
+                            println!(
+                                "{}@ _{} no binding for {:?}",
+                                "  ".repeat(depth),
+                                i + 1,
+                                (n, i)
+                            );
+                        }
+                        if let Some(pos) = assignments.iter().position(|e| *e == (n, i)) {
+                            // println!("{}assignments _{} for {:?} (ref)", "  ".repeat(depth), pos+1, (n, i));
+                            oz.write_var_ref(pos as u8);
+                        } else {
+                            oz.write_new_var();
+                            new_intros += 1;
+                            assignments.push((n, i)); // this can't be right in general
+                        }
+                        oz.loc += 1;
+                    }
+                    Some(rhs) => {
+                        if PRINT_DEBUG {
+                            println!(
+                                "{}@ _{} with binding +{} {} for {:?}",
+                                "  ".repeat(depth),
+                                i + 1,
+                                rhs.n,
+                                rhs.show(),
+                                (n, i)
+                            );
+                        }
+                        // println!("stack={stack:?}");
+                        if let Some(introduced) = cycled.get(&(n, i)) {
+                            // println!("vr cycled contains {:?}", (n, i));
+                            if PRINT_DEBUG {
+                                println!(
+                                    "{}cycled _{} for {:?} (ref) rhs={}",
+                                    "  ".repeat(depth),
+                                    *introduced + 1,
+                                    (n, i),
+                                    rhs.show()
+                                );
+                            }
+                            oz.write_var_ref(*introduced);
+                            oz.loc += 1;
+                        } else if stack.contains(&(n, i)) {
+                            // println!("vr cycled insert {:?}", (n, i));
+                            cycled.insert((n, i), new_intros);
+                            oz.write_new_var();
+                            oz.loc += 1;
+                            new_intros += 1;
+                        } else {
+                            stack.push((n, i));
+                            let (_evars_, nvars_) = apply_bindings(
+                                rhs.n,
+                                rhs.v,
+                                new_intros,
+                                &mut ExprZipper::new(rhs.subsexpr()),
+                                bindings,
+                                oz,
+                                cycled,
+                                stack,
+                                assignments,
+                            );
+                            new_intros = nvars_;
+                            stack.pop();
+                        }
+                        // oz.write_var_ref(i);
+                        // oz.loc += 1;
+                    }
+                }
+            }
+            Ok(Tag::SymbolSize(_s)) => {
+                unreachable!()
+            }
+            Err(slice) => {
+                if PRINT_DEBUG {
+                    println!("{}@ \"{}\"", "  ".repeat(depth), unsafe {
+                        std::str::from_utf8_unchecked(slice)
+                    });
+                }
+                oz.write_symbol(slice);
+                oz.loc += 1 + slice.len();
+            }
+            Ok(Tag::Arity(a)) => {
+                if PRINT_DEBUG {
+                    println!("{}@ [{}]", "  ".repeat(depth), a);
+                }
+                oz.write_arity(a);
+                oz.loc += 1;
+            }
+        }
+
+        if !ez.next() {
+            return (original_intros, new_intros);
+        }
+    }
+}
+
 fn decomposable(lhs: &ExprEnv, rhs: &ExprEnv) -> bool {
     // Variables are treated as atoms (disagreement => generalized var),
     // and repetition is handled by memoizing disagreement pairs.
