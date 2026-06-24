@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use mork_expr::{maybe_byte_item, Tag};
+use mork_expr::{Tag, maybe_byte_item};
 use pathmap::PathMap;
+use pathmap::zipper::*;
 
 /// Canonical identity for an encoded MORK term or subterm.
 #[repr(transparent)]
@@ -154,11 +155,42 @@ pub enum TermParseErrorKind {
 pub struct TermIdentitySidecar {
     terms: Vec<TermRecord>,
     facts: Vec<FactRecord>,
+    /// Liveness weight per fact, parallel to `facts` and indexed by `FactId`. A
+    /// fact is present iff its weight is positive. Removal tombstones (sets the
+    /// weight to 0) instead of compacting, so postings keyed on `FactId` stay
+    /// valid; this is the Lucene "live documents" deletion model. Re-insertion
+    /// revives the fact.
+    fact_weight: Vec<i64>,
     hash_buckets: HashMap<u128, Vec<TermId>>,
     fact_by_term: HashMap<TermId, FactId>,
     encoded_bytes: usize,
     max_depth: u16,
     generation: u32,
+    /// Per-prefix staleness watermark for the persistent sidecar: the
+    /// `read_zipper_at_path(prefix).val_count()` at which each factor prefix was
+    /// last synced from the live space. A query reuses an interned subspace when
+    /// its current count matches, and re-syncs (re-intern adds, tombstone
+    /// vanished facts) when it differs. Drives incremental maintenance across
+    /// exec steps so the sidecar is not rebuilt from scratch each query.
+    synced_prefix_count: HashMap<Vec<u8>, usize>,
+    /// Cumulative facts re-scanned by `sync_prefix_if_stale` re-syncs. A
+    /// from-scratch sidecar re-scans its whole subspace every query; the
+    /// persistent sidecar only re-scans changed prefixes, so this stops growing
+    /// once the queried relations are stable. Per-sidecar (race-free) instead of
+    /// a process global.
+    resync_scans: usize,
+    /// Last observed data-removal generation. When the live counter moves ahead,
+    /// a fact was deleted somewhere the per-prefix value-count watermark cannot
+    /// see (an equal-count swap), so every prefix watermark is invalidated to
+    /// force a re-sync. See `invalidate_if_removed`.
+    observed_remove_gen: u64,
+    /// Facts grouped by relation head (the root term's first child). Lets
+    /// arrangement build scan one relation's facts instead of the whole space,
+    /// so a persistent sidecar that accumulates many relations does not make
+    /// every arrangement build O(all facts). Entries are never removed (a
+    /// tombstoned or rolled-back `FactId` stays), because build already filters
+    /// by liveness and by head, so stale entries are skipped, not wrong.
+    facts_by_relation: HashMap<TermId, Vec<FactId>>,
 }
 
 impl TermIdentitySidecar {
@@ -167,30 +199,27 @@ impl TermIdentitySidecar {
         Self::default()
     }
 
+    /// Interns one complete encoded term and all of its subterms without adding
+    /// a complete fact record.
+    pub fn insert_term(&mut self, encoded: &[u8]) -> Result<TermId, TermParseError> {
+        let (parsed, _) = self.intern_complete(encoded)?;
+        Ok(parsed.id)
+    }
+
     /// Interns one complete encoded fact and all of its subterms.
     ///
     /// Re-inserting the same complete fact returns the existing [`FactId`].
     pub fn insert_fact(&mut self, encoded: &[u8]) -> Result<FactId, TermParseError> {
-        let mark = self.mark();
-        let parsed = match self.intern_at(encoded, 0) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                self.rollback_to(mark);
-                return Err(error);
-            }
-        };
-        if parsed.end != encoded.len() {
-            self.rollback_to(mark);
-            return Err(TermParseError {
-                offset: parsed.end,
-                kind: TermParseErrorKind::TrailingBytes {
-                    parsed_len: parsed.end,
-                    total_len: encoded.len(),
-                },
-            });
-        }
+        let (parsed, mark) = self.intern_complete(encoded)?;
 
         if let Some(&fact) = self.fact_by_term.get(&parsed.id) {
+            // Revive a tombstoned fact on re-insert. Set semantics: presence is
+            // binary, so clamp the weight at 1 rather than counting derivations.
+            let weight = &mut self.fact_weight[fact.0 as usize];
+            if *weight <= 0 {
+                *weight = 1;
+                self.generation = self.generation.saturating_add(1);
+            }
             return Ok(fact);
         }
 
@@ -207,6 +236,7 @@ impl TermIdentitySidecar {
         self.generation = self.generation.saturating_add(1);
 
         let root = self.term(parsed.id);
+        let relation_head = root.children().first().copied();
         let fact = FactRecord {
             id: FactId(fact_index),
             root: parsed.id,
@@ -216,8 +246,90 @@ impl TermIdentitySidecar {
         };
 
         self.facts.push(fact);
+        self.fact_weight.push(1);
         self.fact_by_term.insert(parsed.id, fact.id);
+        if let Some(head) = relation_head {
+            self.facts_by_relation
+                .entry(head)
+                .or_default()
+                .push(fact.id);
+        }
         Ok(fact.id)
+    }
+
+    /// Removes a fact, tombstoning it if it is present and live. Returns `true`
+    /// when the fact was live and is now removed, `false` when it was absent or
+    /// already dead. The `FactRecord` and `FactId` are retained (weight set to 0)
+    /// so arrangement and trie postings keyed on `FactId` stay valid; a later
+    /// `insert_fact` of the same fact revives the same `FactId`. This is the
+    /// Lucene "live documents" deletion model (flip a liveness bit, leave the
+    /// immutable postings, reclaim space only on an optional later compaction)
+    /// and the counting algorithm for multiset view maintenance (Gupta, Mumick,
+    /// Subrahmanian, "Maintaining Views Incrementally", SIGMOD 1993).
+    pub fn remove_fact(&mut self, encoded: &[u8]) -> bool {
+        let Some(term) = self.term_id_for_encoded(encoded) else {
+            return false;
+        };
+        let Some(&fact) = self.fact_by_term.get(&term) else {
+            return false;
+        };
+        let weight = &mut self.fact_weight[fact.0 as usize];
+        if *weight <= 0 {
+            return false;
+        }
+        *weight = 0;
+        self.generation = self.generation.saturating_add(1);
+        true
+    }
+
+    /// Whether a fact is currently live (present in the snapshot). A tombstoned
+    /// fact is retained for `FactId` stability but is not live; consumers that
+    /// scan `facts()` must skip dead facts via this check.
+    pub fn is_fact_live(&self, fact: FactId) -> bool {
+        self.fact_weight
+            .get(fact.0 as usize)
+            .is_some_and(|&weight| weight > 0)
+    }
+
+    /// Whether any live fact under one of `prefixes` contains variables.
+    pub fn any_schematic_fact_under_prefixes(&self, prefixes: &[Vec<u8>]) -> bool {
+        self.facts.iter().any(|fact| {
+            if fact.flags.ground || !self.is_fact_live(fact.id) {
+                return false;
+            }
+            let encoded = self.term(fact.root).encoded();
+            prefixes.iter().any(|prefix| encoded.starts_with(prefix))
+        })
+    }
+
+    /// Count of live facts. Tombstoned facts still occupy a `FactId` slot but are
+    /// not counted.
+    pub fn live_fact_count(&self) -> usize {
+        self.fact_weight
+            .iter()
+            .filter(|&&weight| weight > 0)
+            .count()
+    }
+
+    /// Applies a batch of fact additions and removals, the unit of incremental
+    /// maintenance across exec steps. Additions are interned (idempotent,
+    /// reviving a tombstone); removals are tombstoned. Removals are applied after
+    /// additions, so a fact that appears in both ends removed. This is the
+    /// delta-application step of incremental view maintenance (apply a signed
+    /// Z-set delta: insert the positive part, retract the negative part; Gupta,
+    /// Mumick, Subrahmanian, SIGMOD 1993; DBSP, PVLDB 16(7), 2023).
+    pub fn apply_fact_delta(
+        &mut self,
+        added: &[&[u8]],
+        removed: &[&[u8]],
+    ) -> Result<(), TermParseError> {
+        for &fact in added {
+            self.insert_fact(fact)?;
+        }
+        for &fact in removed {
+            self.remove_fact(fact);
+        }
+        Ok(())
     }
 
     /// Interns every value path from a `PathMap<()>` snapshot.
@@ -234,6 +346,107 @@ impl TermIdentitySidecar {
         Ok(inserted)
     }
 
+    /// Interns every value path under `prefix` from a `PathMap<()>` snapshot.
+    ///
+    /// Unlike `extend_from_pathmap`, this scans only the subspace rooted at
+    /// `prefix` (a query factor's relation/arity prefix from `Expr::prefix`), so
+    /// lowering a body interns the facts its factors actually read instead of the
+    /// whole space. `origin_path()` is the absolute path including the prefix, the
+    /// full encoded fact `insert_fact` needs. The interned set is a subset of what
+    /// `extend_from_pathmap` would produce, so a join over these relations is
+    /// unchanged; only the scan shrinks from O(space) to O(subspace).
+    pub fn extend_from_pathmap_under_prefix(
+        &mut self,
+        map: &PathMap<()>,
+        prefix: &[u8],
+    ) -> Result<usize, TermParseError> {
+        let mut inserted = 0usize;
+        let mut rz = map.read_zipper_at_path(prefix);
+        while rz.to_next_val() {
+            let before = self.facts.len();
+            self.insert_fact(rz.origin_path())?;
+            inserted += usize::from(self.facts.len() != before);
+        }
+        Ok(inserted)
+    }
+
+    /// Re-syncs the interned subspace under `prefix` to match the snapshot:
+    /// interns (or revives) every fact present under the prefix, then tombstones
+    /// every interned fact under the prefix the snapshot no longer holds. After
+    /// this the live facts under `prefix` equal the snapshot's facts under
+    /// `prefix`, the invariant a from-scratch re-intern would give. The
+    /// add-then-tombstone order is the signed delta of incremental view
+    /// maintenance (insert the positive part, retract the negative part).
+    pub fn resync_under_prefix(
+        &mut self,
+        map: &PathMap<()>,
+        prefix: &[u8],
+    ) -> Result<(), TermParseError> {
+        self.extend_from_pathmap_under_prefix(map, prefix)?;
+        let mut vanished: Vec<Box<[u8]>> = Vec::new();
+        for fact in &self.facts {
+            if self.fact_weight[fact.id.0 as usize] <= 0 {
+                continue;
+            }
+            if let Some(term) = self.terms.get(fact.root.0 as usize) {
+                let encoded = term.encoded();
+                if encoded.starts_with(prefix) && !map.contains(encoded) {
+                    vanished.push(encoded.into());
+                }
+            }
+        }
+        for encoded in &vanished {
+            self.remove_fact(encoded);
+        }
+        Ok(())
+    }
+
+    /// Syncs the subspace under `prefix` only when stale, keyed on the snapshot's
+    /// value count under the prefix. Returns `true` if a re-sync ran, `false` if
+    /// the watermark matched and the interned subspace was reused. This is the
+    /// per-query amortization: an unchanged relation is not re-interned.
+    pub fn sync_prefix_if_stale(
+        &mut self,
+        map: &PathMap<()>,
+        prefix: &[u8],
+        count: usize,
+    ) -> Result<bool, TermParseError> {
+        if self.synced_prefix_count.get(prefix) == Some(&count) {
+            return Ok(false);
+        }
+        self.resync_under_prefix(map, prefix)?;
+        self.resync_scans += count;
+        self.synced_prefix_count.insert(prefix.to_vec(), count);
+        Ok(true)
+    }
+
+    /// Cumulative facts re-scanned by stale-prefix re-syncs. Instruments the
+    /// incremental-interning amortization (see `resync_scans`).
+    pub fn resync_scans(&self) -> usize {
+        self.resync_scans
+    }
+
+    /// Records that the subspace under `prefix` is synced at `count` without
+    /// scanning. The incremental-maintenance hook: after a transform feeds its
+    /// own output delta into the sidecar, the written relation is already current,
+    /// so its watermark advances to the post-write count and the next query skips
+    /// the re-sync (self-recursive amortization).
+    pub fn mark_prefix_synced(&mut self, prefix: &[u8], count: usize) {
+        self.synced_prefix_count.insert(prefix.to_vec(), count);
+    }
+
+    /// Invalidates every prefix watermark when the data-removal generation has
+    /// advanced since last observed, so the next query re-syncs and tombstones
+    /// deleted facts the count watermark could not see (an equal-count swap). A
+    /// no-op while no removals occur, so add-only recursive workloads keep full
+    /// amortization.
+    pub fn invalidate_if_removed(&mut self, current_remove_gen: u64) {
+        if self.observed_remove_gen != current_remove_gen {
+            self.synced_prefix_count.clear();
+            self.observed_remove_gen = current_remove_gen;
+        }
+    }
+
     /// Returns a term record by identity.
     pub fn get_term(&self, id: TermId) -> Option<&TermRecord> {
         self.terms.get(id.0 as usize)
@@ -242,6 +455,20 @@ impl TermIdentitySidecar {
     /// Returns a fact record by identity.
     pub fn get_fact(&self, id: FactId) -> Option<&FactRecord> {
         self.facts.get(id.0 as usize)
+    }
+
+    /// Returns complete fact records in insertion order.
+    pub fn facts(&self) -> &[FactRecord] {
+        &self.facts
+    }
+
+    /// Fact ids under a relation head (the root term's first child): the bounded
+    /// scan set for arrangement build. Empty for an unknown relation. May contain
+    /// tombstoned or stale ids, which the caller filters by liveness and head.
+    pub fn facts_for_relation(&self, relation: TermId) -> &[FactId] {
+        self.facts_by_relation
+            .get(&relation)
+            .map_or(&[][..], |facts| facts.as_slice())
     }
 
     /// Returns the existing identity for `encoded` if it has already been interned.
@@ -288,6 +515,33 @@ impl TermIdentitySidecar {
             .expect("TermId should refer to an interned record")
     }
 
+    fn intern_complete(
+        &mut self,
+        encoded: &[u8],
+    ) -> Result<(ParsedTerm, SidecarMark), TermParseError> {
+        let mark = self.mark();
+        let parsed = match self.intern_at(encoded, 0) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.rollback_to(mark);
+                return Err(error);
+            }
+        };
+
+        if parsed.end != encoded.len() {
+            self.rollback_to(mark);
+            return Err(TermParseError {
+                offset: parsed.end,
+                kind: TermParseErrorKind::TrailingBytes {
+                    parsed_len: parsed.end,
+                    total_len: encoded.len(),
+                },
+            });
+        }
+
+        Ok((parsed, mark))
+    }
+
     fn mark(&self) -> SidecarMark {
         SidecarMark {
             terms: self.terms.len(),
@@ -322,6 +576,7 @@ impl TermIdentitySidecar {
             };
             self.fact_by_term.remove(&fact.root);
         }
+        self.fact_weight.truncate(self.facts.len());
 
         self.encoded_bytes = mark.encoded_bytes;
         self.max_depth = mark.max_depth;
@@ -498,7 +753,7 @@ pub fn structural_hash(encoded: &[u8]) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mork_expr::{item_byte, Tag};
+    use mork_expr::{Tag, item_byte};
 
     fn sym(bytes: &[u8]) -> Vec<u8> {
         let mut out = vec![item_byte(Tag::SymbolSize(bytes.len() as u8))];
@@ -560,6 +815,23 @@ mod tests {
     }
 
     #[test]
+    fn insert_term_does_not_create_fact_record() {
+        let mut encoded = vec![item_byte(Tag::Arity(2))];
+        encoded.extend(sym(b"pattern"));
+        encoded.push(item_byte(Tag::NewVar));
+
+        let mut sidecar = TermIdentitySidecar::new();
+        let root = sidecar.insert_term(&encoded).unwrap();
+
+        assert_eq!(
+            sidecar.get_term(root).unwrap().kind,
+            TermKind::Application { arity: 2 }
+        );
+        assert_eq!(sidecar.stats().facts, 0);
+        assert!(sidecar.facts().is_empty());
+    }
+
+    #[test]
     fn variable_bearing_fact_is_classified_as_schematic() {
         let mut encoded = vec![item_byte(Tag::Arity(2))];
         encoded.extend(sym(b"fact"));
@@ -571,6 +843,31 @@ mod tests {
         assert!(!sidecar.get_fact(fact).unwrap().flags.ground);
         assert!(sidecar.get_fact(fact).unwrap().flags.contains_vars);
         assert_eq!(sidecar.stats().schematic_facts, 1);
+    }
+
+    #[test]
+    fn any_schematic_fact_under_prefixes_skips_ground_and_dead_facts() {
+        let mut schematic = vec![item_byte(Tag::Arity(2))];
+        schematic.extend(sym(b"fact"));
+        schematic.push(item_byte(Tag::NewVar));
+        let mut schematic_prefix = vec![item_byte(Tag::Arity(2))];
+        schematic_prefix.extend(sym(b"fact"));
+
+        let mut ground = vec![item_byte(Tag::Arity(2))];
+        ground.extend(sym(b"ground"));
+        ground.extend(sym(b"x"));
+        let mut ground_prefix = vec![item_byte(Tag::Arity(2))];
+        ground_prefix.extend(sym(b"ground"));
+
+        let mut sidecar = TermIdentitySidecar::new();
+        sidecar.insert_fact(&schematic).unwrap();
+        sidecar.insert_fact(&ground).unwrap();
+
+        assert!(sidecar.any_schematic_fact_under_prefixes(&[schematic_prefix.clone()]));
+        assert!(!sidecar.any_schematic_fact_under_prefixes(&[ground_prefix]));
+
+        assert!(sidecar.remove_fact(&schematic));
+        assert!(!sidecar.any_schematic_fact_under_prefixes(&[schematic_prefix]));
     }
 
     #[test]
