@@ -8,6 +8,8 @@ pub mod space;
 mod sources;
 mod sinks;
 mod pure;
+#[cfg(feature = "einsum")]
+pub mod graph_tensor;
 pub mod term_identity;
 
 #[doc(hidden)]
