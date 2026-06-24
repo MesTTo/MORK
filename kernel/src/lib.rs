@@ -8,6 +8,7 @@ pub mod space;
 mod sources;
 mod sinks;
 mod pure;
+pub mod egraph;
 pub mod term_identity;
 
 #[doc(hidden)]
