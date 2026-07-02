@@ -1,0 +1,4 @@
+session "WilliamProofs" = "HOL-Library" +
+  description "Exact byte accounting of the WILLIAM factoring (realized gain = predicted gain - REF_COST, kernel/src/william.rs) and prefix-freeness of the maximal top-k greedy (weighted_paths.rs top_k_maximal)."
+  theories
+    WilliamGain

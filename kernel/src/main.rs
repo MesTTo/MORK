@@ -1,7 +1,10 @@
 #![feature(string_from_utf8_lossy_owned)]
 
 use mork::expr;
-use mork::space::{ACT_PATH, Space, TRANSITIONS, UNIFICATIONS, WRITES};
+use mork::space::{
+    ACT_PATH, SIDECAR_SCHEMATIC_DECLINES, SIDECAR_UNIFY_ENABLED, SIDECAR_UNIFY_RECOVERS, Space,
+    TRANSITIONS, UNIFICATIONS, WRITES,
+};
 use mork_expr::{Tag, item_byte, serialize};
 use pathmap::zipper::ZipperMoving;
 use std::collections::{BTreeSet, HashSet};
@@ -244,61 +247,118 @@ fn basic() {
 // work (inference, scheduling) focuses where it pays. This measures the top-k weighted iterator
 // against the O(n) full-scan baseline on a skewed, MeTTa-shaped store.
 fn william_bench() {
-    use mork::weighted_paths::WeightedPathIndex;
-    use pathmap::PathMap;
+    use mork::weighted_paths::{WeightedPathIndex, decode_pattern};
+    use mork::william::{REF_COST, compression_loop, expand, store_bytes};
 
+    // Skewed like real knowledge: ~70% of atoms instantiate one of 8 long shared rule
+    // templates (heavy compressible patterns); the rest are near-unique facts (a light
+    // tail). Parsed through the Space so the index runs over real MORK-encoded atoms.
     const N: usize = 200_000;
-    let mut atoms: PathMap<()> = PathMap::new();
+    let mut src = String::new();
     for i in 0..N {
-        // Skewed like real knowledge: ~70% of atoms instantiate one of 8 long shared rule
-        // templates (heavy compressible patterns); the rest are near-unique facts (a light tail).
-        let key = if i % 10 < 7 {
-            format!("(rule (when (concept C{:02})) (then (assert A{:08x})))", i % 8, i)
+        if i % 10 < 7 {
+            src.push_str(&format!(
+                "(rule (when (concept C{:02})) (then (assert A{:08x})))\n",
+                i % 8,
+                i
+            ));
         } else {
-            format!("(fact F{:08x} (value V{:08x}))", i, (i as u32).wrapping_mul(2654435761))
-        };
-        atoms.insert(key.as_bytes(), ());
+            src.push_str(&format!(
+                "(fact F{:08x} (value V{:08x}))\n",
+                i,
+                (i as u32).wrapping_mul(2654435761)
+            ));
+        }
     }
+    let mut s = Space::new();
+    s.add_all_sexpr(src.as_bytes()).unwrap();
+    let atoms = &s.btm;
 
-    let ref_cost = 4u64;
+    // The raw (every-prefix) index is the large one; the query-engine A/B runs there,
+    // where its cost matters. The boundary index is small by construction (whole
+    // subexpressions only) and drives the readable report and the factoring loop.
     let t = Instant::now();
-    let index = WeightedPathIndex::from_compression_gain(&atoms, ref_cost);
+    let raw = WeightedPathIndex::from_compression_gain(atoms, REF_COST);
+    let raw_build = t.elapsed();
+    let t = Instant::now();
+    let index = WeightedPathIndex::from_compression_gain_on_boundaries(atoms, REF_COST);
     let index_build = t.elapsed();
-    let t = Instant::now();
+    let raw_tree = raw.selection_tree().unwrap();
     let tree = index.selection_tree().unwrap();
-    let tree_build = t.elapsed();
+    let raw_entries = raw.stats().positive_entries;
     let entries = index.stats().positive_entries;
 
     let k = 16;
-    assert_eq!(tree.top_k(k), index.top_k_by_scan(k), "best-first must match the scan baseline");
+    assert_eq!(
+        raw_tree.top_k(k),
+        raw.top_k_by_scan(k),
+        "best-first must match the scan baseline"
+    );
+    let t = Instant::now();
+    let pre = raw_tree.topk_index(k);
+    let pre_build = t.elapsed();
+    assert_eq!(pre.top_k(k), raw_tree.top_k(k), "precomputed must match best-first");
 
     const REPS: usize = 3000;
     let t = Instant::now();
     for _ in 0..REPS {
-        std::hint::black_box(index.top_k_by_scan(k));
+        std::hint::black_box(raw.top_k_by_scan(k));
     }
     let scan_t = t.elapsed();
     let t = Instant::now();
     for _ in 0..REPS {
-        std::hint::black_box(tree.top_k(k));
+        std::hint::black_box(raw_tree.top_k(k));
     }
     let bf_t = t.elapsed();
+    let t = Instant::now();
+    for _ in 0..REPS {
+        std::hint::black_box(pre.top_k(k));
+    }
+    let pre_t = t.elapsed();
 
     println!(
-        "william: atoms={N} positive_entries={entries} index_build={index_build:?} tree_build={tree_build:?}"
+        "william: atoms={N} raw_entries={raw_entries} boundary_entries={entries} raw_build={raw_build:?} boundary_build={index_build:?} topk_precompute={pre_build:?}"
     );
     println!(
-        "  top-{k} x{REPS}: scan O(n)={:.2}ms  best-first={:.2}ms  speedup={:.1}x  ({:.0} vs {:.0} ns/query)",
+        "  raw top-{k} x{REPS}: scan O(n)={:.2}ms  best-first={:.2}ms ({:.1}x)  precomputed={:.3}ms ({:.0}x)",
         scan_t.as_secs_f64() * 1e3,
         bf_t.as_secs_f64() * 1e3,
         scan_t.as_secs_f64() / bf_t.as_secs_f64(),
-        scan_t.as_secs_f64() / REPS as f64 * 1e9,
-        bf_t.as_secs_f64() / REPS as f64 * 1e9,
+        pre_t.as_secs_f64() * 1e3,
+        scan_t.as_secs_f64() / pre_t.as_secs_f64(),
     );
-    println!("  heaviest compressible patterns (gain = bytes saved by factoring):");
-    for (p, w) in tree.top_k(6) {
-        println!("    gain={w:>7}  {}", String::from_utf8_lossy(&p));
+    println!("  heaviest non-overlapping subpatterns (gain = bytes saved by factoring):");
+    for (p, w) in tree.top_k_maximal(6) {
+        println!("    gain={w:>8}  {}", decode_pattern(&p));
     }
+
+    // The validated compression loop on a copy: factor until nothing pays, then invert.
+    let mut original: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    atoms.for_each_value(|p, _| {
+        original.insert(p.to_vec());
+    });
+    let mut work = atoms.clone();
+    let before = store_bytes(&work);
+    let t = Instant::now();
+    let outcomes = compression_loop(&mut work, 8, 12);
+    let loop_t = t.elapsed();
+    println!("  compression loop ({} rounds in {loop_t:?}):", outcomes.len());
+    for o in &outcomes {
+        println!(
+            "    -{:>8} bytes  x{:<6} {}",
+            o.realized_gain, o.count, o.rendered
+        );
+    }
+    let after = store_bytes(&work);
+    let mut expanded: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    expand(&work).for_each_value(|p, _| {
+        expanded.insert(p.to_vec());
+    });
+    assert_eq!(expanded, original, "expansion must invert the loop exactly");
+    println!(
+        "  store bytes {before} -> {after} ({:.1}% saved), expansion round-trip exact",
+        (before - after) as f64 / before as f64 * 100.0
+    );
 }
 
 fn process_calculus_bench(steps: usize, x: usize, y: usize) {
@@ -356,11 +416,157 @@ fn process_calculus_bench(steps: usize, x: usize, y: usize) {
         unsafe { UNIFICATIONS },
         unsafe { TRANSITIONS }
     );
+    println!(
+        "unify-route recoveries {}, schematic declines {}",
+        SIDECAR_UNIFY_RECOVERS.load(std::sync::atomic::Ordering::Relaxed),
+        SIDECAR_SCHEMATIC_DECLINES.load(std::sync::atomic::Ordering::Relaxed),
+    );
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
 
+// A RETRACTING immediate-consequence benchmark: a re-arming transitive-closure
+// worker over a chain of `nodes` nodes (so the `path` dish grows ~quadratically),
+// with a single `O`/`-` retraction of a mid-chain edge fired a few rounds in. After
+// the retraction, the `Naive` retract mode re-scans the whole (large) dish on every
+// remaining round (O(steps x dish)); `Dred` runs ONE re-derivation catch-up per
+// retraction and then resumes the incremental delta (O(steps x delta)). This is the
+// workload where DRed's incremental advantage over the naive fallback shows. Builds
+// the program once, runs it under each retract mode, asserts the dishes are
+// byte-identical, and prints wall time + the final dish size for each.
+//
+// The driver/worker/gate shape mirrors the proven-byte-identical corpus
+// `rearming_gated_program`, so the result is the same closure the corpus validates.
+// Build the retracting-TC benchmark program for `nodes` nodes and `steps` re-arming
+// rounds: a chain n0->...->n(nodes-1) plus a parallel skip edge over the mid link (so
+// the removed mid edge's path stays re-derivable through the skip, forcing DRed's
+// re-derivation to engage), `path` seeded to the edges, a HIGH-priority one-shot
+// remover `(exec (A) ...)` (arity-1 tag, byte 1, sorts before the driver's arity-2
+// `(D ...)` tag, byte 2) that retracts the mid edge+path on the first round then is
+// consumed, and a re-arming driver (Peano counter `steps`) that re-arms the closure
+// worker `(W)` every round. So the worker fires `steps` times AFTER the single
+// retraction. The shape mirrors the proven-byte-identical corpus rearming program.
+#[cfg(feature = "semi_naive_ic")]
+fn retracting_tc_program(nodes: usize, steps: usize) -> String {
+    let mut facts = String::new();
+    for i in 0..nodes.saturating_sub(1) {
+        facts.push_str(&format!("(edge n{i} n{}) (path n{i} n{})\n", i + 1, i + 1));
+    }
+    let mid = nodes / 2;
+    if mid >= 1 && mid + 1 < nodes {
+        facts.push_str(&format!(
+            "(edge n{} n{}) (path n{} n{})\n",
+            mid - 1,
+            mid + 1,
+            mid - 1,
+            mid + 1
+        ));
+    }
+    format!(
+        r#"
+(exec (A) (, (edge n{mid} n{midp})) (O (- (edge n{mid} n{midp})) (- (path n{mid} n{midp}))))
+(exec (D {counter})
+      (, (exec (D (S $c)) $sp $st) ((W) $p $t))
+      (, (exec (D $c) $sp $st) (exec (R) $p $t)))
+((W) (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+{facts}
+"#,
+        counter = peano(steps),
+        midp = mid + 1,
+    )
+}
+
+// Run the retracting-TC program under both retract modes, assert byte-identity, and
+// return `(naive us, dred us, dish size)`. The wall time is a single run per mode
+// (the benchmark sweep calls this at several sizes).
+#[cfg(feature = "semi_naive_ic")]
+fn retracting_tc_run_both(nodes: usize, steps: usize) -> (u128, u128, usize) {
+    use mork::space::SniRetractMode;
+    let program = retracting_tc_program(nodes, steps);
+
+    let run_mode = |mode: SniRetractMode| -> (u128, usize, String, usize, usize) {
+        let mut sp = Space::new();
+        sp.add_sexpr(program.as_bytes(), expr!(sp, "$"), expr!(sp, "_1"))
+            .unwrap();
+        sp.sni_retract_mode = mode;
+        let t0 = Instant::now();
+        sp.metta_calculus(1_000_000_000_000_000);
+        let us = t0.elapsed().as_micros();
+        let dish = sp.btm.val_count();
+        let mut v = vec![];
+        sp.dump_all_sexpr(&mut v).unwrap();
+        let dump = String::from_utf8_lossy(&v).into_owned();
+        (us, dish, dump, sp.sni_dred_repairs, sp.sni_dred_fallbacks)
+    };
+
+    let (n_us, n_dish, n_dump, _, _) = run_mode(SniRetractMode::Naive);
+    let (d_us, d_dish, d_dump, _d_rep, _d_fb) = run_mode(SniRetractMode::Dred);
+    assert_eq!(
+        n_dump, d_dump,
+        "retracting_tc(nodes={nodes}, steps={steps}): Naive and Dred dishes must be byte-identical"
+    );
+    assert_eq!(n_dish, d_dish);
+    (n_us, d_us, n_dish)
+}
+
+// A single retracting-TC benchmark point with a verbose report (repairs/fallbacks).
+#[cfg(feature = "semi_naive_ic")]
+fn bench_retracting_tc(nodes: usize, steps: usize) {
+    use mork::space::SniRetractMode;
+    let program = retracting_tc_program(nodes, steps);
+    let mut sp = Space::new();
+    sp.add_sexpr(program.as_bytes(), expr!(sp, "$"), expr!(sp, "_1"))
+        .unwrap();
+    sp.sni_retract_mode = SniRetractMode::Dred;
+    sp.metta_calculus(1_000_000_000_000_000);
+    let repairs = sp.sni_dred_repairs;
+    let fallbacks = sp.sni_dred_fallbacks;
+
+    let (n_us, d_us, dish) = retracting_tc_run_both(nodes, steps);
+    let speedup = n_us as f64 / d_us.max(1) as f64;
+    println!(
+        "retracting_tc nodes={nodes} steps={steps}: dish={dish}\n  \
+         Naive {n_us} us\n  Dred  {d_us} us (repairs={repairs} fallbacks={fallbacks})\n  \
+         speedup Dred vs Naive: {speedup:.2}x"
+    );
+}
+
+// Sweep the retracting-TC benchmark across sizes to show the SCALING: Naive re-scans
+// the whole dish on every post-retraction round (O(steps x dish)), so its time grows
+// super-linearly with both `nodes` (dish ~ n^2) and `steps`; Dred does one
+// re-derivation catch-up then runs the incremental delta, so its time tracks the work
+// the loop actually does. Prints a (nodes, steps) -> (naive us, dred us, speedup)
+// table; asserts byte-identity at every point.
+#[cfg(feature = "semi_naive_ic")]
+fn bench_retracting_tc_sweep() {
+    use mork::space::SniRetractMode;
+    println!("=== retracting_tc scaling sweep (Naive O(steps x dish) vs Dred incremental) ===");
+
+    // STEPS sweep at fixed nodes: isolates the per-round re-scan cost. Naive should
+    // grow ~linearly in steps (each post-removal round is a full O(dish) match); Dred
+    // should be ~flat in steps past the closure (idle rounds are O(delta)~O(1)).
+    let nodes = 24usize;
+    println!("-- steps sweep at nodes={nodes} (dish fixed) --");
+    for &steps in &[40usize, 80, 160, 320] {
+        let (n_us, d_us, dish) = retracting_tc_run_both(nodes, steps);
+        let speedup = n_us as f64 / d_us.max(1) as f64;
+        println!("  steps={steps:>4} dish={dish}: Naive {n_us:>9} us  Dred {d_us:>9} us  speedup {speedup:.2}x");
+    }
+
+    // NODES sweep with steps scaled to nodes: dish ~ n^2 grows, the closure takes ~n
+    // rounds. Naive time ~ steps x dish ~ n^3; Dred ~ n^2 (the closure) + n x delta.
+    println!("-- nodes sweep (steps = 4*nodes) --");
+    for &nodes in &[12usize, 18, 24, 32, 40] {
+        let steps = 4 * nodes;
+        let (n_us, d_us, dish) = retracting_tc_run_both(nodes, steps);
+        let speedup = n_us as f64 / d_us.max(1) as f64;
+        println!("  nodes={nodes:>3} steps={steps:>3} dish={dish:>5}: Naive {n_us:>9} us  Dred {d_us:>9} us  speedup {speedup:.2}x");
+    }
+    let _ = SniRetractMode::Dred;
+}
+
 fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
+    let mut s = Space::new();
     let mut s = Space::new();
 
     // note 'idle' MM2-like statement that can be activated by moving it to the exec space
@@ -416,6 +622,11 @@ fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
         "unifications {}, instructions {}",
         unsafe { UNIFICATIONS },
         unsafe { TRANSITIONS }
+    );
+    println!(
+        "unify-route recoveries {}, schematic declines {}",
+        SIDECAR_UNIFY_RECOVERS.load(std::sync::atomic::Ordering::Relaxed),
+        SIDECAR_SCHEMATIC_DECLINES.load(std::sync::atomic::Ordering::Relaxed),
     );
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
@@ -7143,6 +7354,12 @@ fn run_legacy_demo(name: Option<String>) {
 fn main() {
     env_logger::init();
 
+    // Operational A/B switch for the worst-case-optimal unification route. Default on;
+    // `MORK_UNIFY_ROUTE=0` forces the declined-schematic case back onto the ProductZipper.
+    if std::env::var("MORK_UNIFY_ROUTE").as_deref() == Ok("0") {
+        SIDECAR_UNIFY_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let args = Cli::parse();
 
     match args.command {
@@ -7197,6 +7414,14 @@ fn main() {
                     }
                     "process_calculus" => {
                         process_calculus_bench(1000, 200, 200);
+                    }
+                    #[cfg(feature = "semi_naive_ic")]
+                    "retracting_tc" => {
+                        bench_retracting_tc(20, 80);
+                    }
+                    #[cfg(feature = "semi_naive_ic")]
+                    "retracting_tc_sweep" => {
+                        bench_retracting_tc_sweep();
                     }
                     "exponential" => {
                         exponential(32);

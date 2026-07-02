@@ -14,6 +14,7 @@ use std::{
 };
 
 pub mod macros;
+pub mod unify_env;
 
 #[cfg(feature = "gxhash")]
 use gxhash;

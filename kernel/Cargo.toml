@@ -27,6 +27,10 @@ itertools = "0.14.0"
 base64 = "0.22.1"
 hex = "0.4.3"
 subprocess = { version = "0.2.13" }
+# Standalone unification-aware WCO-join prototype (zero-dependency). `capture_join.rs`
+# drives its `SubtermZip` descent over the live PathMap, and the differential tests
+# cross-validate it against the ProductZipper matcher and the SWI-Prolog occurs-check seal.
+mork-uni-join = { path = "../../mork-uni-join" }
 
 [features]
 default = ["grounding", "specialize_io", "einsum", "sidecar_bridge_emit"]
@@ -46,6 +50,7 @@ experimental_dnf = ["pathmap/zipper_alg"]
 sidecar_bridge = []
 sidecar_bridge_emit = []
 semi_naive_fixpoint = []
+semi_naive_ic = []
 
 [[test]]
 name = "einsum_sink"

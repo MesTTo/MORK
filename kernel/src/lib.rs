@@ -44,7 +44,11 @@ pub mod space;
 #[cfg(feature = "einsum")]
 mod tensor_ops;
 pub mod term_identity;
+pub mod capture_join;
+pub mod unify_join;
 pub mod weighted_paths;
+pub mod william;
+pub mod zipper_join;
 
 /// Curated public API for derived term, BindingSpace, and sidecar-planner
 /// execution surfaces.
@@ -152,8 +156,13 @@ pub mod api {
         TermParseError, TermParseErrorKind, TermRecord,
     };
     pub use crate::weighted_paths::{
-        WeightedPathError, WeightedPathIndex, WeightedPathStats, WeightedSelectionTree,
-        WeightedSelectionTreeStats,
+        LiveCompressionGainIndex, LiveGainWriter, WeightedPathError, WeightedPathIndex,
+        WeightedPathStats, WeightedSelectionTree, WeightedSelectionTreeStats, WeightedTopKIndex,
+        decode_pattern,
+    };
+    pub use crate::william::{
+        FactoringError, FactoringOutcome, REF_COST, compression_loop, expand, factor_pattern,
+        store_bytes,
     };
     pub use pathmap::PathMap;
 }

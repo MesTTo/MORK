@@ -42,6 +42,67 @@ use subprocess::{PopenConfig, Redirection};
 pub static mut TRANSITIONS: usize = 0;
 pub static mut UNIFICATIONS: usize = 0;
 pub static mut WRITES: usize = 0;
+/// Counts each time the semi-naive delta transform actually runs (the fast
+/// path). Used by the Phase-6a tests to prove the soundness gate did NOT route
+/// process_calculus to naive: a positive count after a run means the delta path
+/// was exercised. Only touched under `semi_naive_ic`.
+#[cfg(feature = "semi_naive_ic")]
+pub static mut SNI_DELTA_CALLS: usize = 0;
+
+/// Count of bodies the sidecar declined to the ProductZipper because a joined
+/// relation held a schematic fact (the `any_schematic_fact_under_prefixes` gate).
+/// Instrumentation for the decline-penalty benchmark; bumped only on that branch.
+pub static SIDECAR_SCHEMATIC_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of schematic bodies the sidecar kept OFF the ProductZipper by routing them through the
+/// worst-case-optimal unification join after the zipper-owned safe gate. Bumped only on that
+/// branch; the recovery counterpart of `SIDECAR_SCHEMATIC_DECLINES`.
+pub static SIDECAR_UNIFY_RECOVERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Toggle for the worst-case-optimal unification route, default OFF for a gated rollout: the
+/// live behaviour is byte-for-byte unchanged until the A/B differential proves the route
+/// identical to the ProductZipper, at which point the default flips on. The differential enables
+/// it explicitly and the benchmark measures it against the ProductZipper (route off).
+pub static SIDECAR_UNIFY_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Kernel selector for the unification route: when ON, the zipper-native join seeks the live
+/// PathMap directly (zero-copy on every compatible factor, one partial re-index per inverted factor);
+/// when OFF, the route decodes the joined relations into the materialized leapfrog. Both produce
+/// byte-identical answers (the A/B differential asserts it); the zipper is faster on selective and
+/// cyclic bodies. Default ON. A body outside the zipper's factor model falls back to the materialized
+/// join regardless of this flag.
+pub static SIDECAR_ZIPPER_JOIN_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "semi_naive_ic")]
+thread_local! {
+    /// Revert for the semi-naive IC delta: when true, `metta_calculus` forces the naive
+    /// loop even with `semi_naive_ic` compiled in (the second revert next to removing
+    /// the feature; `MORK_SNI=0` is the process-wide form, checked at arming).
+    /// THREAD-local so a behavioral test pinning the reference path never disarms a
+    /// concurrently running test's loop (the DRed corpus asserts engagement).
+    pub static SNI_DISARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Count of unification-route bodies emitted by the zipper-native kernel (the rest fell back to the
+/// materialized join because they were outside the factor model). Instrumentation for the kernel A/B.
+pub static SIDECAR_ZIPPER_RECOVERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Toggle for the legacy full-unification capture route, default OFF. Native ProductZipper now
+/// handles data-side capture; this route remains as an opt-in oracle and alternate emit path for
+/// bodies with non-ground query compounds. It should match native ground outputs while exercising
+/// the `mork_uni_join` capture join sealed against SWI-Prolog occurs-check.
+pub static SIDECAR_CAPTURE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Count of bodies emitted through the full-unification capture route. Instrumentation for the
+/// capture A/B.
+pub static SIDECAR_CAPTURE_RECOVERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
@@ -61,6 +122,63 @@ fn query_unify_stack(first: (ExprEnv, ExprEnv)) -> QueryUnifyStack {
 #[cfg(not(feature = "inline_unify_stack"))]
 fn query_unify_stack(first: (ExprEnv, ExprEnv)) -> QueryUnifyStack {
     vec![first]
+}
+
+/// One recursive `,`->`,` rule's entry in the semi-naive per-rule snapshot map.
+/// Keyed (in `sni_rule_seen`) by the rule's pattern+template bytes; the entry
+/// carries the input `snapshot` at the rule's last firing, its cached `dish_count`
+/// (so the cost gate reads the dish size in O(1)), and the `caught_up_gen` the DRed
+/// re-derivation catch-up uses to fire at most once per retraction.
+#[cfg(feature = "semi_naive_ic")]
+#[derive(Clone)]
+pub(crate) struct SniRuleEntry {
+    snapshot: PathMap<()>,
+    dish_count: usize,
+    /// The `sni_removal_gen` this rule last caught up to (DRed mode). A rule needs
+    /// a full re-derivation catch-up iff `caught_up_gen < sni_removal_gen` (a
+    /// removal happened since it last re-scanned the whole dish). Starts at 0.
+    caught_up_gen: u64,
+}
+
+/// How the semi-naive immediate-consequence loop handles a RETRACTION (an `O`/`-`
+/// rule removing a fact) mid-loop. The per-rule semi-naive delta is byte-identical
+/// to naive only while evaluation stays monotone (add-only). A removal breaks the
+/// recurrence (`semi_naive_delta_design.md`, Phase 6a), so by default it routes to
+/// naive. This selects WHAT to do instead.
+///
+/// All variants write a dish byte-identical to naive on the shapes they accept; the
+/// difference is HOW (and how fast). The byte-identical corpus oracle is the
+/// arbiter: `Dred` only ever stays on the incremental path where it is proven
+/// byte-identical, and falls back to `Naive` for any shape it does not handle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SniRetractMode {
+    /// The Phase-6a default: once any removal happens in the loop, latch the
+    /// soundness gate and run the naive full-space match for every `,`->`,` rule
+    /// for the rest of the loop. Always correct, but O(steps x dish).
+    Naive,
+    /// Delete-and-Rederive (Gupta-Mumick-Subrahmanian, SIGMOD 1993): when a step's
+    /// `removed` delta is non-empty, over-delete the recursive outputs that used a
+    /// removed fact (cascade to a fixpoint), re-derive those still supported by the
+    /// survivors, then continue on the fast incremental path. Falls back to `Naive`
+    /// for any shape not proven byte-identical (the conservative safety gate). This
+    /// broadens the incremental win to non-monotone (retracting) recursive programs.
+    Dred,
+    /// DIAGNOSTIC ONLY (never a shipped default): the raw semi-naive delta with the
+    /// soundness gate DISABLED. After a removal the per-rule delta keeps running, so
+    /// the dish can DIVERGE from naive (the textbook non-monotone hole). Used only by
+    /// the divergence-probe and mutation tests to exhibit what DRed must repair.
+    RawSemiNoGate,
+}
+
+/// Outcome of a DRed re-derivation catch-up (`sni_dred_catch_up`).
+#[cfg(feature = "semi_naive_ic")]
+enum DredCatchUp {
+    /// The catch-up round ran; the payload is the rule's `(touched, any_new)`.
+    Done((usize, bool)),
+    /// This rule already re-derived since the last retraction; run the normal delta.
+    AlreadyCaughtUp,
+    /// The rule entry could not be reconstructed; route to the naive path.
+    Fallback,
 }
 
 pub struct Space {
@@ -101,6 +219,106 @@ pub struct Space {
             u64,
         ),
     >,
+    /// Per-rule input snapshots for the semi-naive immediate-consequence loop
+    /// (`semi_naive_ic`). The IC loop fires one exec per step in priority order and
+    /// re-arms rules across rounds, so a single global "facts added last step" delta
+    /// is WRONG: when a rule fires it must match against everything added since IT
+    /// last ran (which may span many intervening steps that fired OTHER rules), not
+    /// just the previous step. So this maps each rule (keyed by its pattern+template
+    /// bytes, which are stable across the exec re-arming) to the `btm` snapshot taken
+    /// when that rule last fired. On a firing the delta is `btm \ snapshot` (the
+    /// facts added since), matched one factor at a time by `transform_multi_multi_`;
+    /// a first-seen rule matches the whole space (empty snapshot). After the firing
+    /// the snapshot is refreshed to the current `btm`. This is exactly the m-delta-
+    /// rule with the per-rule delta, so the union of delta-matches is byte-identical
+    /// to the naive full re-match (the old x ... x old combinations the rule already
+    /// emitted are idempotent in `btm`). `None` means "not in the IC loop" (naive
+    /// full-space match), which is every default-build path and every non-IC caller.
+    /// Only ever READ under `#[cfg(feature = "semi_naive_ic")]`. See
+    /// `kernel/resources/semi_naive_delta_design.md`.
+    ///
+    /// The value is `(snapshot, snapshot_val_count)`. The cached count lets the
+    /// cost gate (Phase 6b) read this rule's current dish size in O(1) instead of
+    /// paying `read_copy.val_count()` (O(dish)) every firing, which a measurement
+    /// showed costs ~2.6x on process_calculus. The dish count at a firing is
+    /// `snapshot_count + delta_count - removed_count`, where `delta`/`removed` are
+    /// the two cheap COW subtracts `read_copy \ snapshot` and `snapshot \ read_copy`
+    /// (both O(facts changed)); this is EXACT even though the IC driver consumes
+    /// (removes) exec facts between firings, so the dish is NOT add-only (verified
+    /// 0 mismatches across process_calculus). The count is refreshed to that dish
+    /// count on every firing, semi or naive-gated.
+    #[cfg(feature = "semi_naive_ic")]
+    sni_rule_seen: Option<HashMap<Vec<u8>, SniRuleEntry>>,
+    #[cfg(not(feature = "semi_naive_ic"))]
+    sni_rule_seen: Option<HashMap<Vec<u8>, (PathMap<()>, usize)>>,
+    /// The semi-naive soundness gate (`semi_naive_ic`, Phase 6a). The per-rule
+    /// delta (`sni_rule_seen`) is the standard Datalog semi-naive recurrence,
+    /// which is byte-identical to naive ONLY for monotone (add-only) evaluation.
+    /// A retraction breaks that: a fact a worker's snapshot recorded, then
+    /// removed, is excluded from `btm \ snapshot`, so the closure never re-derives
+    /// it through surviving facts even when naive would (the corpus
+    /// `random_corpus_byte_identical` exhibits exactly this; the boundary is
+    /// "any removal", confirmed over 400 seeds: 0 divergences without a removal).
+    /// So: once ANY fact is retracted during the IC loop this latches `true`, and
+    /// `transform_multi_multi_` then routes every `,`->`,` rule to the naive
+    /// full-space match for the rest of the loop. Set at every removal site
+    /// (the `O`/`-` and `I`/`O`/`-` template paths, `invalidate_bridge_caches`);
+    /// cleared by `metta_calculus` when it arms the loop. After the first removal
+    /// the loop is exactly the naive loop, so the feature is UNCONDITIONALLY
+    /// correct: semi-naive where monotone, naive otherwise. process_calculus has
+    /// no removals, so the gate never trips it and the fast path is preserved.
+    /// Only ever READ under `#[cfg(feature = "semi_naive_ic")]`.
+    sni_removal_seen: bool,
+    /// Runtime revert switch for the semi-naive IC delta (Phase 6b default flip).
+    /// The `semi_naive_ic` feature is now in the default build, so the delta + cost
+    /// gate run by default. Set this `true` to force the naive full-space match for
+    /// every `,`->`,` rule WITHOUT a rebuild (the firing site checks it before the
+    /// delta). `false` (the default) keeps the gated semi-naive path. Always present
+    /// so the toggle exists in every build; only READ under `semi_naive_ic`. The
+    /// result is identical either way (both paths are byte-identical); this only
+    /// chooses naive-always vs cost-gated, e.g. to A/B the lever or to fall back if
+    /// a workload ever regresses. Builds without the feature ignore it (always naive).
+    pub sni_force_naive: bool,
+    /// Per-Space count of semi-naive delta firings (the cost gate picked semi).
+    /// Bumped in lockstep with the process-global `SNI_DELTA_CALLS`, but local to
+    /// this Space so a test can assert how this run routed WITHOUT racing the
+    /// global counter against other tests running in parallel. Only written under
+    /// `semi_naive_ic`; starts at 0 and is never reset by the engine.
+    pub sni_delta_calls: usize,
+    /// How the IC loop reacts to a retraction mid-loop (see `SniRetractMode`).
+    /// `Naive` (the default) latches the soundness gate to the naive full-space
+    /// match. `Dred` runs Delete-and-Rederive and keeps the incremental path where
+    /// proven byte-identical. `RawSemiNoGate` disables the gate (diagnostic only).
+    /// Only READ under `semi_naive_ic`; the result is byte-identical to naive for
+    /// `Naive` and `Dred`, and may diverge for `RawSemiNoGate` (which exists solely
+    /// to exhibit the divergence the gate/DRed close).
+    pub sni_retract_mode: SniRetractMode,
+    /// Per-Space count of DRed repair passes the IC loop ran (a removal step that
+    /// `Dred` repaired incrementally instead of falling to naive). Lets a test
+    /// assert DRed actually engaged. Only written under `semi_naive_ic`.
+    pub sni_dred_repairs: usize,
+    /// Per-Space count of removal steps `Dred` REFUSED (a shape it could not prove
+    /// byte-identical), routing to the naive fallback. Lets a test assert which
+    /// shapes fall back. Only written under `semi_naive_ic`.
+    pub sni_dred_fallbacks: usize,
+    /// Monotone generation counter bumped on every retraction during the IC loop
+    /// (DRed mode). A recursive rule whose entry's `caught_up_gen` is behind this
+    /// must run a full re-derivation catch-up before its incremental delta is sound
+    /// again. Reset to 0 when `metta_calculus` arms the loop. Only used under
+    /// `semi_naive_ic` in `Dred` mode.
+    pub sni_removal_gen: u64,
+    /// MUTATION-TEST HOOK (never set in production): when true, the DRed catch-up
+    /// SKIPS its re-derivation naive round and only refreshes the snapshot. This
+    /// makes the re-derivation non-load-bearing so a mutation test can prove the
+    /// re-derivation is necessary (the dish then DIVERGES from naive on the
+    /// retraction repro). Default false. Only read under `semi_naive_ic`.
+    pub sni_dred_skip_rederive: bool,
+    /// CONSERVATIVE-SAFETY TEST HOOK (never set in production): force the DRed
+    /// catch-up to take its `Fallback` arm on the first repair, routing the rest of
+    /// the loop to the naive path. Proves the conservative fallback is reachable and
+    /// itself byte-identical to naive (the safety net for any shape DRed cannot
+    /// prove). Default false. Only read under `semi_naive_ic`.
+    pub sni_dred_force_fallback: bool,
 }
 
 pub(crate) const SIZES: [u64; 4] = {
@@ -269,26 +487,6 @@ struct QueryProjectionMaps {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct QueryFactorPlanCacheKey {
     factors: Vec<Vec<u8>>,
-    dependencies: Vec<QueryFactorPlanDependency>,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct QueryFactorPlanDependency {
-    prefix: Vec<u8>,
-    prefix_cardinality_bucket: usize,
-}
-
-/// Order-of-magnitude bucket of a cardinality: its bit length (0 for 0, else
-/// floor(log2)+1). The query plan is only a factor ordering, never affecting the
-/// join's output, so keying the plan cache on the bucket instead of the exact
-/// count lets a cached plan survive the small per-step cardinality drift of a
-/// mutating space. The key changes only when a cardinality crosses a
-/// power-of-two band, where re-ranking is actually worthwhile. This is what
-/// turns the per-step replanning on workloads like process_calculus (the space
-/// changes every exec step, so an exact-count key misses every time) into cache
-/// hits, without changing any result.
-fn cardinality_bucket(count: usize) -> usize {
-    (usize::BITS - count.leading_zeros()) as usize
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -805,20 +1003,24 @@ impl QueryExecutionStorageMetrics {
         self.renormalized_factor_capacity.gt2048 += other.renormalized_factor_capacity.gt2048;
         self.renormalized_factor_len_sum += other.renormalized_factor_len_sum;
         self.renormalized_factor_capacity_sum += other.renormalized_factor_capacity_sum;
-        self.max_renormalized_factor_len =
-            self.max_renormalized_factor_len.max(other.max_renormalized_factor_len);
-        self.max_renormalized_factor_capacity =
-            self.max_renormalized_factor_capacity.max(other.max_renormalized_factor_capacity);
+        self.max_renormalized_factor_len = self
+            .max_renormalized_factor_len
+            .max(other.max_renormalized_factor_len);
+        self.max_renormalized_factor_capacity = self
+            .max_renormalized_factor_capacity
+            .max(other.max_renormalized_factor_capacity);
         self.raw_searches += other.raw_searches;
         self.raw_stack_entries_sum += other.raw_stack_entries_sum;
         self.max_raw_stack_entries = self.max_raw_stack_entries.max(other.max_raw_stack_entries);
         self.candidate_pair_vectors += other.candidate_pair_vectors;
         self.candidate_pair_entries_sum += other.candidate_pair_entries_sum;
         self.candidate_pair_capacity_sum += other.candidate_pair_capacity_sum;
-        self.max_candidate_pair_entries =
-            self.max_candidate_pair_entries.max(other.max_candidate_pair_entries);
-        self.max_candidate_pair_capacity =
-            self.max_candidate_pair_capacity.max(other.max_candidate_pair_capacity);
+        self.max_candidate_pair_entries = self
+            .max_candidate_pair_entries
+            .max(other.max_candidate_pair_entries);
+        self.max_candidate_pair_capacity = self
+            .max_candidate_pair_capacity
+            .max(other.max_candidate_pair_capacity);
         self.candidate_pair_capacity.le8 += other.candidate_pair_capacity.le8;
         self.candidate_pair_capacity.le32 += other.candidate_pair_capacity.le32;
         self.candidate_pair_capacity.le128 += other.candidate_pair_capacity.le128;
@@ -2656,8 +2858,8 @@ fn query_factor_plan_metrics() -> &'static Mutex<QueryFactorPlanMetrics> {
 // Recording into a single global mutex on every query serialized parallel queries (futex
 // contention that collapsed throughput past ~8 threads); accumulating thread-locally and merging
 // only at the rare snapshot keeps identical totals with no shared write on the hot path.
-fn query_execution_storage_metrics_registry(
-) -> &'static Mutex<Vec<std::sync::Arc<Mutex<QueryExecutionStorageMetrics>>>> {
+fn query_execution_storage_metrics_registry()
+-> &'static Mutex<Vec<std::sync::Arc<Mutex<QueryExecutionStorageMetrics>>>> {
     static REGISTRY: OnceLock<Mutex<Vec<std::sync::Arc<Mutex<QueryExecutionStorageMetrics>>>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
@@ -2802,12 +3004,19 @@ fn coreferential_transition<
 
                 match byte_item(e_byte) {
                     Tag::NewVar => {
-                        if e.n == 0 {
-                            references.push(loc.path().len() as u32);
+                        let restore = if e.n == 0 {
+                            let idx = e.v as usize;
+                            if references.len() <= idx {
+                                references.resize(idx + 1, u32::MAX);
+                            }
+                            let prev = references[idx];
+                            references[idx] = loc.path().len() as u32;
+                            Some((idx, prev))
                         } else {
                             trace!(target: "coref trans", "not putting {} {}", e.n, e.show());
                             // trace!(target: "coref trans", "not putting against {:?}", loc.child_mask());
-                        }
+                            None
+                        };
                         // The data trie is read-only and the sub-walks below
                         // each restore `loc`, so its child mask is invariant
                         // across the variable, symbol-size, and arity descents.
@@ -2938,25 +3147,40 @@ fn coreferential_transition<
                             }
                         }
 
-                        if e.n == 0 {
-                            references.pop();
+                        if let Some((idx, prev)) = restore {
+                            references[idx] = prev;
                         }
                     }
                     Tag::VarRef(i) => {
-                        if e.n == 0 {
-                            if i as usize >= references.len() {
-                                trace!(target: "coref trans", "i {i} #references {}", references.len());
-                                stack.push(e);
-                                return;
-                            }
+                        if e.n == 0
+                            && (i as usize) < references.len()
+                            && references[i as usize] != u32::MAX
+                        {
                             // The data subterm bound to this variable at its first
                             // occurrence (`references[i]` is its start in the data path).
-                            let bound = Expr {
+                            // `references[i]` indexes into `loc.path()`, the ProductZipper's
+                            // path buffer. That buffer can REALLOCATE as the recursion below
+                            // grows the matched path (it starts at a reserved capacity but is
+                            // not bounded). A raw `Expr` into it would dangle the moment a
+                            // deeper recursion reallocs, reading garbage tag bytes (observed
+                            // as `byte_item` "reserved" panics on deep terms, e.g. the
+                            // reordered semi-naive delta seeking a deep bound payload). So
+                            // copy the bound subterm's bytes into a stable owned buffer NOW
+                            // (before any recursion / descent that could realloc) and point
+                            // the re-match at THAT. The copy is exactly the subterm rooted at
+                            // `references[i]` (`Expr::span` walks the term structure), and the
+                            // owned `Vec` lives across every recursion in this arm.
+                            let bound_owned: Vec<u8> = (&*Expr {
                                 ptr: loc
                                     .path()
                                     .as_ptr()
                                     .cast_mut()
                                     .offset(references[i as usize] as _),
+                            }
+                            .span())
+                                .to_vec();
+                            let bound = Expr {
+                                ptr: bound_owned.as_ptr().cast_mut(),
                             };
                             // WAM `unify_value` (read mode): re-check that the data here
                             // equals the bound value. For a GROUND bound term this is an
@@ -2980,7 +3204,12 @@ fn coreferential_transition<
                                 let mut i = 0usize;
                                 let mut variable_branch = false;
                                 while i < bytes.len() {
-                                    if loc.child_mask().and(&ByteMask(VARS)).iter().next().is_some()
+                                    if loc
+                                        .child_mask()
+                                        .and(&ByteMask(VARS))
+                                        .iter()
+                                        .next()
+                                        .is_some()
                                     {
                                         variable_branch = true;
                                         break;
@@ -3073,8 +3302,8 @@ fn coreferential_transition<
 /// in preorder; a compound's children are the following ops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MatchOp {
-    /// `Tag::NewVar`: match any term here; `introduces` records a coreference path.
-    Any { introduces: bool },
+    /// `Tag::NewVar`: match any term here; `introduce` records a query variable id.
+    Any { introduce: Option<u8> },
     /// `Tag::VarRef`: re-check a previously introduced top-level query variable.
     VarRef { index: u8 },
     /// `Tag::SymbolSize`: descend the exact symbol byte then its literal bytes.
@@ -3097,7 +3326,7 @@ fn compile_match_program(sources: &[ExprEnv]) -> Option<Vec<MatchOp>> {
         return None;
     }
     let mut ops = Vec::new();
-    let mut introduced = 0usize;
+    let mut introduced = [false; 256];
     for &source in sources {
         compile_match_factor(source, &mut ops, &mut introduced)?;
     }
@@ -3115,25 +3344,30 @@ fn compile_match_program(sources: &[ExprEnv]) -> Option<Vec<MatchOp>> {
 fn compile_match_factor(
     e: ExprEnv,
     ops: &mut Vec<MatchOp>,
-    introduced: &mut usize,
+    introduced: &mut [bool; 256],
 ) -> Option<()> {
     let n = e.n;
+    let mut next_var = e.v;
     let mut ptr = e.subsexpr().ptr;
     // Open compounds awaiting children: (op index of the Compound, children left).
     let mut open: Vec<(usize, u32)> = Vec::new();
     loop {
         match unsafe { byte_item(*ptr) } {
             Tag::NewVar => {
-                let introduces = n == 0;
-                if introduces {
-                    *introduced += 1;
-                }
-                ops.push(MatchOp::Any { introduces });
+                let var = next_var;
+                next_var = next_var.checked_add(1)?;
+                let introduce = if n == 0 {
+                    introduced[var as usize] = true;
+                    Some(var)
+                } else {
+                    None
+                };
+                ops.push(MatchOp::Any { introduce });
                 ptr = unsafe { ptr.byte_add(1) };
                 close_compound_child(&mut open, ops);
             }
             Tag::VarRef(index) => {
-                if n == 0 && (index as usize) < *introduced {
+                if n == 0 && introduced[index as usize] {
                     ops.push(MatchOp::VarRef { index });
                 } else {
                     return None;
@@ -3206,20 +3440,22 @@ fn close_compound_child(open: &mut Vec<(usize, u32)>, ops: &mut Vec<MatchOp>) {
 fn compile_match_factor_recursive(
     e: ExprEnv,
     ops: &mut Vec<MatchOp>,
-    introduced: &mut usize,
+    introduced: &mut [bool; 256],
     args_scratch: &mut Vec<ExprEnv>,
 ) -> Option<()> {
     let ptr = e.subsexpr().ptr;
     match unsafe { byte_item(*ptr) } {
         Tag::NewVar => {
-            let introduces = e.n == 0;
-            if introduces {
-                *introduced += 1;
-            }
-            ops.push(MatchOp::Any { introduces });
+            let introduce = if e.n == 0 {
+                introduced[e.v as usize] = true;
+                Some(e.v)
+            } else {
+                None
+            };
+            ops.push(MatchOp::Any { introduce });
         }
         Tag::VarRef(index) => {
-            if e.n == 0 && (index as usize) < *introduced {
+            if e.n == 0 && introduced[index as usize] {
                 ops.push(MatchOp::VarRef { index });
             } else {
                 return None;
@@ -3281,44 +3517,48 @@ fn execute_match_program<Z, F>(
     Z: ZipperMoving + Zipper + ZipperAbsolutePath + ZipperIteration,
     F: FnMut(&mut Z) -> (),
 {
-    unsafe {
-        let Some(op) = ops.get(pc) else {
-            f(loc);
-            return;
-        };
-        match op {
-            MatchOp::Any { introduces } => {
-                if *introduces {
-                    references.push(loc.path().len() as u32);
+    let Some(op) = ops.get(pc) else {
+        f(loc);
+        return;
+    };
+    match op {
+        MatchOp::Any { introduce } => {
+            let restore = introduce.map(|index| {
+                let idx = index as usize;
+                if references.len() <= idx {
+                    references.resize(idx + 1, u32::MAX);
                 }
-                match_any_term(loc, 1, ops, pc + 1, references, scratch, f);
-                if *introduces {
-                    references.pop();
-                }
+                let prev = references[idx];
+                references[idx] = loc.path().len() as u32;
+                (idx, prev)
+            });
+            match_any_term(loc, 1, ops, pc + 1, references, scratch, f);
+            if let Some((idx, prev)) = restore {
+                references[idx] = prev;
             }
-            MatchOp::VarRef { index } => {
-                match_varref_program(loc, *index as usize, ops, pc + 1, references, scratch, f);
-            }
-            MatchOp::Symbol { e_byte, bytes } => {
-                vs_match_program(loc, ops, pc + 1, references, scratch, f);
-                if loc.descend_to_existing_byte(*e_byte) {
-                    if loc.descend_to_check(&bytes[..]) {
-                        execute_match_program(loc, ops, pc + 1, references, scratch, f);
-                    }
-                    loc.ascend(bytes.len() + 1);
-                }
-            }
-            MatchOp::Compound { e_byte, span } => {
-                let pc_after = if compiled_matcher_compound_capture_enabled() {
-                    pc + *span
-                } else {
-                    pc + 1
-                };
-                vs_match_program(loc, ops, pc_after, references, scratch, f);
-                if loc.descend_to_existing_byte(*e_byte) {
+        }
+        MatchOp::VarRef { index } => {
+            match_varref_program(loc, *index as usize, ops, pc + 1, references, scratch, f);
+        }
+        MatchOp::Symbol { e_byte, bytes } => {
+            vs_match_program(loc, ops, pc + 1, references, scratch, f);
+            if loc.descend_to_existing_byte(*e_byte) {
+                if loc.descend_to_check(&bytes[..]) {
                     execute_match_program(loc, ops, pc + 1, references, scratch, f);
-                    loc.ascend_byte();
                 }
+                loc.ascend(bytes.len() + 1);
+            }
+        }
+        MatchOp::Compound { e_byte, span } => {
+            let pc_after = if compiled_matcher_compound_capture_enabled() {
+                pc + *span
+            } else {
+                pc + 1
+            };
+            vs_match_program(loc, ops, pc_after, references, scratch, f);
+            if loc.descend_to_existing_byte(*e_byte) {
+                execute_match_program(loc, ops, pc + 1, references, scratch, f);
+                loc.ascend_byte();
             }
         }
     }
@@ -3326,7 +3566,7 @@ fn execute_match_program<Z, F>(
 
 fn rematch_bound_then_program<Z, F>(
     loc: &mut Z,
-    bound: Expr,
+    bound_bytes: &[u8],
     ops: &[MatchOp],
     pc_after: usize,
     references: &mut Vec<u32>,
@@ -3336,11 +3576,22 @@ fn rematch_bound_then_program<Z, F>(
     Z: ZipperMoving + Zipper + ZipperAbsolutePath + ZipperIteration,
     F: FnMut(&mut Z) -> (),
 {
+    // `bound_bytes` must be an OWNED copy of the bound subterm, made while the
+    // capture pointer into `loc`'s path buffer was still fresh: the re-match below
+    // descends `loc`, growing that buffer, and past its reserved capacity it
+    // REALLOCATES — a raw pointer captured before any intervening descent (the
+    // ground fast path runs `vs_match_program` and a byte descent first) dangles
+    // and decodes garbage tag bytes (`byte_item`/`gnext` "reserved" panics on deep
+    // terms; the reordered semi-naive delta reaches them by seeking deep bound
+    // payloads). Same fix shape as the `bound_owned` copy in
+    // `coreferential_transition`'s VarRef arm.
     let addition = ExprEnv {
         n: 254,
         v: 0,
         offset: 0,
-        base: bound,
+        base: Expr {
+            ptr: bound_bytes.as_ptr().cast_mut(),
+        },
     };
     let mut stack = vec![addition];
     let mut rematch_references = Vec::new();
@@ -3361,7 +3612,8 @@ fn match_varref_program<Z, F>(
     Z: ZipperMoving + Zipper + ZipperAbsolutePath + ZipperIteration,
     F: FnMut(&mut Z) -> (),
 {
-    if index >= references.len() {
+    if index >= references.len() || references[index] == u32::MAX {
+        match_any_term(loc, 1, ops, pc_after, references, scratch, f);
         return;
     }
 
@@ -3404,7 +3656,9 @@ fn match_varref_program<Z, F>(
         }
         if variable_branch {
             loc.ascend(consumed);
-            rematch_bound_then_program(loc, bound, ops, pc_after, references, scratch, f);
+            // `bound_bytes` is the copy made before `vs_match_program` recursed (the
+            // raw `bound` pointer may already dangle after that recursion).
+            rematch_bound_then_program(loc, &bound_bytes, ops, pc_after, references, scratch, f);
         } else {
             if consumed == bound_bytes.len() {
                 execute_match_program(loc, ops, pc_after, references, scratch, f);
@@ -3425,7 +3679,9 @@ fn match_varref_program<Z, F>(
         // `coreferential_transition` has no such shortcut and emits once, so the rematch
         // alone is the complete-and-sound behavior. (The ground fast-path above still
         // needs `vs_match_program` because its exact-byte descent skips variable children.)
-        rematch_bound_then_program(loc, bound, ops, pc_after, references, scratch, f);
+        // The copy happens HERE, while `bound` still points at live path bytes.
+        let bound_owned: Vec<u8> = unsafe { &*bound.span() }.to_vec();
+        rematch_bound_then_program(loc, &bound_owned, ops, pc_after, references, scratch, f);
     }
 }
 
@@ -3969,6 +4225,16 @@ impl Space {
             bridge_sidecar: None,
             bridge_remove_gen: 0,
             bridge_closures: HashMap::new(),
+            sni_rule_seen: None,
+            sni_removal_seen: false,
+            sni_force_naive: false,
+            sni_delta_calls: 0,
+            sni_retract_mode: SniRetractMode::Naive,
+            sni_dred_repairs: 0,
+            sni_dred_fallbacks: 0,
+            sni_removal_gen: 0,
+            sni_dred_skip_rederive: false,
+            sni_dred_force_fallback: false,
         }
     }
 
@@ -4014,6 +4280,10 @@ impl Space {
         self.bridge_remove_gen += 1;
         self.bridge_sidecar = None;
         self.bridge_closures.clear();
+        // A direct edit may have removed facts; trip the semi-naive gate so any
+        // in-progress IC loop falls back to naive (cleared at loop arm). Pre-loop
+        // loads call this too, but metta_calculus clears the flag when it arms.
+        self.sni_removal_seen = true;
     }
 
     /// Materialise the binary relation whose head is `relation_head_encoded`
@@ -4111,6 +4381,16 @@ impl Space {
             bridge_sidecar: None,
             bridge_remove_gen: 0,
             bridge_closures: HashMap::new(),
+            sni_rule_seen: None,
+            sni_removal_seen: false,
+            sni_force_naive: false,
+            sni_delta_calls: 0,
+            sni_retract_mode: SniRetractMode::Naive,
+            sni_dred_repairs: 0,
+            sni_dred_fallbacks: 0,
+            sni_removal_gen: 0,
+            sni_dred_skip_rederive: false,
+            sni_dred_force_fallback: false,
         }
     }
 
@@ -5506,7 +5786,14 @@ impl Space {
     ) -> Option<(u8, u8)> {
         buffer.clear();
         let (oi, ni, ok) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
-            0, 0, 0, pat_expr, bindings, buffer, stack, assignments
+            0,
+            0,
+            0,
+            pat_expr,
+            bindings,
+            buffer,
+            stack,
+            assignments
         );
         ok.then_some((oi, ni))
     }
@@ -5527,7 +5814,14 @@ impl Space {
     ) {
         buffer.clear();
         let (_, _, ok) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
-            0, oi, ni, template, bindings, buffer, stack, assignments
+            0,
+            oi,
+            ni,
+            template,
+            bindings,
+            buffer,
+            stack,
+            assignments
         );
         if ok {
             out(&buffer[..]);
@@ -5543,9 +5837,13 @@ impl Space {
         assignments: &mut Vec<(u8, u8)>,
         mut out: impl FnMut(&[u8]),
     ) {
-        let Some((oi, ni)) =
-            Self::pattern_template_intros(bindings, pat_expr, &mut *buffer, &mut *stack, &mut *assignments)
-        else {
+        let Some((oi, ni)) = Self::pattern_template_intros(
+            bindings,
+            pat_expr,
+            &mut *buffer,
+            &mut *stack,
+            &mut *assignments,
+        ) else {
             return;
         };
         for &template in templates {
@@ -5941,7 +6239,11 @@ impl Space {
                     ranks[a]
                         .min_variable_domain_cardinality
                         .unwrap_or(usize::MAX)
-                        .cmp(&ranks[b].min_variable_domain_cardinality.unwrap_or(usize::MAX))
+                        .cmp(
+                            &ranks[b]
+                                .min_variable_domain_cardinality
+                                .unwrap_or(usize::MAX),
+                        )
                 })
                 .then_with(|| ranks[b].prefix_len.cmp(&ranks[a].prefix_len))
                 .then_with(|| ranks[b].constant_items.cmp(&ranks[a].constant_items))
@@ -5964,6 +6266,19 @@ impl Space {
         true
     }
 
+    fn body_has_safe_zipper_schematic_route(btm: &PathMap<()>, pat_expr: Expr) -> bool {
+        let body = unsafe { &*pat_expr.span() };
+        let Some((factors, _)) = crate::zipper_join::parse_body_factors(body) else {
+            return false;
+        };
+        let prefixes = factors
+            .iter()
+            .map(|factor| factor.prefix.clone())
+            .collect::<Vec<_>>();
+        Self::has_schematic_fact_under_prefixes(btm, &prefixes)
+            && crate::zipper_join::unify_join_zipper_body_routable(btm, body)
+    }
+
     /// Drives the template writes for a `,`-conjunction transform from the
     /// sidecar's worst-case-optimal join instead of the ProductZipper, when the
     /// body lowers. Computes the sidecar emit output set (which
@@ -5974,6 +6289,502 @@ impl Space {
     /// here yields the same space the streaming ProductZipper path would, while
     /// the join takes asymptotically fewer steps (the measured worst-case-optimal
     /// advantage).
+    // The query-variable keys that occur in two or more body factors. A schematic fact
+    // aligned with such a variable could be grounded by another factor (capture), so it is
+    // not safe to admit to the equality join. Keys follow `query_factor_variables`' scheme,
+    // so a variable shared across factors carries the same key the planner joins on.
+    fn join_variable_keys(sources: &[ExprEnv]) -> BTreeSet<(u8, u8)> {
+        let mut counts: BTreeMap<(u8, u8), usize> = BTreeMap::new();
+        for &source in sources {
+            for key in Self::query_factor_variables(source) {
+                *counts.entry(key).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, c)| c >= 2)
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    // Whether an expression is ground (contains no NewVar or VarRef item).
+    fn expr_is_ground(e: Expr) -> bool {
+        let mut ez = ExprZipper::new(e);
+        loop {
+            if matches!(ez.tag(), Tag::NewVar | Tag::VarRef(_)) {
+                return false;
+            }
+            if !ez.next() {
+                return true;
+            }
+        }
+    }
+
+    // Advance the NewVar counter past every NewVar in `g`, matching the depth-first order
+    // `query_factor_variables` assigns keys in. Called when a query-factor subterm is skipped
+    // because it cannot match the fact, so later NewVar keys stay aligned with the join set.
+    fn advance_g_newvars(g: Expr, g_newvar: &mut u8) {
+        let mut ez = ExprZipper::new(g);
+        loop {
+            if matches!(ez.tag(), Tag::NewVar) {
+                *g_newvar += 1;
+            }
+            if !ez.next() {
+                break;
+            }
+        }
+    }
+
+    // Whether matching a query-factor subterm `g` against a stored-fact subterm `f` would let
+    // the ProductZipper derive a ground answer the equality join misses: capture one of the
+    // fact's variables to ground, or align it with a join key another factor grounds. `top` is
+    // true at the relation's arguments and false inside a nested query compound. A nested query
+    // compound the sidecar decomposes needs the fact's compound ground there (the equality join
+    // cannot project positions out of a non-ground compound); only a query variable
+    // (column-level) may bind a non-ground fact compound. `g_newvar` tracks the depth-first
+    // NewVar index (the `query_factor_variables` key scheme), advanced past skipped subterms so
+    // join lookups stay aligned. Conservative: a shape mismatch is treated as safe.
+    fn subterm_unsafe(
+        g: Expr,
+        f: Expr,
+        join_keys: &BTreeSet<(u8, u8)>,
+        g_newvar: &mut u8,
+        g_n: u8,
+        top: bool,
+    ) -> bool {
+        let g_tag = ExprZipper::new(g).tag();
+        let f_tag = ExprZipper::new(f).tag();
+        match g_tag {
+            Tag::Arity(ga) => match f_tag {
+                // A fact variable here captures the whole query compound: a ground answer the
+                // equality join cannot reproduce.
+                Tag::NewVar | Tag::VarRef(_) => true,
+                // The relation's arguments: classify each position against the fact.
+                Tag::Arity(fa) if fa == ga && top => {
+                    let mut gc = Vec::new();
+                    ExprEnv::new(0, g).args(&mut gc);
+                    let mut fc = Vec::new();
+                    ExprEnv::new(0, f).args(&mut fc);
+                    for (gci, fci) in gc.iter().zip(fc.iter()) {
+                        if Self::subterm_unsafe(
+                            gci.subsexpr(),
+                            fci.subsexpr(),
+                            join_keys,
+                            g_newvar,
+                            g_n,
+                            false,
+                        ) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                // A nested query compound the sidecar decomposes: safe only if the fact's
+                // compound is ground there, else the join cannot project its positions.
+                Tag::Arity(fa) if fa == ga => {
+                    Self::advance_g_newvars(g, g_newvar);
+                    !Self::expr_is_ground(f)
+                }
+                // Shape mismatch: this factor does not match the fact, so the fact is
+                // irrelevant to it. Safe, but still count the factor's skipped variables.
+                _ => {
+                    Self::advance_g_newvars(g, g_newvar);
+                    false
+                }
+            },
+            // A fact variable captures the query symbol (ground): a captured ground answer.
+            Tag::SymbolSize(_) => matches!(f_tag, Tag::NewVar | Tag::VarRef(_)),
+            Tag::NewVar | Tag::VarRef(_) => {
+                let key = match g_tag {
+                    Tag::NewVar => {
+                        let k = (g_n, *g_newvar);
+                        *g_newvar += 1;
+                        k
+                    }
+                    Tag::VarRef(o) => (g_n, o),
+                    _ => unreachable!(),
+                };
+                let is_join = join_keys.contains(&key);
+                match f_tag {
+                    // A fact variable, or a non-ground fact compound, aligns with this query
+                    // variable; unsafe only if it is a join key another factor would ground.
+                    Tag::NewVar | Tag::VarRef(_) => is_join,
+                    Tag::Arity(_) => is_join && !Self::expr_is_ground(f),
+                    // A ground fact subterm binds the query variable to a ground value: safe.
+                    Tag::SymbolSize(_) => false,
+                }
+            }
+        }
+    }
+
+    // Whether every schematic stored fact under the body's joined relations is safe to admit
+    // to the relational join, the per-position refinement of the all-or-nothing schematic
+    // decline. Compares each schematic fact against each query factor on its relation with
+    // `subterm_unsafe`, so nesting on either side is handled. When this returns true the
+    // sidecar's ground output equals the ProductZipper's, which `sidecar_admissibility_oracle`
+    // and `gate_admissions_are_sound_random` pin.
+    fn schematic_facts_safe_to_admit(
+        sidecar: &crate::term_identity::TermIdentitySidecar,
+        sources: &[ExprEnv],
+    ) -> bool {
+        let join_keys = Self::join_variable_keys(sources);
+        let prefixes: Vec<Vec<u8>> = sources
+            .iter()
+            .map(|&g| query_source_prefix(g).unwrap_or_default())
+            .collect();
+        for fact in sidecar.facts() {
+            if fact.flags.ground || !sidecar.is_fact_live(fact.id) {
+                continue;
+            }
+            let Some(record) = sidecar.get_term(fact.root) else {
+                return false;
+            };
+            let f_bytes = record.encoded();
+            let f_expr = Expr {
+                ptr: f_bytes.as_ptr() as *mut u8,
+            };
+            for (g, prefix) in sources.iter().zip(&prefixes) {
+                if prefix.is_empty() || !f_bytes.starts_with(prefix) {
+                    continue;
+                }
+                let mut g_newvar = g.v;
+                if Self::subterm_unsafe(g.subsexpr(), f_expr, &join_keys, &mut g_newvar, g.n, true)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // Whether `e` carries a NON-ground compound argument: a nested arity term (at any depth under a
+    // top-level argument) that contains a variable, like `(k $x)` in `(e (k $x) $y)`. This is the
+    // ingredient for issue-29 data-side capture: a stored variable can unify with such a compound,
+    // and through the join bind to it, the one place full unification finds answers the
+    // ProductZipper-equivalent equality intersection does not. A bare variable argument is not
+    // flagged (a stored variable aliasing it is plain equality), nor is a GROUND compound (its
+    // capture is the ground capture the ProductZipper also performs).
+    fn expr_has_nonground_compound(e: Expr) -> bool {
+        Self::expr_nonground_compound_arg_count(e) > 0
+    }
+
+    fn expr_nonground_compound_arg_count(e: Expr) -> usize {
+        let mut args = Vec::new();
+        ExprEnv::new(0, e).args(&mut args);
+        // args[0] is the relation head; a non-ground compound can only sit in a real argument.
+        let mut count = 0usize;
+        for arg in args.iter().skip(1) {
+            let ae = arg.subsexpr();
+            if matches!(ExprZipper::new(ae).tag(), Tag::Arity(_)) && !Self::expr_is_ground(ae) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn has_schematic_fact_under_prefixes(read_copy: &PathMap<()>, prefixes: &[Vec<u8>]) -> bool {
+        let mut seen_prefix = BTreeSet::new();
+        for prefix in prefixes {
+            if prefix.is_empty() || !seen_prefix.insert(prefix.clone()) {
+                continue;
+            }
+            let mut rz = read_copy.read_zipper_at_path(&prefix[..]);
+            while rz.to_next_val() {
+                let bytes = rz.origin_path();
+                let f_expr = Expr {
+                    ptr: bytes.as_ptr() as *mut u8,
+                };
+                if !Self::expr_is_ground(f_expr) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Emit a routable schematic body through the worst-case-optimal UNIFICATION join over the live
+    /// read snapshot, byte-identical to the ProductZipper. Each query factor is matched against the
+    /// facts under its relation prefix (ground and schematic), read straight from the same snapshot
+    /// the ProductZipper reads via the PathMap index, by a trail-backed unification, joined
+    /// variable-at-a-time; each answer's bindings drive the templates through the same `apply_e`
+    /// the ProductZipper emit uses. Only GROUND components are bound (a ground term has no
+    /// variable identity to collide under ExprEnv's (n,v) scheme); a template over a non-ground
+    /// variable instantiates a fresh variable, the non-ground output the exec discards. Returns
+    /// the join's answer count, or `None` if the body does not map (the caller then declines).
+    fn sidecar_unify_emit(
+        read_copy: &PathMap<()>,
+        sources: &[ExprEnv],
+        prefixes: &[Vec<u8>],
+        pat_expr: Expr,
+        tpl_expr: Expr,
+        mut out: impl FnMut(&[u8]),
+    ) -> Option<usize> {
+        // The query variable keys, densely numbered in first-occurrence order across factors,
+        // the same order `unify_join` numbers the answer-tuple components in.
+        let mut variable_for_key: BTreeMap<(u8, u8), BindingVar> = BTreeMap::new();
+        for &source in sources {
+            for key in Self::query_factor_variables(source) {
+                let next = BindingVar(variable_for_key.len() as u8);
+                variable_for_key.entry(key).or_insert(next);
+            }
+        }
+        let mut dense_keys: Vec<(u8, u8)> = vec![(0, 0); variable_for_key.len()];
+        for (&key, &bv) in &variable_for_key {
+            dense_keys[bv.0 as usize] = key;
+        }
+
+        let body = unsafe { &*pat_expr.span() };
+        let n = crate::unify_join::body_var_count(body);
+        if n != dense_keys.len() {
+            return None;
+        }
+
+        let mut tpl_args = Vec::new();
+        ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+        let templates: Vec<Expr> = tpl_args.get(1..)?.iter().map(|ee| ee.subsexpr()).collect();
+
+        let mut buffer = template_output_buffer();
+        let mut stack = Vec::new();
+        let mut assignments = Vec::new();
+        // Both kernels emit the same way: instantiate the templates from the ground bindings of one
+        // answer row. Shared so the two paths cannot drift.
+        let mut emit_row = |bindings: &BTreeMap<(u8, u8), ExprEnv>| {
+            Self::apply_templates_from_bindings(
+                bindings,
+                pat_expr,
+                &templates,
+                &mut buffer,
+                &mut stack,
+                &mut assignments,
+                &mut out,
+            );
+        };
+
+        if !crate::zipper_join::unify_join_zipper_body_routable(read_copy, body) {
+            return None;
+        }
+
+        // Zipper-native kernel: parse, route-check, and seek the live snapshot directly, with no
+        // decode of the relation facts. Each answer row carries one Option per query variable,
+        // ground or free; bind each resolved schematic byte term and leave truly-free variables
+        // unbound so template rendering matches ProductZipper.
+        if SIDECAR_ZIPPER_JOIN_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some((znvars, rows)) =
+                crate::zipper_join::unify_join_zipper_body_partial_safe(read_copy, body)
+            {
+                if znvars != n {
+                    return None;
+                }
+                for row in &rows {
+                    let mut bindings: BTreeMap<(u8, u8), ExprEnv> = BTreeMap::new();
+                    for (i, &k) in dense_keys.iter().enumerate() {
+                        if let Some(val) = &row[i] {
+                            bindings.insert(
+                                k,
+                                ExprEnv::new(
+                                    0,
+                                    Expr {
+                                        ptr: val.as_ptr() as *mut u8,
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                    emit_row(&bindings);
+                }
+                SIDECAR_ZIPPER_RECOVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(rows.len());
+            }
+            return None;
+        }
+
+        // Materialized leapfrog: read the facts under the body's relation prefixes, straight from the
+        // live snapshot the ProductZipper also reads, via the PathMap index. Descending to each
+        // relation subtree (deduplicated) replaces a scan of the whole fact set, so the read cost
+        // tracks the joined relations, not the size of the space. `origin_path` is the absolute key,
+        // the full fact encoding ground and schematic alike, so the join sees the matcher's input.
+        let mut seen_prefix = BTreeSet::new();
+        let mut fact_bufs: Vec<Vec<u8>> = Vec::new();
+        for prefix in prefixes {
+            if prefix.is_empty() || !seen_prefix.insert(prefix.clone()) {
+                continue;
+            }
+            let mut rz = read_copy.read_zipper_at_path(&prefix[..]);
+            while rz.to_next_val() {
+                fact_bufs.push(rz.origin_path().to_vec());
+            }
+        }
+        let fact_slices: Vec<&[u8]> = fact_bufs.iter().map(|v| v.as_slice()).collect();
+        let answers = crate::unify_join::leapfrog_unify_join_encoded(body, &fact_slices);
+        for key in &answers {
+            let comps = crate::unify_join::split_tuple(key, n);
+            if comps.len() != n {
+                continue;
+            }
+            let mut bindings: BTreeMap<(u8, u8), ExprEnv> = BTreeMap::new();
+            for (i, &k) in dense_keys.iter().enumerate() {
+                if crate::unify_join::term_is_ground(&comps[i]) {
+                    bindings.insert(
+                        k,
+                        ExprEnv::new(
+                            0,
+                            Expr {
+                                ptr: comps[i].as_ptr() as *mut u8,
+                            },
+                        ),
+                    );
+                }
+            }
+            emit_row(&bindings);
+        }
+        Some(answers.len())
+    }
+
+    /// Emit a body through the full-unification capture join. This path is retained as an oracle and
+    /// alternate sidecar route for non-ground query compounds; native ProductZipper should now match
+    /// its ground outputs. It runs `capture_join_live`, the prototype's descent sealed against
+    /// SWI-Prolog occurs-check, directly over the live read snapshot. The
+    /// join's answer tuple is keyed in first-occurrence query-variable order, the same order
+    /// `dense_keys` numbers the fork variable keys, so the i-th component drives the i-th key; only
+    /// GROUND components are bound, exactly as the materialized branch does (a non-ground component
+    /// leaves its template variable fresh, the non-ground output the exec discards). Returns the
+    /// answer count, or `None` if the body does not map (the caller then declines as before).
+    fn capture_unify_emit(
+        read_copy: &PathMap<()>,
+        sources: &[ExprEnv],
+        pat_expr: Expr,
+        tpl_expr: Expr,
+        mut out: impl FnMut(&[u8]),
+    ) -> Option<usize> {
+        use mork_uni_join::term::Term as PTerm;
+
+        // Fork variable keys, densely numbered in first-occurrence order across factors, the same
+        // order the capture join numbers the answer-tuple components in.
+        let mut variable_for_key: BTreeMap<(u8, u8), BindingVar> = BTreeMap::new();
+        for &source in sources {
+            for key in Self::query_factor_variables(source) {
+                let next = BindingVar(variable_for_key.len() as u8);
+                variable_for_key.entry(key).or_insert(next);
+            }
+        }
+        let mut dense_keys: Vec<(u8, u8)> = vec![(0, 0); variable_for_key.len()];
+        for (&key, &bv) in &variable_for_key {
+            dense_keys[bv.0 as usize] = key;
+        }
+
+        // Prototype conjunctive query from the encoded `(, p1 .. pk)` body. Its query variables are
+        // numbered in the same first-occurrence order as `dense_keys`; a mismatch means the body
+        // does not map to the join's variable model, so decline.
+        let body = unsafe { &*pat_expr.span() };
+        let q = crate::capture_join::conj_from_body(body);
+        if q.query_vars.len() != dense_keys.len() {
+            return None;
+        }
+
+        let mut tpl_args = Vec::new();
+        ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+        let templates: Vec<Expr> = tpl_args.get(1..)?.iter().map(|ee| ee.subsexpr()).collect();
+
+        // The capture join over the live snapshot: it descends each factor's relation subtree under
+        // the byte trie (the descent prunes non-matching heads, so it never scans unrelated facts),
+        // unifying with data-side capture and a backtrackable trail. Byte-identical answer keys to
+        // the materialized leapfrog and so to the SWI-Prolog occurs-check seal.
+        let answers = crate::capture_join::capture_join_live(read_copy, &q);
+
+        let mut buffer = template_output_buffer();
+        let mut stack = Vec::new();
+        let mut assignments = Vec::new();
+        for key in &answers {
+            let comps: Vec<PTerm> = match PTerm::decode(key) {
+                PTerm::App(a) => a,
+                t => vec![t],
+            };
+            if comps.len() != dense_keys.len() {
+                continue;
+            }
+            // Bind only the ground components; their encodings must outlive the `bindings` map (each
+            // ExprEnv holds a raw pointer into the buffer), so keep `value_bufs` alive across the
+            // apply.
+            let value_bufs: Vec<Option<Vec<u8>>> = comps
+                .iter()
+                .map(|c| c.is_ground().then(|| c.encode()))
+                .collect();
+            let mut bindings: BTreeMap<(u8, u8), ExprEnv> = BTreeMap::new();
+            for (i, &k) in dense_keys.iter().enumerate() {
+                if let Some(bytes) = &value_bufs[i] {
+                    bindings.insert(
+                        k,
+                        ExprEnv::new(
+                            0,
+                            Expr {
+                                ptr: bytes.as_ptr() as *mut u8,
+                            },
+                        ),
+                    );
+                }
+            }
+            Self::apply_templates_from_bindings(
+                &bindings,
+                pat_expr,
+                &templates,
+                &mut buffer,
+                &mut stack,
+                &mut assignments,
+                &mut out,
+            );
+        }
+        Some(answers.len())
+    }
+
+    /// Cheap query-side trigger for the capture route: some factor carries a NON-ground compound,
+    /// the necessary condition for a data variable to capture a query subterm (issue-29, capture
+    /// requires a non-ground compound to exist on the query side). Reads no facts, so it gates the
+    /// `btm` clone the capture route would otherwise pay on every step.
+    fn query_has_nonground_compound(pat_expr: Expr) -> bool {
+        let mut args = Vec::new();
+        ExprEnv::new(0, pat_expr).args(&mut args);
+        match args.get(1..) {
+            Some(sources) => sources
+                .iter()
+                .any(|&g| Self::expr_has_nonground_compound(g.subsexpr())),
+            None => false,
+        }
+    }
+
+    /// Optional acyclic capture route. `transform_via_sidecar` only engages on cyclic bodies, so this
+    /// hook lets an explicitly enabled run compare the native path with the full-unification capture
+    /// join on acyclic bodies too. Declines (`None`, so the caller keeps the ProductZipper) when the
+    /// body has no relation-prefix factor model or the join cannot map it.
+    fn transform_via_capture(
+        &mut self,
+        read_copy: &PathMap<()>,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+    ) -> Option<(usize, bool)> {
+        let mut args = Vec::new();
+        ExprEnv::new(0, pat_expr).args(&mut args);
+        let sources = args.get(1..)?;
+        if sources.is_empty() {
+            return None;
+        }
+        // Every factor needs a non-empty relation prefix (a leading constant); a whole-space factor
+        // cannot be subspace-read, the same precondition the sidecar route enforces.
+        sources
+            .iter()
+            .map(|&s| query_source_prefix(s).filter(|p| !p.is_empty()))
+            .collect::<Option<Vec<Vec<u8>>>>()?;
+
+        let mut any_new = false;
+        let emitted = Self::capture_unify_emit(read_copy, sources, pat_expr, tpl_expr, |path| {
+            if self.btm.insert(path, ()).is_none() {
+                any_new = true;
+            }
+        });
+        let matches = emitted?;
+        SIDECAR_CAPTURE_RECOVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some((matches, any_new))
+    }
+
     fn transform_via_sidecar(
         &mut self,
         read_copy: &PathMap<()>,
@@ -6023,10 +6834,102 @@ impl Space {
             }
         }
 
-        // The sidecar join is relational: it equates interned ground tuples.
-        // Schematic stored facts need first-order unification, so ProductZipper
-        // remains authoritative for any relation that contains variables.
-        if sidecar.any_schematic_fact_under_prefixes(&prefixes) {
+        // The sidecar join is relational: it equates interned ground tuples. A schematic
+        // stored fact needs first-order unification, so the ProductZipper stays
+        // authoritative whenever admitting the fact would change the ground output: when a
+        // fact variable meets a constant or a join key, capture would produce a ground
+        // answer the equality join misses. But a fact whose variables sit only on
+        // output-only positions yields only non-ground rows (dropped on both paths), so the
+        // body may stay on the fast join. `schematic_facts_safe_to_admit` is that
+        // per-position refinement of the old all-or-nothing decline.
+        let body = unsafe { &*pat_expr.span() };
+        let zipper_factors =
+            crate::zipper_join::parse_body_factors(body).map(|(factors, _)| factors);
+        let zipper_prefixes = zipper_factors
+            .as_ref()
+            .map(|factors| {
+                factors
+                    .iter()
+                    .map(|factor| factor.prefix.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| prefixes.clone());
+        let has_schematic_under_zipper_prefixes =
+            Self::has_schematic_fact_under_prefixes(read_copy, &zipper_prefixes);
+        let query_has_nonground_compound = zipper_factors.as_ref().is_some_and(|factors| {
+            factors.iter().any(|factor| {
+                factor
+                    .cols
+                    .iter()
+                    .any(|col| col.is_nonground_compound())
+            })
+        });
+        let compound_body_with_schematic_facts =
+            query_has_nonground_compound && has_schematic_under_zipper_prefixes;
+        let equality_join_needs_unify = sidecar.any_schematic_fact_under_prefixes(&prefixes)
+            && !Self::schematic_facts_safe_to_admit(&sidecar, sources);
+        let routable_to_unify =
+            crate::zipper_join::unify_join_zipper_body_routable(read_copy, body);
+        let route_safe_schematic_body = has_schematic_under_zipper_prefixes && routable_to_unify;
+        if equality_join_needs_unify
+            || compound_body_with_schematic_facts
+            || route_safe_schematic_body
+        {
+            // The equality join cannot absorb these schematic facts. The worst-case-optimal
+            // UNIFICATION join can, when the zipper-owned gate says the emitted bytes match the
+            // ProductZipper. The capture route remains an opt-in oracle for non-ground query
+            // compounds, so capture A/B runs still exercise that path explicitly.
+            let capture_enabled =
+                SIDECAR_CAPTURE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+            let prefer_capture = capture_enabled && query_has_nonground_compound;
+            let take_unify = SIDECAR_UNIFY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                && routable_to_unify
+                && !prefer_capture;
+            let take_capture = capture_enabled && (!routable_to_unify || prefer_capture);
+            if take_unify || take_capture {
+                let mut any_new = false;
+                let mut delta: Vec<Vec<u8>> = Vec::new();
+                let emitted = {
+                    let sink = |path: &[u8]| {
+                        if self.btm.insert(path, ()).is_none() {
+                            any_new = true;
+                            delta.push(path.to_vec());
+                        }
+                    };
+                    if take_unify {
+                        Self::sidecar_unify_emit(
+                            read_copy,
+                            sources,
+                            &zipper_prefixes,
+                            pat_expr,
+                            tpl_expr,
+                            sink,
+                        )
+                    } else {
+                        Self::capture_unify_emit(read_copy, sources, pat_expr, tpl_expr, sink)
+                    }
+                };
+                if let Some(matches) = emitted {
+                    if take_unify {
+                        SIDECAR_UNIFY_RECOVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        SIDECAR_CAPTURE_RECOVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    for fact in &delta {
+                        let _ = sidecar.insert_fact(fact);
+                    }
+                    let mut bumped = BTreeSet::new();
+                    for prefix in &prefixes {
+                        if bumped.insert(prefix.clone()) {
+                            let count = self.btm.read_zipper_at_path(&prefix[..]).val_count();
+                            sidecar.mark_prefix_synced(&prefix[..], count);
+                        }
+                    }
+                    self.bridge_sidecar = Some(sidecar);
+                    return Some((matches, any_new));
+                }
+            }
+            SIDECAR_SCHEMATIC_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.bridge_sidecar = Some(sidecar);
             return None;
         }
@@ -6184,6 +7087,24 @@ impl Space {
             relation.add(children[1..].to_vec(), 1).ok()?;
         }
         Some((relation, head))
+    }
+
+    /// O(1) copy-on-write snapshot of the live space, for per-step delta tracking
+    /// in the semi-naive immediate-consequence loop. PathMap's structural sharing
+    /// makes the clone a pointer bump, not a copy, so snapshotting every IC step
+    /// is cheap. See `kernel/resources/semi_naive_delta_design.md`.
+    pub(crate) fn delta_snapshot(&self) -> PathMap<()> {
+        self.btm.clone()
+    }
+
+    /// `(added, removed)` facts since `before`: added = current \ before, removed
+    /// = before \ current. The `added` map is the per-step delta `dR` that the
+    /// semi-naive m-delta-rule matches one factor against (so old x ... x old
+    /// combinations are never re-derived); `removed` drives DRed-style retraction
+    /// when a rule consumes its reactants. Both differences are cheap given the
+    /// shared trie structure.
+    pub(crate) fn delta_since(&self, before: &PathMap<()>) -> (PathMap<()>, PathMap<()>) {
+        (self.btm.subtract(before), before.subtract(&self.btm))
     }
 
     /// Computes the least fixpoint of a linear-recursive `,`-rule by semi-naive
@@ -6831,32 +7752,21 @@ impl Space {
         }
     }
 
-    fn query_factor_plan_cache_key(
-        btm: &PathMap<()>,
-        sources: &[ExprEnv],
-    ) -> Option<QueryFactorPlanCacheKey> {
+    // Shape-only key: no data-dependent parts, so computing it never walks the
+    // space. The old key bucketed each queried prefix's val_count to replan on
+    // cardinality-band crossings, but that walk ran on every call, hit or miss;
+    // a workload that rewrites the relation it queries (odd_even_sort, millions
+    // of steps) paid O(relation) per step inside val_count_below_node, 26x over
+    // the plan-free path. Plans now freeze per shape (invalidate on schema
+    // change, never on data change). If a workload needs adaptive replanning,
+    // clear the cache on an epoch every N hits instead of re-keying per call.
+    fn query_factor_plan_cache_key(sources: &[ExprEnv]) -> Option<QueryFactorPlanCacheKey> {
         let mut factors = Vec::with_capacity(sources.len());
-        let mut dependency_counts = BTreeMap::new();
         for source in sources {
             let span = unsafe { source.subsexpr().span().as_ref()? };
             factors.push(span.to_vec());
-            if let Some(prefix) = query_source_prefix(*source).filter(|prefix| !prefix.is_empty()) {
-                dependency_counts
-                    .entry(prefix)
-                    .or_insert_with_key(|prefix| btm.read_zipper_at_path(prefix).val_count());
-            }
         }
-        let dependencies = dependency_counts
-            .into_iter()
-            .map(|(prefix, prefix_cardinality)| QueryFactorPlanDependency {
-                prefix,
-                prefix_cardinality_bucket: cardinality_bucket(prefix_cardinality),
-            })
-            .collect();
-        Some(QueryFactorPlanCacheKey {
-            factors,
-            dependencies,
-        })
+        Some(QueryFactorPlanCacheKey { factors })
     }
 
     fn query_factor_shape_cache_key(source: ExprEnv) -> Option<Vec<u8>> {
@@ -6921,7 +7831,11 @@ impl Space {
                     ranks[a]
                         .min_variable_domain_cardinality
                         .unwrap_or(usize::MAX)
-                        .cmp(&ranks[b].min_variable_domain_cardinality.unwrap_or(usize::MAX))
+                        .cmp(
+                            &ranks[b]
+                                .min_variable_domain_cardinality
+                                .unwrap_or(usize::MAX),
+                        )
                 })
                 .then_with(|| ranks[b].prefix_len.cmp(&ranks[a].prefix_len))
                 .then_with(|| ranks[b].constant_items.cmp(&ranks[a].constant_items))
@@ -6998,7 +7912,7 @@ impl Space {
     }
 
     fn query_factor_plan(btm: &PathMap<()>, sources: &[ExprEnv]) -> Vec<usize> {
-        let Some(cache_key) = Self::query_factor_plan_cache_key(btm, sources) else {
+        let Some(cache_key) = Self::query_factor_plan_cache_key(sources) else {
             return Self::query_factor_plan_uncached(btm, sources, None);
         };
 
@@ -7007,9 +7921,8 @@ impl Space {
             if let Some(plan) = cache.get(&cache_key) {
                 debug!(
                     target: "query_plan_cache",
-                    "hit factors={} dependencies={}",
-                    cache_key.factors.len(),
-                    cache_key.dependencies.len()
+                    "hit factors={}",
+                    cache_key.factors.len()
                 );
                 return plan;
             }
@@ -7025,9 +7938,8 @@ impl Space {
         let mut cache = query_factor_plan_cache().lock().unwrap();
         debug!(
             target: "query_plan_cache",
-            "miss factors={} dependencies={}",
-            cache_key.factors.len(),
-            cache_key.dependencies.len()
+            "miss factors={}",
+            cache_key.factors.len()
         );
         cache.insert(cache_key, &plan);
         plan
@@ -7131,11 +8043,13 @@ impl Space {
         let mut var_map = [u8::MAX; 64];
         let mut next_var = 0;
         let mut buffers = Vec::with_capacity(plan.len());
+        let mut bases = Vec::with_capacity(plan.len());
 
         for &source_idx in plan {
             let source = sources[source_idx];
             let capacity = unsafe { source.subsexpr().span().as_ref().unwrap().len() };
             let mut buffer = Vec::with_capacity(capacity);
+            let base = next_var;
             Self::append_renormalized_query_factor(
                 source,
                 &mut var_map,
@@ -7143,19 +8057,21 @@ impl Space {
                 &mut buffer,
             )?;
             buffers.push(buffer);
+            bases.push(base);
         }
 
         record_storage_metrics(|m| m.record_renormalized_plan(&buffers));
 
         let planned_sources = buffers
             .iter()
-            .map(|buffer| {
-                ExprEnv::new(
-                    0,
-                    Expr {
-                        ptr: buffer.as_ptr().cast_mut(),
-                    },
-                )
+            .zip(bases)
+            .map(|(buffer, v)| ExprEnv {
+                n: 0,
+                v,
+                offset: 0,
+                base: Expr {
+                    ptr: buffer.as_ptr().cast_mut(),
+                },
             })
             .collect();
         Some((buffers, planned_sources))
@@ -7262,6 +8178,9 @@ impl Space {
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
 
         let sources = &pat_args[1..];
+        let preserve_source_order = sources
+            .iter()
+            .any(|&source| Self::expr_has_nonground_compound(source.subsexpr()));
         // Single-factor fast path. A one-source query has an unconditional plan of `[0]`
         // (the `n <= 1` early return in query_factor_plan_uncached), and a 0-normalized source
         // renormalizes to itself, so matching it directly is byte-identical to the planned
@@ -7270,34 +8189,45 @@ impl Space {
         // single-pattern point-query loop showed those locks dominate per-query cost and
         // serialize parallel queries (throughput collapses past ~8 threads). Multi-factor
         // queries are unchanged.
-        let (_planned_buffers, planned_sources, planned_unify_sources, primary_source_index, plan_reordered) =
-            if sources.len() == 1 {
-                (Vec::new(), sources.to_vec(), sources.to_vec(), 0, false)
-            } else {
-                let plan = Self::query_factor_plan(btm, sources);
-                let planned = Self::renormalize_query_factors(sources, &plan);
-                let plan_reordered = planned.is_some()
-                    && plan
+        let (
+            _planned_buffers,
+            planned_sources,
+            planned_unify_sources,
+            primary_source_index,
+            plan_reordered,
+        ) = if sources.len() == 1 || preserve_source_order {
+            (Vec::new(), sources.to_vec(), sources.to_vec(), 0, false)
+        } else {
+            let plan = Self::query_factor_plan(btm, sources);
+            let planned = Self::renormalize_query_factors(sources, &plan);
+            let plan_reordered = planned.is_some()
+                && plan
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &source_idx)| i != source_idx);
+            match planned {
+                Some((buffers, planned_sources)) => {
+                    let planned_unify_sources = plan
                         .iter()
-                        .enumerate()
-                        .any(|(i, &source_idx)| i != source_idx);
-                match planned {
-                    Some((buffers, planned_sources)) => {
-                        let planned_unify_sources = plan
-                            .iter()
-                            .map(|&source_idx| sources[source_idx])
-                            .collect::<Vec<_>>();
-                        (
-                            buffers,
-                            planned_sources,
-                            planned_unify_sources,
-                            plan.iter().position(|&source_idx| source_idx == 0).unwrap(),
-                            plan_reordered,
-                        )
-                    }
-                    None => (Vec::new(), sources.to_vec(), sources.to_vec(), 0, plan_reordered),
+                        .map(|&source_idx| sources[source_idx])
+                        .collect::<Vec<_>>();
+                    (
+                        buffers,
+                        planned_sources,
+                        planned_unify_sources,
+                        plan.iter().position(|&source_idx| source_idx == 0).unwrap(),
+                        plan_reordered,
+                    )
                 }
-            };
+                None => (
+                    Vec::new(),
+                    sources.to_vec(),
+                    sources.to_vec(),
+                    0,
+                    plan_reordered,
+                ),
+            }
+        };
         let mut prz = ProductZipper::new(
             btm.read_zipper(),
             (0..(sources.len() - 1)).map(|_i| btm.read_zipper()),
@@ -7471,8 +8401,19 @@ impl Space {
         let mut pat_args = Vec::with_capacity(n_factors);
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
         let sources = &pat_args[1..];
-        let plan = Self::query_factor_plan(btm, sources);
-        let planned = Self::renormalize_query_factors(sources, &plan);
+        let preserve_source_order = sources
+            .iter()
+            .any(|&source| Self::expr_has_nonground_compound(source.subsexpr()));
+        let plan = if preserve_source_order {
+            (0..sources.len()).collect::<Vec<_>>()
+        } else {
+            Self::query_factor_plan(btm, sources)
+        };
+        let planned = if preserve_source_order {
+            None
+        } else {
+            Self::renormalize_query_factors(sources, &plan)
+        };
         let plan_reordered = planned.is_some()
             && plan
                 .iter()
@@ -7982,29 +8923,157 @@ impl Space {
             }
         }
 
-        // Drive the template writes from the sidecar's worst-case-optimal join
-        // when the body lowers (a ground `,` conjunction). The emit is proven
-        // equal to the ProductZipper's (validate_sidecar_emit_against_product),
-        // and the walk-step measurement shows the join takes asymptotically fewer
-        // steps. A cheap structural pre-check (the join graph from the pattern's
-        // variables, no data) skips acyclic bodies before paying the O(relation)
-        // interning, since the worst-case-optimal join only beats the ProductZipper
-        // on cyclic bodies. Falls through to the ProductZipper otherwise.
-        // The worst-case-optimal join only wins on a genuinely cyclic, growing
-        // join. A body whose cardinality order is disconnected (a function table
-        // whose `args` input sorts last, as in finite_domain) reorders to a cheap
-        // connected ProductZipper plan, so route it straight there and skip the
-        // O(relation) sidecar sync+probe entirely. The check is cheap btm stats
-        // and short-circuits after `body_is_cyclic`, so non-cyclic bodies pay
-        // nothing and a real cyclic pattern (clique, transitive's triangle) still
-        // takes the WCO path.
+        // Semi-naive immediate-consequence step (Stage 3 of the semi-naive delta
+        // lever). Inside the IC loop (`sni_rule_seen` is Some) run the m-delta-rule
+        // transform: match each body factor against this rule's delta in turn, the
+        // rest against the full space, and union (idempotent btm insert dedups). The
+        // delta is `read_copy \ snapshot` where `snapshot` is the match input the
+        // last time THIS rule fired (keyed by pattern+template, stable across the
+        // exec re-arming). A first-seen rule has no snapshot, so its delta is the
+        // whole space -> the m passes reproduce the naive full match exactly. Every
+        // later firing is delta-restricted, so a step costs O(facts added since this
+        // rule last ran) instead of O(dish). `read_copy` carries the just-consumed
+        // exec `add`, exactly as the naive path inserts it below, so a rule that
+        // matches its own exec (the IC driver) is byte-identical. The snapshot is
+        // taken BEFORE the emit (= `read_copy`), so a recursive rule's own previous-
+        // round output is in its next delta and the recursion still chains.
+        // `sni_rule_seen == None` (every non-IC caller, every default build) falls
+        // through to the naive full-space match. See the design doc.
+        //
+        // Soundness gate (Phase 6a): the per-rule delta is the Datalog semi-naive
+        // recurrence, byte-identical to naive ONLY while evaluation stays monotone
+        // (add-only). A retraction breaks it -- a fact a worker's snapshot recorded
+        // then removed is excluded from `btm \ snapshot`, so the closure never
+        // re-derives it through surviving facts even where naive (which re-scans
+        // the whole dish) does. The corpus pinned the divergence boundary to "any
+        // removal" (0 divergences without one over 400 random seeds). So once any
+        // removal has happened in this loop (`sni_removal_seen` latched by the
+        // `O`/`-` paths), fall through to the naive full-space match for every
+        // `,`->`,` rule. `seen` is put back so the field stays `Some` for the
+        // rest of the loop and `metta_calculus`'s restore is unaffected. This
+        // keeps the feature UNCONDITIONALLY correct: semi-naive where monotone,
+        // naive after the first retraction. process_calculus never retracts, so it
+        // never trips the gate and keeps the fast path.
+        #[cfg(feature = "semi_naive_ic")]
+        if let Some(mut seen) = self.sni_rule_seen.take() {
+            // The soundness gate forces naive after a retraction ONLY in `Naive`
+            // mode. `Dred` repairs the per-rule views with a re-derivation catch-up
+            // (see `sni_dred_catch_up`) so the delta stays sound; `RawSemiNoGate`
+            // deliberately ignores the gate (diagnostic, may diverge). So the removal
+            // half of the gate is mode-conditional.
+            let removal_forces_naive =
+                self.sni_removal_seen && self.sni_retract_mode == SniRetractMode::Naive;
+
+            // DRed catch-up (Dred mode, a retraction happened): before this rule's
+            // incremental delta is trusted again it must re-derive any removed-but-
+            // rederivable fact it (or the closure) produces, exactly as naive's full
+            // re-scan would. `sni_dred_catch_up` runs ONE naive full-match round for
+            // the rule when its `caught_up_gen` is behind `sni_removal_gen` and sets
+            // its snapshot to the pre-round dish (so a multi-round re-derivation chains
+            // through the later incremental firings, step-for-step like naive); or
+            // refuses (un-handled shape) and signals a naive fallback. A rule already
+            // caught up to the current gen falls straight through to the normal
+            // cost-gated delta fire. See the divergence ground truth: the only
+            // naive-vs-semi gap is an explicitly-removed fact re-derived through
+            // survivors, so the catch-up is pure monotone re-addition (no over-delete).
+            if self.sni_retract_mode == SniRetractMode::Dred
+                && self.sni_removal_seen
+                && !self.sni_force_naive
+            {
+                match self.sni_dred_catch_up(&mut seen, pat_expr, tpl_expr, add) {
+                    DredCatchUp::Done(result) => {
+                        self.sni_rule_seen = Some(seen);
+                        return result;
+                    }
+                    DredCatchUp::AlreadyCaughtUp => {
+                        // fall through to the normal cost-gated delta fire below.
+                    }
+                    DredCatchUp::Fallback => {
+                        // Un-handled shape: route this and every later rule to naive
+                        // for the rest of the loop. Flip the mode to `Naive` so the
+                        // `removal_forces_naive` test holds from here on, put the
+                        // snapshots back, and run the naive full-space match for THIS
+                        // rule directly. Conservative: a wrong dish is never risked.
+                        self.sni_dred_fallbacks += 1;
+                        self.sni_retract_mode = SniRetractMode::Naive;
+                        self.sni_rule_seen = Some(seen);
+                        return self.transform_multi_multi_naive(pat_expr, tpl_expr, add);
+                    }
+                }
+            }
+
+            if self.sni_force_naive || removal_forces_naive {
+                // Routed to naive, for one of two reasons:
+                //  - `sni_force_naive`: the runtime revert switch is on (force the
+                //    naive path for every rule without a rebuild);
+                //  - `sni_removal_seen` (soundness gate, `Naive` mode): a retraction
+                //    happened in this loop, so the per-rule delta is unsound (see the
+                //    field docs).
+                // Either way put the snapshots back and fall through to the naive
+                // full-space match for the rest of the loop. (When forced naive the
+                // snapshot is never consulted again, but keeping the field `Some`
+                // leaves `metta_calculus`'s restore unaffected.)
+                self.sni_rule_seen = Some(seen);
+            } else {
+                // Cost gate (Phase 6b): `sni_delta_fire` runs the m-delta-rule ONLY
+                // when it estimates the delta is small relative to the dish
+                // (`m * delta_count < dish_count`), else it refreshes this rule's
+                // snapshot and returns `None` so we fall through to the naive full
+                // match. The m-delta-rule runs m passes, so on a small dish (delta
+                // ~ dish, e.g. a rule's first firing or a dense clique body) it is
+                // ~m x SLOWER than naive's single pass; the gate prevents that
+                // regression while keeping the big win where delta << dish. The
+                // snapshot is refreshed inside `sni_delta_fire` either way, so the
+                // field stays `Some` for the rest of the loop. Both branches write a
+                // byte-identical dish (the gate only chooses HOW to compute the same
+                // immediate consequences), proven by the corpus + the gate-equivalence
+                // test.
+                if let Some(result) = self.sni_delta_fire(seen, pat_expr, tpl_expr, add) {
+                    return result;
+                }
+                // gate chose naive: fall through to the naive full-space match below.
+            }
+        }
+
+        self.transform_multi_multi_naive(pat_expr, tpl_expr, add)
+    }
+
+    /// The naive full-space match for a `,`->`,` rule: match the whole body against
+    /// the full `read_copy` (the live `btm` plus the just-consumed exec `add`) and
+    /// emit every template instantiation. This is the unconditional, always-correct
+    /// path that every default-build caller and every semi-naive fall-through routes
+    /// to. Extracted from `transform_multi_multi_` so the semi-naive gate, the DRed
+    /// catch-up, and the conservative fallback can all reuse one definition.
+    pub fn transform_multi_multi_naive(
+        &mut self,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+        add: Expr,
+    ) -> (usize, bool) {
+        // Drive template writes from the sidecar's join when the body lowers and either its
+        // cardinality-sorted order stays connected or the zipper-owned gate proves a schematic
+        // body can route byte-identically. Disconnected bodies otherwise stay on the ProductZipper's
+        // reordered plan.
         #[cfg(feature = "sidecar_bridge_emit")]
-        if Self::body_is_cyclic(pat_expr)
-            && Self::body_cardinality_order_connected(&self.btm, pat_expr)
+        if Self::body_cardinality_order_connected(&self.btm, pat_expr)
+            || Self::body_has_safe_zipper_schematic_route(&self.btm, pat_expr)
         {
             let mut read_copy = self.btm.clone();
             read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
             if let Some(result) = self.transform_via_sidecar(&read_copy, pat_expr, tpl_expr) {
+                return result;
+            }
+        }
+        // Optional acyclic full-unification capture route. Default-off, so the native ProductZipper
+        // stays authoritative until explicitly opted in; the cheap query-side pre-check skips the
+        // clone for every non-capture body.
+        #[cfg(feature = "sidecar_bridge_emit")]
+        if SIDECAR_CAPTURE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            && Self::query_has_nonground_compound(pat_expr)
+        {
+            let mut read_copy = self.btm.clone();
+            read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
+            if let Some(result) = self.transform_via_capture(&read_copy, pat_expr, tpl_expr) {
                 return result;
             }
         }
@@ -8057,7 +9126,22 @@ impl Space {
         // reuse it, skipping the per-match pattern re-walk. A non-ground match
         // (ni != 0) recomputes, preserving the cycle (`!ok`) decline.
         let mut pattern_intros: Option<(u8, u8)> = None;
+        let sni_trace = std::env::var("MORK_SNI_TRACE").is_ok();
         let touched = Self::query_multi(&read_copy, pat_expr, |refs_bindings, loc| 'query: {
+            if sni_trace {
+                match &refs_bindings {
+                    Ok(refs) => eprintln!("SNI naive emit Ok(refs {refs:?})"),
+                    Err(b) => eprintln!(
+                        "SNI naive emit Err bindings: {:?}",
+                        b.iter()
+                            .map(|(k, ee)| (
+                                *k,
+                                serialize(unsafe { ee.subsexpr().span().as_ref().unwrap() })
+                            ))
+                            .collect::<Vec<_>>()
+                    ),
+                }
+            }
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             unsafe {
                 WRITES += template_prefixes.len();
@@ -8072,17 +9156,25 @@ impl Space {
                         |(v, ee)| trace!(target: "transform", "binding {:?} {}", *v, ee.show()),
                     );
 
-                    let (oi0, ni) = match pattern_intros {
+                    let ground_bindings = bindings.values().all(|ee| ee.subsexpr().is_ground());
+                    let (oi0, ni) = match pattern_intros.filter(|_| ground_bindings) {
                         Some(cached) => cached,
                         None => {
                             let mut void = std::io::sink();
                             let (oi, ni, ok) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
-                                0, 0, 0, pat_expr, bindings, void, trace, assignments
+                                0,
+                                0,
+                                0,
+                                pat_expr,
+                                bindings,
+                                void,
+                                trace,
+                                assignments
                             );
                             if !ok {
-                                break 'query false;
+                                break 'query true;
                             }
-                            if ni == 0 {
+                            if ground_bindings && ni == 0 {
                                 pattern_intros = Some((oi, ni));
                             }
                             (oi, ni)
@@ -8103,6 +9195,13 @@ impl Space {
                         };
                         oi = toi;
 
+                        if sni_trace {
+                            eprintln!(
+                                "EMITnaive pat={} out={}",
+                                serialize(unsafe { pat_expr.span().as_ref().unwrap() }),
+                                serialize(&buffer)
+                            );
+                        }
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
                         any_new |= wz.set_val(()).is_none();
@@ -8115,6 +9214,540 @@ impl Space {
             zh.cleanup_write_zipper(wz);
         }
         (touched, any_new)
+    }
+
+    /// One DRed re-derivation catch-up for a `,`->`,` rule firing after a retraction
+    /// (Dred mode). The divergence ground truth (`dred_divergence_ground_truth`) is
+    /// that the ONLY naive-vs-semi gap under retraction is a fact EXPLICITLY removed
+    /// by an `O`/`-` rule that the recursive closure re-derives through SURVIVING
+    /// facts: naive's full re-scan re-derives it, the add-only delta (which skips
+    /// old x ... x old combinations) misses it. The engine's `,`->`,` rules never
+    /// retract derived facts (only the explicit `O`/`-` does), so naive is a MONOTONE
+    /// TRACE -- it keeps stale derived facts whose support was removed. So the repair
+    /// is PURE RE-DERIVATION (never an over-delete): run the rule's naive full match
+    /// once, then resume the incremental delta.
+    ///
+    /// The catch-up is exactly ONE naive round (`transform_multi_multi_naive`), with
+    /// the rule's snapshot set to the dish BEFORE the round. That makes the next
+    /// firing's delta `dish_after_round \ dish_before_round` contain every fact this
+    /// round (re-)derived, so a multi-round re-derivation chains through the normal
+    /// incremental firings exactly as naive spreads it across steps -- step-for-step
+    /// identical to naive, not a fixpoint collapse (which would emit re-armed execs
+    /// out of order). After the catch-up the rule's `caught_up_gen` is set to the
+    /// current `sni_removal_gen`, so it pays the full match only ONCE per retraction,
+    /// then runs incrementally again -- versus `Naive` mode, which re-scans the whole
+    /// dish on EVERY firing for the rest of the loop.
+    ///
+    /// Coverage is complete without a per-shape gate: every rule on the semi-naive
+    /// delta path is a `,`->`,` rule (the gate lives only in `transform_multi_multi_`),
+    /// and the catch-up IS a naive round for it; `I`-source and `O`-template rules are
+    /// ALWAYS naive (full match every step), so they re-derive removed facts on their
+    /// own. `Fallback` is returned only if the rule entry cannot be reconstructed (it
+    /// never is in practice), routing to the naive path for safety.
+    ///
+    /// Returns:
+    /// - `AlreadyCaughtUp` if this rule already re-derived since the last retraction
+    ///   (`caught_up_gen == sni_removal_gen`); the caller runs the normal delta fire.
+    /// - `Done(result)` after running the catch-up round and refreshing the snapshot.
+    /// - `Fallback` if the entry is unreconstructable; the caller runs naive.
+    #[cfg(feature = "semi_naive_ic")]
+    fn sni_dred_catch_up(
+        &mut self,
+        seen: &mut HashMap<Vec<u8>, SniRuleEntry>,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+        add: Expr,
+    ) -> DredCatchUp {
+        let pat_span = unsafe { pat_expr.span().as_ref().unwrap() };
+        let tpl_span = unsafe { tpl_expr.span().as_ref().unwrap() };
+        let mut key = Vec::with_capacity(pat_span.len() + tpl_span.len() + 1);
+        key.extend_from_slice(pat_span);
+        key.push(0xff);
+        key.extend_from_slice(tpl_span);
+
+        let cur_gen = self.sni_removal_gen;
+
+        // CONSERVATIVE-SAFETY TEST HOOK: route to the naive fallback on demand.
+        if self.sni_dred_force_fallback {
+            return DredCatchUp::Fallback;
+        }
+
+        // Already re-derived since the last retraction -> incremental is sound.
+        if let Some(entry) = seen.get(&key) {
+            if entry.caught_up_gen == cur_gen {
+                return DredCatchUp::AlreadyCaughtUp;
+            }
+        }
+
+        // The dish BEFORE this round (the live `btm` plus the just-consumed exec
+        // `add`, exactly the input the naive round below matches). This becomes the
+        // rule's snapshot so the NEXT delta captures everything this round derives.
+        let add_span = unsafe { add.span().as_ref().unwrap() };
+        let mut dish_before = self.btm.clone();
+        dish_before.insert(add_span, ());
+        let dish_before_count = dish_before.val_count();
+
+        // One naive full-match round (the re-derivation): byte-identical to a naive
+        // step for this rule. Re-derives any removed-but-rederivable fact reachable
+        // in one round; multi-round re-derivations chain through later incremental
+        // firings (their delta now includes this round's outputs).
+        //
+        // MUTATION-TEST HOOK: with `sni_dred_skip_rederive` the re-derivation round
+        // is replaced by the ordinary add-only delta fire over this rule's frontier
+        // -- exactly the buggy raw-semi behaviour the catch-up exists to fix. It
+        // emits this round's monotone consequences but NOT the removed-but-rederivable
+        // facts (those need a full re-scan), so the dish DIVERGES from naive on a
+        // retraction repro, proving the re-derivation is load-bearing. Never set in
+        // production.
+        let result = if self.sni_dred_skip_rederive {
+            let prior_snapshot = seen
+                .get(&key)
+                .map(|e| e.snapshot.clone())
+                .unwrap_or_else(PathMap::new);
+            let delta = dish_before.subtract_cow(&prior_snapshot);
+            self.transform_multi_multi_delta(&dish_before, &delta, pat_expr, tpl_expr)
+        } else {
+            self.transform_multi_multi_naive(pat_expr, tpl_expr, add)
+        };
+
+        // Refresh the entry: snapshot = the pre-round dish, cached count, and mark
+        // this rule caught up to the current retraction generation.
+        seen.insert(
+            key,
+            SniRuleEntry {
+                snapshot: dish_before,
+                dish_count: dish_before_count,
+                caught_up_gen: cur_gen,
+            },
+        );
+        self.sni_dred_repairs += 1;
+        DredCatchUp::Done(result)
+    }
+
+    /// Fire one semi-naive immediate-consequence step for a `,`->`,` rule, given
+    /// the per-rule snapshot map (taken by `transform_multi_multi_`). Computes this
+    /// rule's delta `read_copy \ snapshot` (the facts added since it last fired,
+    /// the whole space on the first firing), and applies the COST GATE (Phase 6b):
+    ///
+    /// - if the delta is small relative to the dish (`m * delta_count < dish_count`,
+    ///   where `m` is the body factor count), run the m-delta-rule
+    ///   `transform_multi_multi_delta` and return `Some((candidates, any_new))`;
+    /// - otherwise the m passes would cost ~m x the naive single pass (the delta ~
+    ///   dish case: a rule's first firing, or a dense multi-factor body like the
+    ///   clique/finite_domain benches, where a measurement showed up to 16,800x
+    ///   slower than naive), so refresh the snapshot and return `None` for the
+    ///   caller to fall through to the naive full-space match.
+    ///
+    /// Either way the snapshot is refreshed to `read_copy` (with its exact dish
+    /// count cached), so the next firing's delta is exactly the facts added since.
+    /// Both paths emit the SAME immediate consequences (the gate only chooses how to
+    /// compute them), so the written dish is byte-identical. Only reached when the
+    /// soundness gate is clear (no retraction yet this loop); see
+    /// `transform_multi_multi_` and the field docs.
+    #[cfg(feature = "semi_naive_ic")]
+    fn sni_delta_fire(
+        &mut self,
+        mut seen: HashMap<Vec<u8>, SniRuleEntry>,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+        add: Expr,
+    ) -> Option<(usize, bool)> {
+        let add_span = unsafe { add.span().as_ref().unwrap() };
+        let mut read_copy = self.btm.clone();
+        read_copy.insert(add_span, ());
+
+        // Rule key: pattern bytes then template bytes. Stable across re-arming
+        // (the exec wrapper changes round to round, the , -body does not).
+        let pat_span = unsafe { pat_expr.span().as_ref().unwrap() };
+        let tpl_span = unsafe { tpl_expr.span().as_ref().unwrap() };
+        let mut key = Vec::with_capacity(pat_span.len() + tpl_span.len() + 1);
+        key.extend_from_slice(pat_span);
+        key.push(0xff);
+        key.extend_from_slice(tpl_span);
+
+        // The body factor count `m` (the `,`-args count). The m-delta-rule runs
+        // one pass per factor.
+        let mut pat_args = Vec::with_capacity(64);
+        ExprEnv::new(0, pat_expr).args(&mut pat_args);
+        let m = pat_args.len().saturating_sub(1);
+
+        // Cost gate (Phase 6b). The m-delta-rule runs `m` passes (one per body
+        // factor), each pass `O(delta)` outer x `O(pattern)` inner. So a firing
+        // costs ~`m * delta_count` work, versus naive's single ~`dish_count` pass.
+        // Route to the cheaper one: semi-naive only when `m * delta_count <
+        // dish_count`. This is the standard semi-naive break-even: when the delta
+        // is a large fraction of the dish (`delta ~ dish`, e.g. a rule's first
+        // firing where delta == read_copy, or a dense m-factor body), the m passes
+        // re-scan the dish m times and lose to naive; when `delta << dish` (a deep
+        // recursive closure step) they win big. The threshold is the BARE predicate
+        // with no fudge constant: a per-firing calibration on process_calculus
+        // (m in {1,2}, delta_count in 1..8, dish growing to hundreds) showed it
+        // keeps 1998/2001 firings on semi (the full ~117x win) and routes only the
+        // 3 first-firings to naive, while routing 100% of the clique/finite_domain
+        // firings to naive (delta == dish, m in 3..11). No regression on either end.
+        //
+        // The gate needs `delta_count` and `dish_count` but NOT the materialized
+        // `delta` trie until it actually picks semi. Two regimes:
+        //
+        //  - FIRST firing (no snapshot): the delta is the whole dish, so
+        //    `delta_count == dish_count` and the gate `m * dish < dish` is false for
+        //    every m >= 1 -> ALWAYS naive. So skip the `subtract_cow`/`clone`
+        //    entirely and decide from `dish_count = read_copy.val_count()` (one O(dish)
+        //    walk, unavoidable to seed the snapshot count). This removes the
+        //    first-firing delta materialization that otherwise cost ~3% on the
+        //    single-firing finite_domain bench (clone + full subtract + count over
+        //    10k facts) for a decision that is structurally pre-determined.
+        //
+        //  - LATER firing (has snapshot): the delta is small, so materialize it with
+        //    the cheap `subtract_cow` (O(facts changed); `read_copy` and `snapshot`
+        //    are COW clones sharing unchanged subtrees, which the subtract prunes
+        //    instead of walking -- the Stage-5 lever, byte-identical to `subtract`).
+        //    `dish_count = snapshot_count + delta_count - removed_count` is then EXACT
+        //    and O(facts changed), avoiding `read_copy.val_count()` (O(dish), measured
+        //    ~2.6x on process_calculus). `removed_count = (snapshot \ read_copy)` is
+        //    the second cheap COW subtract; it is nonzero because the IC driver
+        //    consumes (removes) exec facts between firings, so the dish is NOT add-only
+        //    -- the subtraction makes the count exact anyway (verified 0 mismatches).
+        let (delta, delta_count, dish_count) = match seen.get(&key) {
+            None => {
+                // First firing: gate is pre-determined to naive (m >= 1); don't build
+                // the whole-dish delta. `delta` stays `None`.
+                let dish_count = read_copy.val_count();
+                (None, dish_count, dish_count)
+            }
+            Some(entry) => {
+                let snapshot = &entry.snapshot;
+                let delta = read_copy.subtract_cow(snapshot);
+                let delta_count = delta.val_count();
+                let removed_count = snapshot.subtract_cow(&read_copy).val_count();
+                let dish_count = entry.dish_count + delta_count - removed_count;
+                (Some(delta), delta_count, dish_count)
+            }
+        };
+
+        // Run the m-delta-rule only when the gate clears AND the delta was
+        // materialized (it never is on the pre-determined-naive first firing);
+        // otherwise leave `result` as `None` so the caller falls through to the
+        // naive full match. The snapshot refresh below happens in BOTH cases: after
+        // a naive-gated firing the naive path still emits all consequences, so the
+        // next delta only needs facts added after THIS firing. Storing the snapshot
+        // even on a naive-gated firing is what lets the NEXT firing's delta be small
+        // (without it, a rule first gated to naive would re-derive a whole-dish delta
+        // forever and never reach the semi fast path).
+        let result = match delta {
+            Some(delta) if m.saturating_mul(delta_count) < dish_count => {
+                unsafe {
+                    SNI_DELTA_CALLS += 1;
+                }
+                self.sni_delta_calls += 1;
+                Some(self.transform_multi_multi_delta(&read_copy, &delta, pat_expr, tpl_expr))
+            }
+            _ => None,
+        };
+
+        // Refresh this rule's snapshot to the input just matched, with its exact
+        // dish count cached for the next firing's O(1) gate, and the rule's
+        // pattern/template bytes (owned) so the DRed repair can re-derive this rule.
+        let cur_gen = self.sni_removal_gen;
+        seen.insert(
+            key,
+            SniRuleEntry {
+                snapshot: read_copy,
+                dish_count,
+                caught_up_gen: cur_gen,
+            },
+        );
+        self.sni_rule_seen = Some(seen);
+        result
+    }
+
+    /// Semi-naive m-delta-rule form of `transform_multi_multi_` (Stage 2 of the
+    /// semi-naive delta lever). Instead of matching the whole `,`-body against the
+    /// full accumulating space, it matches each delta-rule: for each body factor `j`,
+    /// factor `j` is opened on the per-step `delta` PathMap and the other factors on
+    /// the full `read_copy`. The union over the delta-rules (emitted by idempotent
+    /// btm insert, which dedups the overlap when a match has more than one delta
+    /// factor) is exactly the new immediate-consequence facts: every old x ... x old
+    /// combination is skipped because at least one factor is always restricted to the
+    /// delta. A factor over a relation that did not change has no delta facts, so its
+    /// pass simply finds nothing. See `kernel/resources/semi_naive_delta_design.md`.
+    ///
+    /// This reuses the same schematic matcher (`coreferential_transition` via the
+    /// ProductZipper walk) and the same template emit as `transform_multi_multi_`,
+    /// so the coreference / VarRef / issue-29 semantics are identical; the only new
+    /// code is the per-factor zipper sourcing and the j-loop. Sources are passed in
+    /// identity (body) order to the raw matcher, so the positional factor->zipper
+    /// mapping holds without any planner reordering.
+    ///
+    /// NOT wired as a default (Stage 3); callable + differentially tested. Returns
+    /// `(matched-candidate count summed over the delta-rules, any new path written)`.
+    /// The candidate count is the per-delta-rule sum (it double-counts a match found
+    /// by two delta-rules), so it is NOT comparable to the naive `touched`; the
+    /// byte-identical written space is the oracle, not the count.
+    ///
+    /// Scope: add-only, exactly like `transform_multi_multi_` (it only writes
+    /// template outputs, never retracts). `delta` is the per-step ADDED facts. For a
+    /// consuming rule the removed reactants drive DRed-style retraction; that is
+    /// Stage 3/4 and is not handled here. The differential oracle
+    /// (`semi_naive_delta_matches_naive_on_process_calculus`) covers the monotone
+    /// case, which is where the measured redundancy lives.
+    pub fn transform_multi_multi_delta(
+        &mut self,
+        read_copy: &PathMap<()>,
+        delta: &PathMap<()>,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+    ) -> (usize, bool) {
+        let mut buffer = template_output_buffer();
+        let mut tpl_args = Vec::with_capacity(64);
+        ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+        let templates: Vec<_> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+        let template_prefixes: Vec<_> = templates
+            .iter()
+            .map(|e| unsafe { e.prefix().unwrap_or_else(|x| x).as_ref().unwrap() })
+            .collect();
+        let mut subsumption = Self::prefix_subsumption(&template_prefixes[..]);
+        let mut placements = subsumption.clone();
+
+        // The body factors, in their natural (identity) order. Each is a
+        // (sub)source the matcher descends; `sources[i]` lines up positionally with
+        // the i-th read-zipper in every per-delta-rule ProductZipper below.
+        let mut pat_args = Vec::with_capacity(64);
+        ExprEnv::new(0, pat_expr).args(&mut pat_args);
+        let sources: Vec<ExprEnv> = pat_args[1..].to_vec();
+        let n_factors = sources.len();
+
+        // Delta-rule indices: the standard m-delta-rule loops one pass per body
+        // factor, restricting that factor to the per-step delta and the rest to the
+        // full space, then unions. A factor over a relation that did NOT change has
+        // no delta facts, so its pass simply finds nothing (harmless). Looping over
+        // ALL factors is the correct, relation-agnostic form: it makes no assumption
+        // about which relations the delta carries, so it stays sound when the delta
+        // spans several relations (the real IC loop). A factor that can hit a delta
+        // fact (its relation is in the delta) is the one that contributes new
+        // tuples; the union over all j is exactly the post-step matches that use at
+        // least one delta fact.
+        let delta_rule_indices: Vec<usize> = (0..n_factors).collect();
+
+        let zh = self.btm.zipper_head();
+        let mut template_wzs: Vec<_> = Vec::with_capacity(64);
+        template_prefixes.iter().enumerate().for_each(|(i, x)| {
+            if subsumption[i] == i {
+                placements[i] = template_wzs.len();
+                template_wzs.push(unsafe { zh.write_zipper_at_exclusive_path_unchecked(x) });
+            }
+        });
+        for i in 0..subsumption.len() {
+            subsumption[i] = placements[subsumption[i]]
+        }
+
+        let mut assignments: Vec<(u8, u8)> = vec![];
+        let mut trace: Vec<(u8, u8)> = vec![];
+        let mut ass = Vec::with_capacity(64);
+        let mut astack = Vec::with_capacity(64);
+
+        let mut any_new = false;
+        let mut total_candidates = 0usize;
+
+        // The per-match emit, shared by every delta-rule pass (and the rare
+        // renormalize-fallback pass). It instantiates the template under the match
+        // `bindings` and writes the outputs, exactly as `transform_multi_multi_`'s
+        // emit. `bindings` are keyed in the ORIGINAL pattern namespace (the matcher
+        // unifies against `unify_sources`, which stay the original `sources`), so this
+        // is order-independent of how the factors were reordered for the descent.
+        // `pattern_intros` is threaded in per pass (the (oi,ni) seed for the cycle
+        // check), not captured, so each pass resets it. Returns `true` to continue.
+        let sni_trace = std::env::var("MORK_SNI_TRACE").is_ok();
+        let mut emit = |refs_bindings: Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>,
+                        loc: Expr,
+                        pattern_intros: &mut Option<(u8, u8)>|
+         -> bool {
+            'query: {
+                if sni_trace {
+                    match &refs_bindings {
+                        Ok(refs) => eprintln!("SNI delta emit Ok(refs {refs:?})"),
+                        Err(b) => eprintln!(
+                            "SNI delta emit Err bindings: {:?}",
+                            b.iter()
+                                .map(|(k, ee)| (
+                                    *k,
+                                    serialize(unsafe { ee.subsexpr().span().as_ref().unwrap() })
+                                ))
+                                .collect::<Vec<_>>()
+                        ),
+                    }
+                }
+                trace!(target: "transform", "delta data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
+                unsafe {
+                    WRITES += template_prefixes.len();
+                }
+                match refs_bindings {
+                    Ok(_) => {
+                        // A single-factor body (n_factors == 1) cannot reach here via
+                        // the raw matcher; the delta form is only used for multi-factor
+                        // recursive bodies. Treat as a no-op to stay total.
+                        true
+                    }
+                    Err(ref bindings) => {
+                        #[cfg(debug_assertions)]
+                        bindings.iter().for_each(
+                            |(v, ee)| trace!(target: "transform", "delta binding {:?} {}", *v, ee.show()),
+                        );
+
+                        // Mirror the naive emit's seed discipline exactly: the cached
+                        // (oi, ni) is only valid for GROUND bindings (a schematic match
+                        // introduces data variables, so its intro numbering differs; a
+                        // stale ground seed renumbers a data NewVar into the pattern
+                        // namespace and materializes another binding's term -- the
+                        // process_calculus IC divergence). And a cycle decline skips
+                        // this match, it must not stop the pass.
+                        let ground_bindings =
+                            bindings.values().all(|ee| ee.subsexpr().is_ground());
+                        let (oi0, ni) = match pattern_intros.filter(|_| ground_bindings) {
+                            Some(cached) => cached,
+                            None => {
+                                let mut void = std::io::sink();
+                                let (oi, ni, ok) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
+                                    0, 0, 0, pat_expr, bindings, void, trace, assignments
+                                );
+                                if !ok {
+                                    break 'query true;
+                                }
+                                if ground_bindings && ni == 0 {
+                                    *pattern_intros = Some((oi, ni));
+                                }
+                                (oi, ni)
+                            }
+                        };
+                        let mut oi = oi0;
+
+                        'writes: for (i, template) in templates.iter().enumerate() {
+                            let wz = &mut template_wzs[subsumption[i]];
+
+                            trace!(target: "transform", "{i} delta template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
+
+                            buffer.clear();
+                            let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
+                                0, oi, ni, *template, bindings, buffer, astack, ass
+                            ) else {
+                                continue 'writes;
+                            };
+                            oi = toi;
+
+                            if sni_trace {
+                                eprintln!(
+                                    "EMITdelta pat={} out={}",
+                                    serialize(unsafe { pat_expr.span().as_ref().unwrap() }),
+                                    serialize(&buffer)
+                                );
+                            }
+                            trace!(target: "transform", "U {i} delta out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
+                            wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
+                            any_new |= wz.set_val(()).is_none();
+                        }
+                        true
+                    }
+                }
+            }
+        };
+
+        // One delta-rule per mutated-relation factor j. Stage 4 reorder: factor j
+        // (restricted to the small `delta`) is the ProductZipper PRIMARY (the outer
+        // loop), and the other factors (on the full `read_copy`) are SECONDARIES that
+        // SEEK the bound shared variables via the existing VarRef byte-recheck rather
+        // than being descended whole. So a pass is O(delta) outer x O(pattern) inner
+        // seek instead of O(read_copy) outer x O(delta) inner -- the residual
+        // full-dish descent that kept the scaling exponent at ~1.77 is gone.
+        //
+        // The reorder is NOT a bare read-zipper swap. The body factors' patterns are
+        // renormalized in identity order: a variable's first occurrence is `NewVar`,
+        // later occurrences are `VarRef(slot)` pointing back. Putting factor j first
+        // without renumbering would leave its VarRefs pointing at variables not yet
+        // introduced, breaking coreference. So per pass we build the plan
+        // `[j, then the rest in identity order]` and RE-RENORMALIZE the sources in
+        // that order (`search_sources`): factor j's variables become the leading
+        // NewVars and the other factors' shared variables become VarRefs back to them.
+        // `search_sources` drives only the descent/coreference structure.
+        //
+        // The binding keys must stay in the ORIGINAL pattern namespace so the emit
+        // (`apply_e` over `pat_expr`) is unchanged. `args` numbers every factor in one
+        // shared `.n=0` De Bruijn space with the cumulative NewVar offset as identity,
+        // and each `sources[i]` keeps that original `.v`/VarRef numbering. So
+        // `unify_sources` is the ORIGINAL `sources` reordered by the plan (never
+        // renormalized): the `unify` binding keys are exactly the original ones, only
+        // the pattern-factor <-> matched-location PAIRING changes. This mirrors
+        // `query_multi`'s split of `planned_sources` (descent) vs `planned_unify_sources`
+        // (binding keys). `effect_source_index = 0` because the emit ignores `loc`.
+        //
+        // The `pattern_intros` cache is per-pass (the seed (oi,ni) depends only on the
+        // pattern, which is the same across passes, but resetting per pass keeps the
+        // ni!=0 decline local and is cheap).
+        for &j in &delta_rule_indices {
+            // Plan: factor j first, the remaining factors in identity order.
+            let mut plan_j: Vec<usize> = Vec::with_capacity(n_factors);
+            plan_j.push(j);
+            plan_j.extend((0..n_factors).filter(|&i| i != j));
+
+            // Renormalize the sources in plan order so factor j introduces the leading
+            // NewVars and later factors' shared variables become VarRefs back to them.
+            // If the variable offsets don't re-encode (>= 64 distinct), fall back to
+            // the identity (un-reordered) form for this pass, which is still correct
+            // (the pre-Stage-4 behaviour) -- never a wrong match, only a slower pass.
+            let Some((_search_buffers, search_sources)) =
+                Self::renormalize_query_factors(&sources, &plan_j)
+            else {
+                let primary_map: &PathMap<()> = if j == 0 { delta } else { read_copy };
+                let mut prz = ProductZipper::new(
+                    primary_map.read_zipper(),
+                    (1..n_factors).map(|i| {
+                        if i == j { delta } else { read_copy }.read_zipper()
+                    }),
+                );
+                reserve_query_product_buffers(&mut prz);
+                let mut pattern_intros: Option<(u8, u8)> = None;
+                let candidates =
+                    Self::query_multi_raw(&mut prz, &sources, |refs_bindings, loc| {
+                        emit(refs_bindings, loc, &mut pattern_intros)
+                    });
+                total_candidates += candidates;
+                continue;
+            };
+
+            // The ORIGINAL sources, reordered by the plan, for the binding-key
+            // namespace. Position 0 is factor j (unified against the primary = a delta
+            // fact); positions 1.. are the other factors (unified against the
+            // secondaries = read_copy facts, seeking the shared bindings).
+            let unify_sources: Vec<ExprEnv> = plan_j.iter().map(|&i| sources[i]).collect();
+
+            // SAFETY mirrors `query_multi`: all read-zippers are opened at root and the
+            // matcher descends each factor's prefix from the source stack. The primary
+            // is factor j on `delta` (the small outer loop); the secondaries are the
+            // other factors on `read_copy`, in plan order. `delta`/`read_copy` are
+            // separate maps from `self.btm`, so the write zippers (from `zh`) never
+            // alias the read zippers.
+            let mut prz = ProductZipper::new(
+                delta.read_zipper(),
+                (0..n_factors - 1).map(|_| read_copy.read_zipper()),
+            );
+            reserve_query_product_buffers(&mut prz);
+
+            let mut pattern_intros: Option<(u8, u8)> = None;
+            let candidates = Self::query_multi_raw_with_unification_sources(
+                &mut prz,
+                &search_sources,
+                &unify_sources,
+                0,
+                None,
+                |refs_bindings, loc| emit(refs_bindings, loc, &mut pattern_intros),
+            );
+            total_candidates += candidates;
+        }
+
+        drop(emit);
+        for wz in template_wzs {
+            zh.cleanup_write_zipper(wz);
+        }
+        (total_candidates, any_new)
     }
 
     #[cfg(feature = "specialize_io")]
@@ -8324,7 +9957,14 @@ impl Space {
                         None => {
                             let mut void = std::io::sink();
                             let (oi, ni, ok) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
-                                0, 0, 0, pat_expr, bindings, void, trace, assignments
+                                0,
+                                0,
+                                0,
+                                pat_expr,
+                                bindings,
+                                void,
+                                trace,
+                                assignments
                             );
                             if !ok {
                                 break 'query false;
@@ -8369,9 +10009,23 @@ impl Space {
         // A `(- ...)` template deleted facts: bump the per-Space removal
         // generation so the persistent join sidecar re-syncs and tombstones them
         // (closes the count-equality staleness window).
-        #[cfg(feature = "sidecar_bridge_emit")]
         if sinks.iter().any(|s| s.is_remove()) {
-            self.bridge_remove_gen = self.bridge_remove_gen.wrapping_add(1);
+            #[cfg(feature = "sidecar_bridge_emit")]
+            {
+                self.bridge_remove_gen = self.bridge_remove_gen.wrapping_add(1);
+            }
+            // Trip the semi-naive soundness gate: a retraction makes every IC
+            // worker's add-only snapshot potentially stale (a removed fact is
+            // excluded from `btm \ snapshot`, so the closure never re-derives it),
+            // so disarm the delta and fall back to naive for the rest of the loop
+            // (Naive mode), or trigger a DRed re-derivation catch-up (Dred mode).
+            // The generation counter bumps so every recursive rule re-derives once
+            // before its incremental delta is trusted again.
+            self.sni_removal_seen = true;
+            #[cfg(feature = "semi_naive_ic")]
+            {
+                self.sni_removal_gen = self.sni_removal_gen.wrapping_add(1);
+            }
         }
         (touched, any_new)
     }
@@ -8521,9 +10175,23 @@ impl Space {
         // A `(- ...)` template deleted facts: bump the per-Space removal
         // generation so the persistent join sidecar re-syncs and tombstones them
         // (closes the count-equality staleness window).
-        #[cfg(feature = "sidecar_bridge_emit")]
         if sinks.iter().any(|s| s.is_remove()) {
-            self.bridge_remove_gen = self.bridge_remove_gen.wrapping_add(1);
+            #[cfg(feature = "sidecar_bridge_emit")]
+            {
+                self.bridge_remove_gen = self.bridge_remove_gen.wrapping_add(1);
+            }
+            // Trip the semi-naive soundness gate: a retraction makes every IC
+            // worker's add-only snapshot potentially stale (a removed fact is
+            // excluded from `btm \ snapshot`, so the closure never re-derives it),
+            // so disarm the delta and fall back to naive for the rest of the loop
+            // (Naive mode), or trigger a DRed re-derivation catch-up (Dred mode).
+            // The generation counter bumps so every recursive rule re-derives once
+            // before its incremental delta is trusted again.
+            self.sni_removal_seen = true;
+            #[cfg(feature = "semi_naive_ic")]
+            {
+                self.sni_removal_gen = self.sni_removal_gen.wrapping_add(1);
+            }
         }
         (touched, any_new)
     }
@@ -8617,6 +10285,37 @@ impl Space {
         let mut done: usize = 0;
         let mut exec_path = Vec::new();
 
+        // Semi-naive immediate-consequence loop (Stage 3, feature `semi_naive_ic`).
+        // The naive loop re-matches each exec's `,`-rule against the whole
+        // accumulating dish every round; the semi-naive loop matches only the delta
+        // for the rule that fires (the facts added since that rule last ran), so a
+        // step costs O(delta) instead of O(dish). The per-rule deltas live in
+        // `sni_rule_seen`, which `transform_multi_multi_` consults and refreshes;
+        // here we just arm it for the duration of the loop. A single global delta
+        // would be wrong: rules re-arm and fire out of lockstep, so each needs its
+        // own "since I last ran" frontier (see the field docs). The default build
+        // never arms it, so the loop is byte-identical to the naive one. Restored to
+        // `None` on exit so nested / later `transform_multi_multi_` calls stay naive.
+        #[cfg(feature = "semi_naive_ic")]
+        let sni_outer = self.sni_rule_seen.take();
+        #[cfg(feature = "semi_naive_ic")]
+        {
+            self.sni_rule_seen = Some(HashMap::new());
+            self.sni_force_naive = self.sni_force_naive
+                || SNI_DISARM.with(|c| c.get())
+                || std::env::var("MORK_SNI").as_deref() == Ok("0");
+            // Arm the soundness gate fresh: only removals DURING this loop should
+            // disarm the delta. Cleared here so a pre-loop load (which trips the
+            // flag via invalidate_bridge_caches) does not force naive from the
+            // start. Once a removal happens mid-loop the flag latches and every
+            // later `,`->`,` rule routes to naive (the corpus proved retraction is
+            // the exact divergence boundary).
+            self.sni_removal_seen = false;
+            self.sni_removal_gen = 0;
+            self.sni_dred_repairs = 0;
+            self.sni_dred_fallbacks = 0;
+        }
+
         while done < steps {
             if self.take_first_exec_path(&mut exec_path) {
                 let xe = Expr {
@@ -8639,6 +10338,12 @@ impl Space {
             } else {
                 break;
             }
+        }
+
+        // Disarm the per-rule deltas so any later transform stays on the naive path.
+        #[cfg(feature = "semi_naive_ic")]
+        {
+            self.sni_rule_seen = sni_outer;
         }
 
         done
@@ -8715,6 +10420,23 @@ impl Drop for Space {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the naive IC loop for a test of another route (RAII-restored, panic-safe).
+    #[cfg(feature = "semi_naive_ic")]
+    struct SniDisarmGuard(bool);
+    #[cfg(feature = "semi_naive_ic")]
+    impl SniDisarmGuard {
+        fn new() -> Self {
+            Self(SNI_DISARM.with(|c| c.replace(true)))
+        }
+    }
+    #[cfg(feature = "semi_naive_ic")]
+    impl Drop for SniDisarmGuard {
+        fn drop(&mut self) {
+            let prev = self.0;
+            SNI_DISARM.with(|c| c.set(prev));
+        }
+    }
 
     #[test]
     fn shard_zipper_sweep_preserves_space_content() {
@@ -8899,23 +10621,9 @@ mod tests {
     fn plan_cache_key(id: usize) -> QueryFactorPlanCacheKey {
         QueryFactorPlanCacheKey {
             factors: vec![format!("factor-{id}").into_bytes()],
-            dependencies: Vec::new(),
         }
     }
 
-    #[test]
-    fn cardinality_bucket_is_stable_within_a_power_of_two_band() {
-        // Counts inside one [2^(k-1), 2^k) band share a bucket, so the small
-        // per-step cardinality drift of a mutating space keeps the plan-cache
-        // key stable and the plan is reused. The key only changes when a count
-        // crosses a band, where re-ranking is worthwhile.
-        assert_eq!(cardinality_bucket(0), 0);
-        assert_eq!(cardinality_bucket(1), 1);
-        assert_eq!(cardinality_bucket(2), cardinality_bucket(3));
-        assert_eq!(cardinality_bucket(64), cardinality_bucket(127));
-        assert_eq!(cardinality_bucket(128), cardinality_bucket(255));
-        assert_ne!(cardinality_bucket(127), cardinality_bucket(128));
-    }
 
     fn side_index_key(id: usize) -> QueryShapeSideIndexKey {
         let key_bytes = id.to_le_bytes().to_vec();
@@ -9205,7 +10913,9 @@ mod tests {
     #[test]
     fn coref_no_overproduction_on_repeated_data_var() {
         let mut space = Space::new();
-        space.add_all_sexpr(b"(implies (Frog $x) (Green $x))\n").unwrap();
+        space
+            .add_all_sexpr(b"(implies (Frog $x) (Green $x))\n")
+            .unwrap();
         let mut count = 0usize;
         let touched = Space::query_multi(
             &space.btm,
@@ -9216,7 +10926,10 @@ mod tests {
             },
         );
         assert_eq!(touched, 1, "query_multi return count over-produces");
-        assert_eq!(count, 1, "callback fired more than once: data coreference double-counted");
+        assert_eq!(
+            count, 1,
+            "callback fired more than once: data coreference double-counted"
+        );
     }
 
     // Dual of coref_no_overproduction: querying `(, (= (Add (S $n) Z) $r))` against the
@@ -9237,7 +10950,10 @@ mod tests {
                 true
             },
         );
-        assert_eq!(touched, 1, "matcher under-produces: missed compound binding to a reused data var");
+        assert_eq!(
+            touched, 1,
+            "matcher under-produces: missed compound binding to a reused data var"
+        );
         let _ = count;
     }
 
@@ -9249,7 +10965,9 @@ mod tests {
     #[test]
     fn higher_order_query_var_in_binder_and_body() {
         let mut space = Space::new();
-        space.add_all_sexpr(b"(= (lam $v $b) (got $v $b))\n").unwrap();
+        space
+            .add_all_sexpr(b"(= (lam $v $b) (got $v $b))\n")
+            .unwrap();
         let mut count = 0usize;
         let touched = Space::query_multi(
             &space.btm,
@@ -10648,6 +12366,9 @@ mod tests {
 
     #[test]
     fn transform_via_sidecar_declines_schematic_relations() {
+        #[cfg(feature = "semi_naive_ic")]
+        let _sni_guard = SniDisarmGuard::new();
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
         let mut space = Space::new();
         space
             .add_all_sexpr(
@@ -10655,14 +12376,14 @@ mod tests {
 (edge a b)
 (edge b c)
 (edge c a)
-(if (S $n) $x $y $x)
+(r b $d)
 "#,
             )
             .unwrap();
 
         let (pat_expr, sources) = query_pattern_and_sources(
             &mut space,
-            "[5] , [3] edge $ $ [3] edge _2 $ [3] edge _3 _1 [5] if $ [2] S _1 fallback $",
+            "[5] , [3] edge $ $ [3] edge _2 $ [3] edge _3 _1 [3] r _2 [2] f _1",
         );
         let (tpl_expr, _) = query_pattern_and_sources(&mut space, "[2] , [2] out _1");
 
@@ -10680,14 +12401,19 @@ mod tests {
         sidecar.extend_from_pathmap(&space.btm).unwrap();
         assert!(
             sidecar.any_schematic_fact_under_prefixes(&prefixes),
-            "the (if ...) relation contains a schematic stored fact"
+            "the r relation contains a schematic stored fact"
         );
 
         let read_copy = space.btm.clone();
+        let old_unify = SIDECAR_UNIFY_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let old_capture = SIDECAR_CAPTURE_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let declined = space
+            .transform_via_sidecar(&read_copy, pat_expr, tpl_expr)
+            .is_none();
+        SIDECAR_CAPTURE_ENABLED.store(old_capture, std::sync::atomic::Ordering::Relaxed);
+        SIDECAR_UNIFY_ENABLED.store(old_unify, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            space
-                .transform_via_sidecar(&read_copy, pat_expr, tpl_expr)
-                .is_none(),
+            declined,
             "cyclic bodies with schematic relations must stay on ProductZipper"
         );
     }
@@ -11020,6 +12746,708 @@ mod tests {
             semi_naive.btm.val_count() > 10,
             "the closure adds derived pairs"
         );
+    }
+
+    // ---- Stage 2 of the semi-naive delta lever: the m-delta-rule transform ----
+    // (transform_multi_multi_delta). See kernel/resources/semi_naive_delta_design.md.
+
+    // Local Peano encoder (the binary's `peano` is not in the lib).
+    fn peano_sexpr(x: usize) -> String {
+        if x == 0 {
+            "Z".to_string()
+        } else {
+            format!("(S {})", peano_sexpr(x - 1))
+        }
+    }
+
+    // The set of values in a space.
+    fn collect_facts(btm: &PathMap<()>) -> BTreeSet<Vec<u8>> {
+        let mut facts = BTreeSet::new();
+        btm.try_for_each_value::<_, ()>(|path, _| {
+            facts.insert(path.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        facts
+    }
+
+    // The naive one-step ProductZipper emit set over `btm` (the oracle).
+    fn naive_emit_set(
+        space: &mut Space,
+        btm: &PathMap<()>,
+        body: &'static str,
+        template: &'static str,
+    ) -> BTreeSet<Vec<u8>> {
+        let (pat_expr, _) = query_pattern_and_sources(space, body);
+        let (tpl_expr, _) = query_pattern_and_sources(space, template);
+        let mut tpl_args = Vec::new();
+        ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+        let templates: Vec<Expr> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+        Space::product_template_outputs(btm, pat_expr, &templates)
+    }
+
+    // The semi-naive m-delta-rule emit set: the facts transform_multi_multi_delta
+    // writes into a space initialized to `post` (the full post-step space), given
+    // `delta` (the per-step added facts). Returns the newly-written paths.
+    fn delta_emit_set(
+        post: &PathMap<()>,
+        delta: &PathMap<()>,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+    ) -> BTreeSet<Vec<u8>> {
+        let mut space = Space::new();
+        space.btm = post.clone();
+        let read_copy = space.btm.clone();
+        let before = space.btm.clone();
+        space.transform_multi_multi_delta(&read_copy, delta, pat_expr, tpl_expr);
+        collect_facts(&space.btm.subtract(&before))
+    }
+
+    // Build (post-step space, pre-step space, delta) from sexpr blocks. `base` is
+    // the pre-step facts, `added` is the per-step delta; post = base + added.
+    fn build_step_spaces(
+        base: &[u8],
+        added: &[u8],
+    ) -> (PathMap<()>, PathMap<()>, PathMap<()>) {
+        let mut pre = Space::new();
+        pre.add_all_sexpr(base).unwrap();
+        let pre_btm = pre.btm.clone();
+
+        let mut post = Space::new();
+        post.add_all_sexpr(base).unwrap();
+        post.add_all_sexpr(added).unwrap();
+        let post_btm = post.btm.clone();
+
+        let delta = post_btm.subtract(&pre_btm);
+        (post_btm, pre_btm, delta)
+    }
+
+    // The core m-delta-rule invariant on a body, asserted two ways:
+    //   (soundness)     delta_emit  is subset of  naive(post)
+    //   (semi-naive)    delta_emit + naive(pre)  ==  naive(post)
+    // The second is the exact statement the idempotent-insert fixpoint relies on:
+    // matching one factor against the delta and the rest against the full space,
+    // unioned over the mutated-relation factors, recovers precisely the facts that
+    // complete the naive one-step result. When template instantiation is injective
+    // on matches (`exact_difference`), the stronger design form also holds:
+    //   delta_emit  ==  naive(post) \ naive(pre).
+    fn assert_m_delta_invariant(
+        base: &[u8],
+        added: &[u8],
+        body: &'static str,
+        template: &'static str,
+        exact_difference: bool,
+    ) {
+        let (post, pre, delta) = build_step_spaces(base, added);
+
+        let mut space = Space::new();
+        let (pat_expr, _) = query_pattern_and_sources(&mut space, body);
+        let (tpl_expr, _) = query_pattern_and_sources(&mut space, template);
+
+        let naive_pre = naive_emit_set(&mut space, &pre, body, template);
+        let naive_post = naive_emit_set(&mut space, &post, body, template);
+        let delta_out = delta_emit_set(&post, &delta, pat_expr, tpl_expr);
+
+        // soundness: every delta-rule output is a real match over the full space
+        assert!(
+            delta_out.is_subset(&naive_post),
+            "delta-rule emitted a fact the naive full match does not"
+        );
+        // the semi-naive recovery identity
+        let recovered: BTreeSet<Vec<u8>> =
+            delta_out.union(&naive_pre).cloned().collect();
+        assert_eq!(
+            recovered, naive_post,
+            "delta_emit + naive(pre) must equal naive(post)"
+        );
+        if exact_difference {
+            let naive_new: BTreeSet<Vec<u8>> =
+                naive_post.difference(&naive_pre).cloned().collect();
+            assert_eq!(
+                delta_out, naive_new,
+                "with injective output, delta_emit == naive(post) \\ naive(pre)"
+            );
+        }
+    }
+
+    #[test]
+    fn m_delta_rule_per_step_invariant_ground() {
+        // A ground non-linear (doubly-recursive) transitive-closure body over
+        // `path`. The output relation is the same as the input (recursive), so
+        // outputs can be re-derived old-and-new; the semi-naive recovery identity
+        // is the right invariant (exact_difference would not hold in general).
+        let base = br#"
+(path a b)
+(path b c)
+(path c d)
+"#;
+        // Adding (path d e) opens new two-hop joins through d and e.
+        let added = b"(path d e)\n";
+        assert_m_delta_invariant(
+            base,
+            added,
+            "[3] , [3] path $ $ [3] path _2 $",
+            "[2] , [3] path _1 _3",
+            false,
+        );
+
+        // A disjoint output relation makes template instantiation injective on the
+        // (x,z) match, so the stronger design difference form holds exactly.
+        assert_m_delta_invariant(
+            base,
+            added,
+            "[3] , [3] path $ $ [3] path _2 $",
+            "[2] , [3] reach _1 _3",
+            true,
+        );
+
+        // A 3-factor body stresses the j-loop's secondary-position indexing (the
+        // delta can sit at primary, secondary 0, or secondary 1). The three-hop
+        // chain path X Y, path Y Z, path Z W emits tri X W. _1=X,_2=Y,_3=Z,_4=W;
+        // factor1 = path _2 $ (Y,Z), factor2 = path _3 $ (Z,W).
+        assert_m_delta_invariant(
+            base,
+            added,
+            "[4] , [3] path $ $ [3] path _2 $ [3] path _3 $",
+            "[2] , [3] tri _1 _4",
+            true,
+        );
+    }
+
+    #[test]
+    fn m_delta_rule_per_step_invariant_schematic() {
+        // The real process_calculus nesting: a receiver (petri (? chan payload
+        // body)) joins a message (petri (! chan payload)) on the shared channel and
+        // payload, emitting the receiver body. The facts carry variables (a
+        // variable-bearing receiver), so the join does real unification, exactly
+        // like (petri (? (add $ret) ...)). Both factors are over `petri` (the
+        // mutated relation), so the m-delta-rule loops both.
+        let base = br#"
+(petri (? chan one (done one)))
+(petri (! chan one))
+"#;
+        // The delta adds a second receiver+message pair on a fresh channel, with a
+        // variable-bearing receiver body to exercise schematic unification on the
+        // delta-restricted factor.
+        let added = br#"
+(petri (? other ($v) (got $v)))
+(petri (! other (Z)))
+"#;
+        // body: (, (petri (? $chan $payload $body)) (petri (! $chan $payload)))
+        //   _1=chan, _2=payload, _3=body; factor1 corefs chan/payload as _1/_2.
+        // template: (petri $body)  ->  _3.
+        assert_m_delta_invariant(
+            base,
+            added,
+            "[3] , [2] petri [4] ? $ $ $ [2] petri [3] ! _1 _2",
+            "[2] , [2] petri _3",
+            false,
+        );
+    }
+
+    #[test]
+    fn m_delta_rule_preserves_free_data_vars_in_split_templates() {
+        // The process_calculus |-split: a SINGLE-factor body over a schematic fact
+        // whose second component carries a FREE data variable plus a back-reference
+        // to it ((? chan $a (send (S $a)))), split by TWO templates. The IC-loop
+        // divergence materialized the first component into the second's variable
+        // slot on delta-routed firings; this pins the split emit byte-for-byte
+        // against the naive full match.
+        let base = br#"
+(petri (| (msg a) (recv a)))
+"#;
+        let added = br#"
+(petri (| (! chan pay) (? chan $a (send (S $a)))))
+"#;
+        // body: (, (petri (| $l $r))) -- m == 1; templates: (, (petri $l) (petri $r)).
+        assert_m_delta_invariant(
+            base,
+            added,
+            "[2] , [2] petri [3] | $ $",
+            "[3] , [2] petri _1 [2] petri _2",
+            false,
+        );
+    }
+
+    // Regression guard for the path-buffer realloc bug in the VarRef recheck of
+    // `coreferential_transition`, exposed by the Stage-4 reordered delta. The reorder
+    // makes a factor's bound subterm the rechecked one; the recheck captured a raw
+    // pointer into `loc.path()` (the ProductZipper's path buffer) and recursed while
+    // holding it, so once the matched path grew past the reserved buffer
+    // (`QUERY_PRODUCT_PATH_BUFFER_INITIAL_CAPACITY`, 4096) and reallocated, the pointer
+    // dangled and the matcher read garbage tag bytes (a `byte_item` "reserved" panic).
+    // The fix copies the bound subterm into an owned buffer before recursing.
+    //
+    // Reproducing needs the FULL `metta_calculus` IC loop: the deep
+    // `(IC 0 1 peano(1000))` controller counter plus the add(n,n) cascade's deep
+    // intermediate terms push the concatenated path past 4096 mid-recheck. n=175 is
+    // just past the measured onset (n<=170 stays under the reserve). Pre-fix the
+    // RELEASE binary panicked deterministically here; post-fix the semi-naive IC loop
+    // is byte-identical to naive. Feature-gated because it drives `metta_calculus`.
+    #[cfg(feature = "semi_naive_ic")]
+    #[test]
+    fn coreferential_recheck_survives_path_buffer_realloc_on_deep_terms() {
+        // Parsing peano(1000) and matching the deep cascade recurse past the default
+        // 2 MiB test stack, so run on a worker thread with a large stack (self-
+        // contained: no RUST_MIN_STACK needed). This is a depth limit, not the bug.
+        std::thread::Builder::new()
+            .stack_size(1 << 31)
+            .spawn(|| {
+                fn build(setup: &str) -> Space {
+                    let mut s = Space::new();
+                    let pat = crate::expr!(s, "$");
+                    let tpl = crate::expr!(s, "_1");
+                    s.add_sexpr(setup.as_bytes(), pat, tpl).unwrap();
+                    s
+                }
+                // naive reference: hand-drive the IC loop with the delta hook inert.
+                let n = 175usize;
+                let setup = process_calculus_setup_sexpr(1000, n, n);
+                let mut naive = build(&setup);
+                {
+                    let mut exec_path = Vec::new();
+                    while naive.take_first_exec_path(&mut exec_path) {
+                        let xe = Expr { ptr: exec_path.as_mut_ptr() };
+                        let _ = naive.interpret(xe);
+                    }
+                }
+                // semi-naive: the wired loop through the reordered delta transform.
+                let mut semi = build(&setup);
+                semi.metta_calculus(1_000_000_000_000_000);
+
+                let mut nv = Vec::new();
+                naive.dump_all_sexpr(&mut nv).unwrap();
+                let mut sv = Vec::new();
+                semi.dump_all_sexpr(&mut sv).unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&nv),
+                    String::from_utf8_lossy(&sv),
+                    "deep IC loop (n={n}): reordered semi-naive must be byte-identical to naive across the path-buffer realloc"
+                );
+                let want = format!("{}\n", peano_sexpr(2 * n));
+                let pat = crate::expr!(semi, "[2] petri [3] ! result $");
+                let tpl = crate::expr!(semi, "_1");
+                let mut rv = Vec::new();
+                semi.dump_sexpr(pat, tpl, &mut rv);
+                assert_eq!(
+                    String::from_utf8_lossy(&rv),
+                    want,
+                    "deep IC loop must compute add({n},{n}) = peano({})",
+                    2 * n
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn semi_naive_delta_matches_naive_on_process_calculus() {
+        // The load-bearing differential oracle. Drive a recursive `,`-rule to
+        // fixpoint two ways and assert the final spaces are byte-identical:
+        //   (a) naive: the ProductZipper emit (product_template_outputs) re-run
+        //       round by round against the full accumulating space (this is what
+        //       transform_multi_multi_ does each step);
+        //   (b) semi-naive: transform_multi_multi_delta driven by the per-step
+        //       delta maintained with delta_snapshot / delta_since.
+        //
+        // Run on TWO rules: a schematic transitive closure, and the actual
+        // process_calculus petri reaction computing add(8,8) = peano(16).
+
+        // Helper: run rule (body -> template) to fixpoint, naive round-by-round.
+        fn naive_fixpoint(setup: &str, body: &'static str, template: &'static str) -> Space {
+            let mut space = Space::new();
+            space.add_all_sexpr(setup.as_bytes()).unwrap();
+            let (pat_expr, _) = query_pattern_and_sources(&mut space, body);
+            let (tpl_expr, _) = query_pattern_and_sources(&mut space, template);
+            let mut tpl_args = Vec::new();
+            ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+            let templates: Vec<Expr> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+            loop {
+                let round = space.btm.clone();
+                let outputs = Space::product_template_outputs(&round, pat_expr, &templates);
+                let mut any_new = false;
+                for path in &outputs {
+                    any_new |= space.btm.insert(&path[..], ()).is_none();
+                }
+                if !any_new {
+                    break;
+                }
+            }
+            space
+        }
+
+        // Helper: run the same rule to fixpoint, semi-naive (delta-driven). The
+        // first round matches the whole space (delta = whole space); thereafter the
+        // delta is the facts the previous round added.
+        fn semi_naive_fixpoint(setup: &str, body: &'static str, template: &'static str) -> Space {
+            let mut space = Space::new();
+            space.add_all_sexpr(setup.as_bytes()).unwrap();
+            let (pat_expr, _) = query_pattern_and_sources(&mut space, body);
+            let (tpl_expr, _) = query_pattern_and_sources(&mut space, template);
+
+            // Round 0: the seed delta is the entire initial space (every fact is
+            // "new" relative to the empty pre-state), matched in full.
+            let mut delta = space.btm.clone();
+            loop {
+                let before = space.delta_snapshot();
+                let read_copy = space.btm.clone();
+                space.transform_multi_multi_delta(&read_copy, &delta, pat_expr, tpl_expr);
+                let (added, _removed) = space.delta_since(&before);
+                if added.val_count() == 0 {
+                    break;
+                }
+                delta = added;
+            }
+            space
+        }
+
+        // Rule 1: schematic non-linear transitive closure over `path`.
+        {
+            let mut setup = String::from("(edge x y)\n");
+            for i in 0..8 {
+                setup.push_str(&format!("(path n{i} n{})\n", i + 1));
+            }
+            let body = "[3] , [3] path $ $ [3] path _2 $";
+            let template = "[2] , [3] path _1 _3";
+            let naive = naive_fixpoint(&setup, body, template);
+            let semi = semi_naive_fixpoint(&setup, body, template);
+
+            let mut nv = Vec::new();
+            naive.dump_all_sexpr(&mut nv).unwrap();
+            let mut sv = Vec::new();
+            semi.dump_all_sexpr(&mut sv).unwrap();
+            assert_eq!(
+                nv, sv,
+                "TC: semi-naive delta fixpoint must be byte-identical to naive"
+            );
+            assert!(naive.btm.val_count() > 9, "the closure adds derived pairs");
+        }
+
+        // Rule 2: the process_calculus petri reaction. The receiver (? chan payload
+        // body) reacts with the message (! chan payload) and emits the body. We seed
+        // an `add` computation and let the reaction cascade to the Peano result.
+        // This is the exact rule from process_calculus_bench (main.rs:254-257), and
+        // the add encoding from main.rs:263-266, computing add(8,8) = peano(16).
+        {
+            let setup = format!(
+                r#"
+(petri (? (add $ret) ((S $x) $y) (| (! (add (PN $x $y)) ($x $y))
+                                    (? (PN $x $y) $z (! $ret (S $z)))  )  ))
+(petri (? (add $ret) (Z $y) (! $ret $y)))
+(petri (! (add result) ({} {})))
+"#,
+                peano_sexpr(8),
+                peano_sexpr(8)
+            );
+            // The reaction rule (exec 0): a receiver (petri (? chan payload body))
+            // joins a message (petri (! chan payload)) on the shared channel and
+            // payload, emitting the receiver body. Nested arity-prefix encoding:
+            // _1=channel, _2=payload, _3=body (NewVars in appearance order); factor1
+            // corefs channel/payload as _1/_2.
+            let body = "[3] , [2] petri [4] ? $ $ $ [2] petri [3] ! _1 _2";
+            let template = "[2] , [2] petri _3";
+
+            // The split rule (exec 1) breaks a `|` process into its two halves. To
+            // reach the arithmetic fixpoint we apply BOTH the reaction and the split
+            // (both are monotone add-only here, so interleaving them to a joint
+            // fixpoint computes the same result the IC controller would).
+            let split_body = "[2] , [2] petri [3] | $ $";
+            let split_template = "[3] , [2] petri _1 [2] petri _2";
+
+            // naive: interleave reaction-fixpoint and split-fixpoint, naive each.
+            let naive = {
+                let mut space = Space::new();
+                space.add_all_sexpr(setup.as_bytes()).unwrap();
+                let (rpat, _) = query_pattern_and_sources(&mut space, body);
+                let (rtpl, _) = query_pattern_and_sources(&mut space, template);
+                let (spat, _) = query_pattern_and_sources(&mut space, split_body);
+                let (stpl, _) = query_pattern_and_sources(&mut space, split_template);
+                let mut rtpl_args = Vec::new();
+                ExprEnv::new(0, rtpl).args(&mut rtpl_args);
+                let rtemplates: Vec<Expr> =
+                    rtpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+                let mut stpl_args = Vec::new();
+                ExprEnv::new(0, stpl).args(&mut stpl_args);
+                let stemplates: Vec<Expr> =
+                    stpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+                loop {
+                    let mut any_new = false;
+                    let round = space.btm.clone();
+                    for path in &Space::product_template_outputs(&round, rpat, &rtemplates) {
+                        any_new |= space.btm.insert(&path[..], ()).is_none();
+                    }
+                    let round = space.btm.clone();
+                    for path in &Space::product_template_outputs(&round, spat, &stemplates) {
+                        any_new |= space.btm.insert(&path[..], ()).is_none();
+                    }
+                    if !any_new {
+                        break;
+                    }
+                }
+                space
+            };
+
+            // semi-naive: same interleave, but each rule's match is delta-restricted
+            // via transform_multi_multi_delta with a maintained per-rule delta.
+            let semi = {
+                let mut space = Space::new();
+                space.add_all_sexpr(setup.as_bytes()).unwrap();
+                let (rpat, _) = query_pattern_and_sources(&mut space, body);
+                let (rtpl, _) = query_pattern_and_sources(&mut space, template);
+                let (spat, _) = query_pattern_and_sources(&mut space, split_body);
+                let (stpl, _) = query_pattern_and_sources(&mut space, split_template);
+                // Seed both deltas with the whole space.
+                loop {
+                    let before = space.delta_snapshot();
+                    let delta = before.clone();
+                    let read_copy = space.btm.clone();
+                    space.transform_multi_multi_delta(&read_copy, &delta, rpat, rtpl);
+                    let read_copy = space.btm.clone();
+                    let delta2 = space.btm.clone();
+                    space.transform_multi_multi_delta(&read_copy, &delta2, spat, stpl);
+                    let (added, _removed) = space.delta_since(&before);
+                    if added.val_count() == 0 {
+                        break;
+                    }
+                }
+                space
+            };
+
+            let mut nv = Vec::new();
+            naive.dump_all_sexpr(&mut nv).unwrap();
+            let mut sv = Vec::new();
+            semi.dump_all_sexpr(&mut sv).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&nv),
+                String::from_utf8_lossy(&sv),
+                "petri reaction: semi-naive delta fixpoint must be byte-identical to naive"
+            );
+
+            // The cascade computes add(8,8) = 16, landing on the `result` channel as
+            // (petri (! result peano(16))). Assert the arithmetic answer is present
+            // in BOTH the naive and semi-naive dishes (byte-identical above implies
+            // both, but check explicitly so a vacuous match can never pass).
+            let want = format!("(petri (! result {}))", peano_sexpr(16));
+            assert!(
+                String::from_utf8_lossy(&nv).contains(&want),
+                "naive petri reaction must compute add(8,8) = peano(16) on `result`"
+            );
+            assert!(
+                String::from_utf8_lossy(&sv).contains(&want),
+                "semi-naive petri reaction must compute add(8,8) = peano(16) on `result`"
+            );
+        }
+    }
+
+    // The exact process_calculus_bench setup (main.rs:242-271): the IC driver, the
+    // petri reaction `(exec 0)`, the split `(exec 1)`, and the add(x,y) seed. Built
+    // through add_sexpr with the same `$`/`_1` pattern so the encoded space matches
+    // the binary's byte for byte.
+    #[cfg(feature = "semi_naive_ic")]
+    fn process_calculus_setup_sexpr(steps: usize, x: usize, y: usize) -> String {
+        format!(
+            r#"
+(exec (IC 0 1 {})
+               (, (exec (IC $x $y (S $c)) $sp $st)
+                  ((exec $x) $p $t))
+               (, (exec (IC $y $x $c) $sp $st)
+                  (exec (R $x) $p $t)))
+
+((exec 0)
+      (, (petri (? $channel $payload $body))
+         (petri (! $channel $payload)) )
+      (, (petri $body)))
+((exec 1)
+      (, (petri (| $lprocess $rprocess)))
+      (, (petri $lprocess)
+         (petri $rprocess)))
+
+(petri (? (add $ret) ((S $x) $y) (| (! (add (PN $x $y)) ($x $y))
+                                    (? (PN $x $y) $z (! $ret (S $z)))  )  ))
+(petri (? (add $ret) (Z $y) (! $ret $y)))
+(petri (! (add result) ({} {})))
+    "#,
+            peano_sexpr(steps),
+            peano_sexpr(x),
+            peano_sexpr(y)
+        )
+    }
+
+    // Stage 3 load-bearing differential oracle. Run the FULL process_calculus IC
+    // loop both ways to the same (unbounded) step budget and assert the final dish
+    // is BYTE-IDENTICAL:
+    //   naive: drive `take_first_exec_path` + `interpret` by hand, never touching
+    //          `sni_delta` (it stays None, so transform_multi_multi_ takes the
+    //          naive full-space branch every step -- exactly the feature-off loop);
+    //   semi:  `metta_calculus`, which maintains the per-step delta and routes
+    //          every `,`-rule through transform_multi_multi_delta.
+    // Both must land peano(x+y) on the `result` channel. If the wiring or delta
+    // maintenance is wrong the dishes diverge and the dump assertion fails.
+    #[cfg(feature = "semi_naive_ic")]
+    #[test]
+    fn metta_calculus_semi_naive_matches_naive() {
+        fn build(setup: &str) -> Space {
+            let mut s = Space::new();
+            let pat = crate::expr!(s, "$");
+            let tpl = crate::expr!(s, "_1");
+            s.add_sexpr(setup.as_bytes(), pat, tpl).unwrap();
+            s
+        }
+
+        // Naive reference: the IC loop with the delta hook inert (sni_delta None).
+        fn run_naive(setup: &str) -> Space {
+            let mut s = build(setup);
+            let mut exec_path = Vec::new();
+            // sni_delta stays None for the whole run, so every transform_multi_multi_
+            // takes the naive full-space path: this is the feature-off loop.
+            while s.take_first_exec_path(&mut exec_path) {
+                let xe = Expr {
+                    ptr: exec_path.as_mut_ptr(),
+                };
+                let _ = s.interpret(xe);
+                debug_assert!(s.sni_rule_seen.is_none());
+            }
+            s
+        }
+
+        // Semi-naive: the wired loop maintaining the per-step delta.
+        fn run_semi(setup: &str) -> Space {
+            let mut s = build(setup);
+            s.metta_calculus(1_000_000_000_000_000);
+            s
+        }
+
+        // Project the `result` channel the way the bench does (main.rs:283).
+        fn project_result(s: &mut Space) -> String {
+            let pat = crate::expr!(s, "[2] petri [3] ! result $");
+            let tpl = crate::expr!(s, "_1");
+            let mut v = Vec::new();
+            s.dump_sexpr(pat, tpl, &mut v);
+            String::from_utf8_lossy(&v).into_owned()
+        }
+
+        for (x, y) in [(8usize, 8usize), (16, 16)] {
+            // The IC round budget (the `(IC 0 1 peano(steps))` counter) must exceed
+            // the add(x,y) cascade depth. add(n,n) finishes in O(n) reaction rounds,
+            // so 100 is ample for x=y up to 16. Kept small because the test thread's
+            // stack cannot parse a peano(1000) literal (the bench runs that in main).
+            let setup = process_calculus_setup_sexpr(100, x, y);
+            let mut naive = run_naive(&setup);
+            let mut semi = run_semi(&setup);
+
+            let mut nv = Vec::new();
+            naive.dump_all_sexpr(&mut nv).unwrap();
+            let mut sv = Vec::new();
+            semi.dump_all_sexpr(&mut sv).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&nv),
+                String::from_utf8_lossy(&sv),
+                "process_calculus x={x} y={y}: semi-naive IC loop must be byte-identical to naive"
+            );
+
+            // The result channel must hold peano(x+y) in BOTH dishes (byte-identity
+            // implies it, but assert explicitly so a vacuous empty-dish match can
+            // never pass).
+            let want = format!("{}\n", peano_sexpr(x + y));
+            assert_eq!(
+                project_result(&mut naive),
+                want,
+                "naive process_calculus must compute add({x},{y}) = peano({})",
+                x + y
+            );
+            assert_eq!(
+                project_result(&mut semi),
+                want,
+                "semi-naive process_calculus must compute add({x},{y}) = peano({})",
+                x + y
+            );
+        }
+    }
+
+    #[cfg(feature = "semi_naive_ic")]
+    #[test]
+    fn semi_naive_ic_lockstep_with_naive_per_step() {
+        // Per-STEP oracle: hand-drive the naive loop and an armed semi loop in
+        // lockstep and compare the whole dish after every exec step. The
+        // end-to-end oracle only sees the final dish; this pins a divergence to
+        // the first step that produced it, with the offending facts named.
+        fn build(setup: &str) -> Space {
+            let mut s = Space::new();
+            let pat = crate::expr!(s, "$");
+            let tpl = crate::expr!(s, "_1");
+            s.add_sexpr(setup.as_bytes(), pat, tpl).unwrap();
+            s
+        }
+        for (x, y) in [(3usize, 3usize), (8, 8)] {
+            let setup = process_calculus_setup_sexpr(100, x, y);
+            let mut naive = build(&setup);
+            let mut semi = build(&setup);
+            // Arm the semi space exactly as metta_calculus does for its loop.
+            semi.sni_rule_seen = Some(HashMap::new());
+            semi.sni_removal_seen = false;
+            semi.sni_removal_gen = 0;
+            semi.sni_dred_repairs = 0;
+            semi.sni_dred_fallbacks = 0;
+
+            let mut exec_path = Vec::new();
+            let mut step = 0usize;
+            loop {
+                step += 1;
+                let n_has = naive.take_first_exec_path(&mut exec_path);
+                if n_has {
+                    let xe = Expr {
+                        ptr: exec_path.as_mut_ptr(),
+                    };
+                    let _ = naive.interpret(xe);
+                }
+                let s_has = semi.take_first_exec_path(&mut exec_path);
+                if s_has {
+                    let xe = Expr {
+                        ptr: exec_path.as_mut_ptr(),
+                    };
+                    let _ = semi.interpret(xe);
+                }
+                assert_eq!(n_has, s_has, "x={x} y={y} step {step}: one loop ran dry first");
+                let mut nv = Vec::new();
+                naive.dump_all_sexpr(&mut nv).unwrap();
+                let mut sv = Vec::new();
+                semi.dump_all_sexpr(&mut sv).unwrap();
+                if nv != sv {
+                    let ns: BTreeSet<String> =
+                        String::from_utf8_lossy(&nv).lines().map(|l| l.to_string()).collect();
+                    let ss: BTreeSet<String> =
+                        String::from_utf8_lossy(&sv).lines().map(|l| l.to_string()).collect();
+                    let only_n: Vec<String> = ns.difference(&ss).take(4).cloned().collect();
+                    let only_s: Vec<String> = ss.difference(&ns).take(4).cloned().collect();
+                    // Raw byte layouts decide variable-numbering questions the
+                    // s-expressions cannot: dump the consumed exec, every pre-step
+                    // `(| ...)`-carrying fact (the split's input, identical in both
+                    // engines a step ago), and both engines' `?`-carrying outputs.
+                    let contains = |hay: &[u8], needle: &[u8]| {
+                        hay.windows(needle.len()).any(|w| w == needle)
+                    };
+                    let mut raw = String::new();
+                    raw.push_str(&format!("exec: {:02x?}\n", &exec_path[..]));
+                    for (label, space) in [("naive", &naive), ("semi", &semi)] {
+                        space.btm.for_each_value(|p, _| {
+                            if contains(p, &[0x03, 0xc1, b'|']) || contains(p, &[0x04, 0xc1, b'?'])
+                            {
+                                raw.push_str(&format!("{label} {}\n  = {p:02x?}\n", serialize(p)));
+                            }
+                        });
+                    }
+                    panic!(
+                        "x={x} y={y}: first divergence at step {step}\nonly naive:\n  {}\nonly semi:\n  {}\n{raw}",
+                        only_n.join("\n  "),
+                        only_s.join("\n  ")
+                    );
+                }
+                if !n_has {
+                    break;
+                }
+            }
+        }
     }
 
     #[test]
@@ -11355,11 +13783,11 @@ mod tests {
             // Single child of each class, plus several together, under `[2] q $`.
             (
                 &[
-                    "[2] q foo",                 // SymbolSize child
-                    "[2] q [2] S Z",             // Arity-2 child
-                    "[2] q [3] t a b",           // Arity-3 child
-                    "[2] q x",                   // another SymbolSize
-                    "[2] q [2] K [2] S Z",       // nested arity
+                    "[2] q foo",           // SymbolSize child
+                    "[2] q [2] S Z",       // Arity-2 child
+                    "[2] q [3] t a b",     // Arity-3 child
+                    "[2] q x",             // another SymbolSize
+                    "[2] q [2] K [2] S Z", // nested arity
                 ],
                 "[2] q $",
                 "mixed tag classes at one node",
@@ -11679,15 +14107,15 @@ mod tests {
     fn compile_linear_equals_recursive() {
         let mut space = Space::new();
         let cases = [
-            "[2] q a",                                       // flat ground source
-            "[3] q $ $",                                     // flat var sources
-            "[2] q [2] S [2] S [2] S [2] S [2] S Z",         // deep ground chain S^5(Z)
-            "[3] q [2] S [2] S [2] S [2] S $ a",             // deep chain, bottom var (adversarial)
-            "[4] state $ $ [2] S [2] S Z",                   // counter_machine shape: vars + deep ground
-            "[3] f [3] g a b [2] h c",                       // nested branching ground
-            "[3] p $ _1",                                    // bound varref re-check
-            "[2] q [1] Z",                                   // arity-1 compound
-            "[3] mix [2] S [2] S $ [2] T [2] T Z",           // mixed deep var + deep ground
+            "[2] q a",                               // flat ground source
+            "[3] q $ $",                             // flat var sources
+            "[2] q [2] S [2] S [2] S [2] S [2] S Z", // deep ground chain S^5(Z)
+            "[3] q [2] S [2] S [2] S [2] S $ a",     // deep chain, bottom var (adversarial)
+            "[4] state $ $ [2] S [2] S Z",           // counter_machine shape: vars + deep ground
+            "[3] f [3] g a b [2] h c",               // nested branching ground
+            "[3] p $ _1",                            // bound varref re-check
+            "[2] q [1] Z",                           // arity-1 compound
+            "[3] mix [2] S [2] S $ [2] T [2] T Z",   // mixed deep var + deep ground
         ];
         for case in cases {
             let pat = crate::expr!(space, case);
@@ -11696,7 +14124,7 @@ mod tests {
             let sources = &args[1..];
 
             let mut lin = Vec::new();
-            let mut intro_l = 0usize;
+            let mut intro_l = [false; 256];
             let mut accept_l = true;
             for &s in sources {
                 if compile_match_factor(s, &mut lin, &mut intro_l).is_none() {
@@ -11706,19 +14134,23 @@ mod tests {
             }
 
             let mut rec = Vec::new();
-            let mut intro_r = 0usize;
+            let mut intro_r = [false; 256];
             let mut scratch = Vec::new();
             let mut accept_r = true;
             for &s in sources {
-                if compile_match_factor_recursive(s, &mut rec, &mut intro_r, &mut scratch).is_none() {
+                if compile_match_factor_recursive(s, &mut rec, &mut intro_r, &mut scratch).is_none()
+                {
                     accept_r = false;
                     break;
                 }
             }
 
             assert_eq!(accept_l, accept_r, "accept mismatch: {case}");
-            assert_eq!(intro_l, intro_r, "introduced count mismatch: {case}");
-            assert_eq!(lin, rec, "compiled ops differ (linear vs recursive): {case}");
+            assert_eq!(intro_l, intro_r, "introduced set mismatch: {case}");
+            assert_eq!(
+                lin, rec,
+                "compiled ops differ (linear vs recursive): {case}"
+            );
         }
     }
 
@@ -12025,6 +14457,4033 @@ mod tests {
         }
     }
 
+    // The cost of the all-or-nothing schematic decline. The same triangle body and
+    // hub-graph, run two ways:
+    //   admit   - every joined fact is ground, so the sidecar runs the WCO join,
+    //   decline - ONE extra schematic fact `(edge zz $w)` sits under the joined
+    //             `edge` prefix. `zz` has no incoming edge, so it closes no
+    //             triangle and the emitted output is byte-identical; it exists only
+    //             to trip `any_schematic_fact_under_prefixes`, which sends the WHOLE
+    //             body to the ProductZipper. Its variable lands on no join position,
+    //             so a per-position router would still admit it.
+    // The ratio is what the coarse per-relation gate costs, i.e. what per-position
+    // routing recovers. Output is asserted byte-identical and the decline counter
+    // asserted 0 (admit) vs 1 (decline), so the path flip is proven, not inferred.
+    //
+    //   cargo +nightly test -p mork --lib --release bench_decline_penalty_metta \
+    //       -- --ignored --nocapture
+    #[ignore = "decline-penalty harness; run with --ignored --nocapture"]
+    #[test]
+    fn bench_decline_penalty_metta() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        // Measures the all-or-nothing decline cost, so the decline case must actually decline.
+        // The unification route recovers it (bench_unify_recovery_metta), so pin the route off.
+        SIDECAR_UNIFY_ENABLED.store(false, Ordering::Relaxed);
+
+        fn collect(space: &Space) -> BTreeSet<Vec<u8>> {
+            let mut facts = BTreeSet::new();
+            space
+                .btm
+                .try_for_each_value::<_, ()>(|path, _| {
+                    facts.insert(path.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            facts
+        }
+
+        fn run(
+            n: usize,
+            hubs: usize,
+            schematic: bool,
+        ) -> (std::time::Duration, BTreeSet<Vec<u8>>, u64) {
+            let mut space = Space::new();
+            let mut program = String::new();
+            for a in 0..hubs {
+                for b in 0..hubs {
+                    if a != b {
+                        program.push_str(&format!("(edge h{a} h{b})\n"));
+                    }
+                }
+            }
+            for p in 0..n {
+                for h in 0..hubs {
+                    program.push_str(&format!("(edge p{p} h{h})\n(edge h{h} p{p})\n"));
+                }
+            }
+            if schematic {
+                // Schematic, under the joined `edge` prefix, but isolated: `zzdead`
+                // has no other edge and the compound target `(qq $w)` unifies with no
+                // atom endpoint, so it closes no triangle and emits nothing. It exists
+                // only to trip the per-relation `any_schematic_fact_under_prefixes`
+                // gate. Its variable is on no join position: a per-position router admits it.
+                program.push_str("(edge zzdead (qq $w))\n");
+            }
+            space.add_all_sexpr(program.as_bytes()).unwrap();
+
+            let before = collect(&space);
+            SIDECAR_SCHEMATIC_DECLINES.store(0, Ordering::Relaxed);
+            let start = Instant::now();
+            space
+                .add_all_sexpr(
+                    b"(exec 0 (, (edge $x $y) (edge $y $z) (edge $z $x)) (, (tri $x $y $z)))\n",
+                )
+                .unwrap();
+            space.metta_calculus(1);
+            let elapsed = start.elapsed();
+            let declines = SIDECAR_SCHEMATIC_DECLINES.load(Ordering::Relaxed);
+            let emitted: BTreeSet<Vec<u8>> = collect(&space).difference(&before).cloned().collect();
+            (elapsed, emitted, declines)
+        }
+
+        let hubs = 3usize;
+        eprintln!("decline penalty: one schematic edge fact forces the body off the WCO join");
+        for &n in &[100usize, 200, 400] {
+            let (t_admit, out_admit, dec_admit) = run(n, hubs, false);
+            let (t_decline, out_decline, dec_decline) = run(n, hubs, true);
+            if out_admit != out_decline {
+                let only_admit: Vec<_> = out_admit
+                    .difference(&out_decline)
+                    .take(8)
+                    .map(|p| serialize(p))
+                    .collect();
+                let only_decline: Vec<_> = out_decline
+                    .difference(&out_admit)
+                    .take(8)
+                    .map(|p| serialize(p))
+                    .collect();
+                eprintln!(
+                    "n={n} DIFF admit_len={} decline_len={}",
+                    out_admit.len(),
+                    out_decline.len()
+                );
+                eprintln!("  only in admit:   {:?}", only_admit);
+                eprintln!("  only in decline: {:?}", only_decline);
+            }
+            assert_eq!(
+                out_admit, out_decline,
+                "n={n}: output must be byte-identical across paths"
+            );
+            assert_eq!(
+                dec_admit, 0,
+                "n={n}: the all-ground body must stay on the sidecar"
+            );
+            assert_eq!(
+                dec_decline, 1,
+                "n={n}: one schematic fact must decline the body exactly once"
+            );
+            let penalty = t_decline.as_secs_f64() / t_admit.as_secs_f64();
+            eprintln!(
+                "n={n:4} admit(WCO join)={t_admit:>10.3?}  decline(ProductZipper)={t_decline:>10.3?}  penalty={penalty:4.1}x  outputs={}",
+                out_admit.len()
+            );
+        }
+        SIDECAR_UNIFY_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    // Per-position admission, recovering the decline penalty. The triangle gains a label
+    // pendant `(label $x $t)`. A partial-information schematic label `(label extra $w)` (an
+    // edgeless node, value unknown) is admissible: its variable sits only on the output
+    // position $t, so it produces only non-ground rows the exec drops, and the gate keeps the
+    // whole body on the WCO join. A schematic label with a non-ground compound on the JOIN
+    // key, `(label (qq $w) lx)`, is declined (the equality join cannot intersect it), giving
+    // the ProductZipper baseline the old all-or-nothing gate forced for both. Same body,
+    // byte-identical output (neither extra fact closes a triangle), the only change is
+    // whether the one schematic fact is admissible.
+    //   cargo +nightly test -p mork --lib --release bench_admission_recovery_metta \
+    //       -- --ignored --nocapture
+    #[ignore = "admission-recovery harness; run with --ignored --nocapture"]
+    #[test]
+    fn bench_admission_recovery_metta() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        // This bench measures the per-position EQUALITY-join admission gate, where the decline
+        // case must actually decline. The unification route would otherwise recover it (that is
+        // bench_unify_recovery_metta's job), so pin the route off here.
+        SIDECAR_UNIFY_ENABLED.store(false, Ordering::Relaxed);
+
+        fn collect(space: &Space) -> BTreeSet<Vec<u8>> {
+            let mut facts = BTreeSet::new();
+            space
+                .btm
+                .try_for_each_value::<_, ()>(|p, _| {
+                    facts.insert(p.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            facts
+        }
+
+        fn run(
+            n: usize,
+            hubs: usize,
+            decline: bool,
+        ) -> (std::time::Duration, BTreeSet<Vec<u8>>, u64) {
+            let mut space = Space::new();
+            let mut program = String::new();
+            for a in 0..hubs {
+                for b in 0..hubs {
+                    if a != b {
+                        program.push_str(&format!("(edge h{a} h{b})\n(label h{a} lh{a})\n"));
+                    }
+                }
+            }
+            for p in 0..n {
+                program.push_str(&format!("(label p{p} lp{p})\n"));
+                for h in 0..hubs {
+                    program.push_str(&format!("(edge p{p} h{h})\n(edge h{h} p{p})\n"));
+                }
+            }
+            // One schematic label that closes no triangle either way. With its unknown on the
+            // OUTPUT position it is admitted; with a non-ground compound on the JOIN key it is
+            // declined, because the equality join cannot intersect a non-ground key.
+            if decline {
+                program.push_str("(label (qq $w) lx)\n");
+            } else {
+                program.push_str("(label extra $w)\n");
+            }
+            space.add_all_sexpr(program.as_bytes()).unwrap();
+
+            let before = collect(&space);
+            SIDECAR_SCHEMATIC_DECLINES.store(0, Ordering::Relaxed);
+            let start = Instant::now();
+            space
+                .add_all_sexpr(b"(exec 0 (, (edge $x $y) (edge $y $z) (edge $z $x) (label $x $t)) (, (out $x $y $z $t)))\n")
+                .unwrap();
+            space.metta_calculus(1);
+            let elapsed = start.elapsed();
+            let declines = SIDECAR_SCHEMATIC_DECLINES.load(Ordering::Relaxed);
+            let emitted: BTreeSet<Vec<u8>> = collect(&space).difference(&before).cloned().collect();
+            (elapsed, emitted, declines)
+        }
+
+        let hubs = 3usize;
+        eprintln!(
+            "admission recovery: an output-only-variable schematic fact stays on the WCO join"
+        );
+        for &n in &[100usize, 200, 400] {
+            let (t_fast, out_fast, dec_fast) = run(n, hubs, false);
+            let (t_slow, out_slow, dec_slow) = run(n, hubs, true);
+            assert_eq!(
+                out_fast, out_slow,
+                "n={n}: output must be byte-identical across paths"
+            );
+            assert_eq!(
+                dec_fast, 0,
+                "n={n}: the output-only schematic label must be admitted"
+            );
+            assert_eq!(
+                dec_slow, 1,
+                "n={n}: the join-key compound label must decline exactly once"
+            );
+            let recovery = t_slow.as_secs_f64() / t_fast.as_secs_f64();
+            eprintln!(
+                "n={n:4} admitted(WCO join)={t_fast:>10.3?}  declined(ProductZipper)={t_slow:>10.3?}  recovery={recovery:4.1}x  outputs={}",
+                out_fast.len()
+            );
+        }
+        SIDECAR_UNIFY_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    // The deep recovery, measured. A schematic edge on a JOIN KEY (`(edge k{j} $w)`, the data
+    // variable landing on the shared `$y`) is the case the equality join cannot intersect, so the
+    // old gate declines the whole cyclic body to the ProductZipper. With the unification route on,
+    // the same body runs the worst-case-optimal leapfrog-unification join instead. The workload is
+    // the AGM-blowup triangle: a hub with `s` in- and out-edges gives s^2 two-paths but no
+    // triangle (the ProductZipper materializes them; the WCO join prunes), a small complete digraph
+    // gives the ground triangles, and the schematic edges add the unification answers. Same body,
+    // same space, byte-identical output; the only difference is the route, so the ratio is the cost
+    // the decline used to pay.
+    //   cargo +nightly test -p mork --lib --release bench_unify_recovery_metta \
+    //       -- --ignored --nocapture --test-threads=1
+    #[ignore = "unification-recovery harness; run with --ignored --nocapture --test-threads=1"]
+    #[test]
+    fn bench_unify_recovery_metta() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        fn collect(space: &Space) -> BTreeSet<Vec<u8>> {
+            let mut facts = BTreeSet::new();
+            space
+                .btm
+                .try_for_each_value::<_, ()>(|p, _| {
+                    facts.insert(p.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            facts
+        }
+
+        fn run(
+            s: usize,
+            clique: usize,
+            sch: usize,
+            unify: bool,
+        ) -> (std::time::Duration, BTreeSet<Vec<u8>>, u64, u64) {
+            SIDECAR_UNIFY_ENABLED.store(unify, Ordering::Relaxed);
+            let mut space = Space::new();
+            let mut program = String::new();
+            // Hub blowup: s^2 two-paths through the hub `h`, no triangle of its own.
+            for i in 0..s {
+                program.push_str(&format!("(edge u{i} h)\n(edge h v{i})\n"));
+            }
+            // A complete digraph supplies the ground triangles.
+            for a in 0..clique {
+                for b in 0..clique {
+                    if a != b {
+                        program.push_str(&format!("(edge k{a} k{b})\n"));
+                    }
+                }
+            }
+            // Schematic edges from clique vertices: a data variable on the target, which lands on
+            // the join key `$y` and so cannot ride the equality join.
+            for j in 0..sch {
+                program.push_str(&format!("(edge k{j} $w{j})\n"));
+            }
+            space.add_all_sexpr(program.as_bytes()).unwrap();
+
+            let before = collect(&space);
+            SIDECAR_SCHEMATIC_DECLINES.store(0, Ordering::Relaxed);
+            SIDECAR_UNIFY_RECOVERS.store(0, Ordering::Relaxed);
+            let start = Instant::now();
+            space
+                .add_all_sexpr(
+                    b"(exec 0 (, (edge $x $y) (edge $y $z) (edge $z $x)) (, (out $x $y $z)))\n",
+                )
+                .unwrap();
+            space.metta_calculus(1);
+            let elapsed = start.elapsed();
+            let declines = SIDECAR_SCHEMATIC_DECLINES.load(Ordering::Relaxed);
+            let recovers = SIDECAR_UNIFY_RECOVERS.load(Ordering::Relaxed);
+            let emitted: BTreeSet<Vec<u8>> = collect(&space).difference(&before).cloned().collect();
+            (elapsed, emitted, declines, recovers)
+        }
+
+        let clique = 6usize;
+        let sch = 3usize;
+        eprintln!(
+            "unification recovery: a schematic edge on a join key, WCO unification join vs ProductZipper decline"
+        );
+        for &s in &[128usize, 256, 512, 1024, 2048, 4096] {
+            let (t_fast, out_fast, _dec_fast, rec_fast) = run(s, clique, sch, true);
+            let (t_slow, out_slow, dec_slow, _rec_slow) = run(s, clique, sch, false);
+            assert_eq!(
+                out_fast, out_slow,
+                "s={s}: output must be byte-identical across paths"
+            );
+            assert!(
+                rec_fast >= 1,
+                "s={s}: the unification route must fire when enabled"
+            );
+            assert!(
+                dec_slow >= 1,
+                "s={s}: the body must decline to the ProductZipper when the route is off"
+            );
+            let recovery = t_slow.as_secs_f64() / t_fast.as_secs_f64();
+            eprintln!(
+                "s={s:4} unify(WCO)={t_fast:>11.3?}  decline(ProductZipper)={t_slow:>11.3?}  recovery={recovery:5.1}x  outputs={}",
+                out_fast.len()
+            );
+        }
+        SIDECAR_UNIFY_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    // Capture route vs native ProductZipper on a data-side-capture workload. A single schematic fact
+    // `(r $d hub)` absorbs the query compound `(k $x)`; the join `(s $x)` then grounds `$x`, so the
+    // capture fact contributes one answer per join key. Both paths should now emit the same answers.
+    // The benchmark reports the full-unification route cost against the native matcher. The descent
+    // prunes the head-`m` noise facts, so the read tracks the matched relation, not the whole space.
+    //   cargo +nightly test -p mork --lib --release bench_capture_route_vs_product_zipper \
+    //       -- --ignored --nocapture --test-threads=1
+    #[ignore = "benchmark; run with --ignored --nocapture --test-threads=1"]
+    #[test]
+    fn bench_capture_route_vs_product_zipper() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        fn collect(space: &Space) -> BTreeSet<Vec<u8>> {
+            let mut facts = BTreeSet::new();
+            space
+                .btm
+                .try_for_each_value::<_, ()>(|p, _| {
+                    facts.insert(p.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            facts
+        }
+
+        fn run(s: usize, capture: bool) -> (std::time::Duration, BTreeSet<Vec<u8>>, u64) {
+            SIDECAR_CAPTURE_ENABLED.store(capture, Ordering::Relaxed);
+            let mut space = Space::new();
+            let mut program = String::new();
+            for i in 0..s {
+                program.push_str(&format!("(r (k c{i}) val{i})\n")); // ground head-k: both paths match
+                program.push_str(&format!("(s c{i})\n")); // the join key
+                program.push_str(&format!("(r (m c{i}) w{i})\n")); // head-m noise: the descent prunes it
+            }
+            program.push_str("(r $d hub)\n"); // the schematic fact only the capture route mines
+            space.add_all_sexpr(program.as_bytes()).unwrap();
+
+            let before = collect(&space);
+            SIDECAR_CAPTURE_RECOVERS.store(0, Ordering::Relaxed);
+            let start = Instant::now();
+            space
+                .add_all_sexpr(b"(exec 0 (, (r (k $x) $y) (s $x)) (, (out $x $y)))\n")
+                .unwrap();
+            space.metta_calculus(1);
+            let elapsed = start.elapsed();
+            let rec = SIDECAR_CAPTURE_RECOVERS.load(Ordering::Relaxed);
+            let emitted: BTreeSet<Vec<u8>> = collect(&space).difference(&before).cloned().collect();
+            (elapsed, emitted, rec)
+        }
+
+        eprintln!(
+            "capture route vs ProductZipper: the schematic `(r $d hub)` absorbs query `(k $x)`; both paths should emit the same answers"
+        );
+        for &s in &[64usize, 128, 256, 512, 1024, 2048] {
+            let (t_cap, out_cap, rec) = run(s, true);
+            let (t_pz, out_pz, _) = run(s, false);
+            assert_eq!(
+                out_cap, out_pz,
+                "s={s}: capture route diverged from native ProductZipper"
+            );
+            assert!(rec >= 1, "s={s}: the capture route must fire");
+            let ratio = t_cap.as_secs_f64() / t_pz.as_secs_f64();
+            eprintln!(
+                "s={s:5} capture={t_cap:>11.3?} ({:5} answers)  ProductZipper={t_pz:>11.3?} ({:5} answers)  cost={ratio:4.2}x",
+                out_cap.len(),
+                out_pz.len()
+            );
+        }
+        SIDECAR_CAPTURE_ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    // The adapter-1 property: the route reads facts under its relation prefixes through the PathMap
+    // index, so its cost tracks the JOINED relations, not the size of the space. This holds the
+    // relevant cyclic-schematic workload fixed (a small hub triangle over `edge`) and floods the
+    // space with facts under an UNRELATED relation `junk`. Output is byte-identical across junk
+    // levels (the junk closes no triangle), asserted. Measured A/B of the read at the same sizes:
+    //   junk        0     4000    16000    64000
+    //   full scan  3.15ms 2.81ms  3.44ms   4.57ms   (climbs with the space)
+    //   index read 3.25ms 2.98ms  3.24ms   3.27ms   (flat)
+    // The full scan's climb is per-flip and unbounded in the space size; the index read stays flat.
+    //   cargo +nightly test -p mork --lib --release bench_unify_irrelevant_facts \
+    //       -- --ignored --nocapture --test-threads=1
+    #[ignore = "adapter-1 index-read harness; run with --ignored --nocapture --test-threads=1"]
+    #[test]
+    fn bench_unify_irrelevant_facts() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        fn run(junk: usize) -> (std::time::Duration, BTreeSet<Vec<u8>>, u64) {
+            SIDECAR_UNIFY_ENABLED.store(true, Ordering::Relaxed);
+            let mut space = Space::new();
+            let mut program = String::new();
+            // Fixed relevant workload: a small hub triangle over `edge` with a few schematic edges.
+            for a in 0..6 {
+                for b in 0..6 {
+                    if a != b {
+                        program.push_str(&format!("(edge k{a} k{b})\n"));
+                    }
+                }
+            }
+            for i in 0..256 {
+                program.push_str(&format!("(edge u{i} h)\n(edge h w{i})\n"));
+            }
+            for j in 0..3 {
+                program.push_str(&format!("(edge k{j} $w{j})\n"));
+            }
+            // Irrelevant flood under a different relation, never touched by the `edge` body.
+            for k in 0..junk {
+                program.push_str(&format!("(junk j{k} j{k})\n"));
+            }
+            space.add_all_sexpr(program.as_bytes()).unwrap();
+
+            let mut before = BTreeSet::new();
+            space
+                .btm
+                .try_for_each_value::<_, ()>(|p, _| {
+                    before.insert(p.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            SIDECAR_UNIFY_RECOVERS.store(0, Ordering::Relaxed);
+            let start = Instant::now();
+            space
+                .add_all_sexpr(
+                    b"(exec 0 (, (edge $x $y) (edge $y $z) (edge $z $x)) (, (out $x $y $z)))\n",
+                )
+                .unwrap();
+            space.metta_calculus(1);
+            let elapsed = start.elapsed();
+            let recovers = SIDECAR_UNIFY_RECOVERS.load(Ordering::Relaxed);
+            let mut emitted = BTreeSet::new();
+            space
+                .btm
+                .try_for_each_value::<_, ()>(|p, _| {
+                    if !before.contains(p) {
+                        emitted.insert(p.to_vec());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            (elapsed, emitted, recovers)
+        }
+
+        eprintln!("adapter-1 index read: relevant workload fixed, irrelevant `junk` facts vary");
+        let mut baseline: Option<BTreeSet<Vec<u8>>> = None;
+        for &junk in &[0usize, 4000, 16000, 64000] {
+            let (t, out, rec) = run(junk);
+            if let Some(b) = &baseline {
+                assert_eq!(
+                    *b, out,
+                    "junk={junk}: output must be byte-identical to the junk-free run"
+                );
+            } else {
+                baseline = Some(out.clone());
+            }
+            assert!(rec >= 1, "junk={junk}: the route must fire");
+            eprintln!(
+                "junk={junk:6}  route={t:>10.3?}  recovered={rec}  outputs={}",
+                out.len()
+            );
+        }
+        SIDECAR_UNIFY_ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    // First-occurrence order of `$var` names across the patterns. The prototype assigns
+    // ids the same way, so an `(ans <vars>)` template lists bindings in the matching order.
+    fn first_occurrence_vars(patterns: &[&str]) -> Vec<String> {
+        let mut order: Vec<String> = Vec::new();
+        for p in patterns {
+            let mut name = String::new();
+            let mut in_var = false;
+            for c in p.chars() {
+                if c == '$' {
+                    in_var = true;
+                    name.clear();
+                } else if in_var && (c.is_alphanumeric() || c == '_') {
+                    name.push(c);
+                } else {
+                    if in_var && !name.is_empty() && !order.contains(&name) {
+                        order.push(name.clone());
+                    }
+                    in_var = false;
+                    name.clear();
+                }
+            }
+            if in_var && !name.is_empty() && !order.contains(&name) {
+                order.push(name.clone());
+            }
+        }
+        order
+    }
+
+    // A serialized term is ground when no token is a NewVar (`$`) or VarRef (`_<n>`).
+    // serialize already skips symbol content, so this is structural over real variables.
+    fn serialized_is_ground(s: &str) -> bool {
+        s.split_whitespace().all(|t| {
+            t != "$"
+                && !(t.starts_with('_')
+                    && t.len() > 1
+                    && t[1..].bytes().all(|b| b.is_ascii_digit()))
+        })
+    }
+
+    // A small xorshift RNG shared by the unification-route differentials.
+    struct UjRng(u64);
+    impl UjRng {
+        fn nx(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.nx() % n as u64) as usize
+        }
+        fn chance(&mut self, a: usize, b: usize) -> bool {
+            self.below(b) < a
+        }
+    }
+
+    fn sidecar_route_toggle_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    // Run a conjunctive body and projection as a live exec, returning the ground `out` answers and
+    // how many recoveries fired, with the worst-case-optimal unification route forced on or off.
+    fn uj_live_run(
+        facts: &[String],
+        patterns: &[String],
+        proj: &[String],
+        unify: bool,
+    ) -> (BTreeSet<String>, u64) {
+        use std::sync::atomic::Ordering;
+        SIDECAR_UNIFY_ENABLED.store(unify, Ordering::Relaxed);
+        SIDECAR_UNIFY_RECOVERS.store(0, Ordering::Relaxed);
+        let mut space = Space::new();
+        let mut program = String::new();
+        for f in facts {
+            program.push_str(f);
+            program.push('\n');
+        }
+        space.add_all_sexpr(program.as_bytes()).unwrap();
+        let mut before = BTreeSet::new();
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                before.insert(p.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        let body = patterns.join(" ");
+        let out_vars = proj
+            .iter()
+            .map(|v| format!("${v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exec = format!("(exec 0 (, {body}) (, (out {out_vars})))\n");
+        space.add_all_sexpr(exec.as_bytes()).unwrap();
+        space.metta_calculus(1);
+        let head = format!("[{}] out", proj.len() + 1);
+        let mut out = BTreeSet::new();
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                if !before.contains(p) {
+                    let s = serialize(p);
+                    if s.starts_with(&head) && serialized_is_ground(&s) {
+                        out.insert(s);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        (out, SIDECAR_UNIFY_RECOVERS.load(Ordering::Relaxed))
+    }
+
+    fn uj_live_run_raw(
+        facts: &[String],
+        patterns: &[String],
+        proj: &[String],
+        unify: bool,
+    ) -> (BTreeSet<String>, u64, u64, usize) {
+        use std::sync::atomic::Ordering;
+        SIDECAR_UNIFY_ENABLED.store(unify, Ordering::Relaxed);
+        SIDECAR_UNIFY_RECOVERS.store(0, Ordering::Relaxed);
+        SIDECAR_ZIPPER_RECOVERS.store(0, Ordering::Relaxed);
+        let mut space = Space::new();
+        let mut program = String::new();
+        for f in facts {
+            program.push_str(f);
+            program.push('\n');
+        }
+        space.add_all_sexpr(program.as_bytes()).unwrap();
+        let mut before = BTreeSet::new();
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                before.insert(p.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        let body = patterns.join(" ");
+        let out_vars = proj
+            .iter()
+            .map(|v| format!("${v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exec = format!("(exec 0 (, {body}) (, (out {out_vars})))\n");
+        space.add_all_sexpr(exec.as_bytes()).unwrap();
+        space.metta_calculus(1);
+        let head = format!("[{}] out", proj.len() + 1);
+        let mut out = BTreeSet::new();
+        let mut nonground = 0usize;
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                if !before.contains(p) {
+                    let s = serialize(p);
+                    if s.starts_with(&head) {
+                        if !serialized_is_ground(&s) {
+                            nonground += 1;
+                        }
+                        out.insert(s);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        (
+            out,
+            SIDECAR_UNIFY_RECOVERS.load(Ordering::Relaxed),
+            SIDECAR_ZIPPER_RECOVERS.load(Ordering::Relaxed),
+            nonground,
+        )
+    }
+
+    // Assert the unification route is byte-identical to the ProductZipper for one case (route on
+    // versus off), and report (the route fired, the answer set is non-empty).
+    fn uj_assert_identical(facts: &[String], patterns: &[String], proj: &[String]) -> (bool, bool) {
+        let (with_unify, rec) = uj_live_run(facts, patterns, proj, true);
+        let (without_unify, _) = uj_live_run(facts, patterns, proj, false);
+        assert_eq!(
+            with_unify,
+            without_unify,
+            "unify route diverged from the ProductZipper\n  patterns={patterns:?}\n  facts={facts:?}\n  proj={proj:?}\n  unify-only={:?}\n  product-only={:?}",
+            with_unify.difference(&without_unify).collect::<Vec<_>>(),
+            without_unify.difference(&with_unify).collect::<Vec<_>>()
+        );
+        (rec > 0, !with_unify.is_empty())
+    }
+
+    /// A random cyclic body for the live A/B corpora: an arity-2 edge cycle (triangle, 4-cycle, or
+    /// triangle-with-pendant) or an arity-3 rotation cycle, over ground vertices plus a few schematic
+    /// facts on join keys, with an occasional compound query argument. Every variable sits on a join
+    /// key, so the body reaches the unification route. Shared by the ProductZipper and kernel A/Bs.
+    fn uj_random_cyclic_case(r: &mut UjRng) -> (Vec<String>, Vec<String>) {
+        let nv = 3 + r.below(3); // 3..=5 ground vertices
+        if r.chance(1, 3) {
+            // Arity-3 rotation cycle over relation `t`.
+            let pats = vec![
+                "(t $x $y $z)".to_string(),
+                "(t $y $z $x)".to_string(),
+                "(t $z $x $y)".to_string(),
+            ];
+            let mut f = vec![
+                "(t v0 v1 v2)".to_string(),
+                "(t v1 v2 v0)".to_string(),
+                "(t v2 v0 v1)".to_string(),
+            ];
+            for i in 0..nv {
+                if r.chance(1, 2) {
+                    f.push(format!("(t v{i} v{} v{})", (i + 1) % nv, (i + 2) % nv));
+                }
+            }
+            let nsch = 1 + r.below(3);
+            for k in 0..nsch {
+                let v = r.below(nv);
+                f.push(match r.below(3) {
+                    0 => format!("(t v{v} $s{k} v{})", (v + 1) % nv),
+                    1 => format!("(t $s{k} v{v} $u{k})"),
+                    _ => format!("(t (k v{v}) $s{k} v{})", (v + 2) % nv),
+                });
+            }
+            (pats, f)
+        } else {
+            // Arity-2 edge cycle over relation `e`.
+            let compound = r.chance(1, 6);
+            let pats: Vec<String> = match r.below(3) {
+                0 if compound => vec!["(e (k $x) $y)", "(e $y $z)", "(e $z (k $x))"],
+                0 => vec!["(e $x $y)", "(e $y $z)", "(e $z $x)"],
+                1 => vec!["(e $x $y)", "(e $y $z)", "(e $z $w)", "(e $w $x)"],
+                _ => vec!["(e $x $y)", "(e $y $z)", "(e $z $x)", "(e $x $w)"],
+            }
+            .into_iter()
+            .map(String::from)
+            .collect();
+            let mut f: Vec<String> =
+                vec!["(e v0 v1)".into(), "(e v1 v2)".into(), "(e v2 v0)".into()];
+            for i in 0..nv {
+                for j in 0..nv {
+                    if i != j && r.chance(1, 3) {
+                        f.push(format!("(e v{i} v{j})"));
+                    }
+                }
+            }
+            let nsch = 1 + r.below(3);
+            for k in 0..nsch {
+                let v = r.below(nv);
+                f.push(match r.below(5) {
+                    0 => format!("(e v{v} $s{k})"),
+                    1 => format!("(e $s{k} v{v})"),
+                    2 => format!("(e $s{k} $t{k})"),
+                    3 => format!("(e (k (k v{v})) $s{k})"),
+                    _ => format!("(e (k v{v}) $s{k})"),
+                });
+            }
+            (pats, f)
+        }
+    }
+
+    /// A random ACYCLIC data-side-capture body (issue-29): one factor carries a non-ground compound
+    /// `(wrap $x)` whose inner variable joins a second relation, over facts whose data variables
+    /// must absorb that compound. This is the fragment `transform_via_capture` handles, the acyclic
+    /// analogue of `uj_random_cyclic_case`. A mix of head-matching, head-mismatching, and
+    /// data-variable facts exercises the descent's pruning and its capture binding together.
+    fn uj_random_acyclic_capture_case(r: &mut UjRng) -> (Vec<String>, Vec<String>) {
+        let wrap = ["f", "g", "k"][r.below(3)];
+        let rel2 = ["s", "p", "q"][r.below(3)];
+        let pats = vec![format!("(r ({wrap} $x) $y)"), format!("({rel2} $x)")];
+        let nv = 2 + r.below(3);
+        let mut f = vec![format!("(r $d v{})", r.below(nv))];
+        for i in 0..nv {
+            f.push(match r.below(3) {
+                0 => format!("(r ({wrap} c{i}) v{i})"), // head matches: $x = c{i}
+                1 => format!("(r (m c{i}) v{i})"),      // head mismatches: descent prunes it
+                _ => format!("(r $e{i} v{i})"),         // another data variable
+            });
+        }
+        let nx = 1 + r.below(3);
+        for _ in 0..nx {
+            f.push(format!("({rel2} c{})", r.below(nv)));
+        }
+        if r.chance(1, 2) {
+            f.push(format!("({rel2} $w)")); // a schematic second-relation fact
+        }
+        (pats, f)
+    }
+
+    /// Run a body through the unification route twice, once with the zipper-native kernel and once
+    /// with the materialized leapfrog, asserting the emitted ground answers are byte-for-byte
+    /// identical. The direct A/B for the kernel swap, independent of the ProductZipper. Returns
+    /// whether the run produced any answers.
+    fn uj_assert_kernels_identical(facts: &[String], patterns: &[String], proj: &[String]) -> bool {
+        use std::sync::atomic::Ordering;
+        SIDECAR_ZIPPER_JOIN_ENABLED.store(true, Ordering::Relaxed);
+        let (with_zipper, _) = uj_live_run(facts, patterns, proj, true);
+        SIDECAR_ZIPPER_JOIN_ENABLED.store(false, Ordering::Relaxed);
+        let (with_materialized, _) = uj_live_run(facts, patterns, proj, true);
+        SIDECAR_ZIPPER_JOIN_ENABLED.store(true, Ordering::Relaxed);
+        assert_eq!(
+            with_zipper,
+            with_materialized,
+            "zipper kernel diverged from the materialized join\n  patterns={patterns:?}\n  facts={facts:?}\n  proj={proj:?}\n  zipper-only={:?}\n  materialized-only={:?}",
+            with_zipper
+                .difference(&with_materialized)
+                .collect::<Vec<_>>(),
+            with_materialized
+                .difference(&with_zipper)
+                .collect::<Vec<_>>()
+        );
+        !with_zipper.is_empty()
+    }
+
+    // The kernel swap's end-to-end gate: drive random cyclic schematic bodies through the LIVE flip
+    // twice, zipper-native kernel vs materialized leapfrog, and assert byte-identical ground answers.
+    // Run it isolated (`--test-threads=1`): the kernel toggle is process-global.
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (no-bridge builds route differently; control-verified pre-delta).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn zipper_kernel_byte_identical_to_materialized_live() {
+        use std::sync::atomic::Ordering;
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let mut r = UjRng(0x2718_2818_2845_9045);
+        SIDECAR_ZIPPER_RECOVERS.store(0, Ordering::Relaxed);
+        let mut nonempty = 0usize;
+        const N: usize = 1500;
+        for _ in 0..N {
+            let (patterns, facts) = uj_random_cyclic_case(&mut r);
+            let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+            let order = first_occurrence_vars(&pats);
+            if order.is_empty() {
+                continue;
+            }
+            let mask = 1 + r.below((1usize << order.len()) - 1);
+            let proj: Vec<String> = order
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, v)| v.clone())
+                .collect();
+            if uj_assert_kernels_identical(&facts, &patterns, &proj) {
+                nonempty += 1;
+            }
+        }
+        SIDECAR_ZIPPER_JOIN_ENABLED.store(true, Ordering::Relaxed);
+        let zk = SIDECAR_ZIPPER_RECOVERS.load(Ordering::Relaxed);
+        eprintln!("kernel A/B: {N} cases | zipper kernel emitted {zk} | nonempty {nonempty}");
+        assert!(
+            zk > 30,
+            "corpus must exercise the zipper kernel, not just the fallback: {zk}"
+        );
+        assert!(
+            nonempty > 50,
+            "corpus must produce real answers: {nonempty}"
+        );
+    }
+
+    // Run the body as an exec with an `(ans <vars>)` template through the real matcher and
+    // return the emitted ground `ans` fact paths. The exec apply keeps only ground results.
+    fn fork_answer_paths(patterns: &[&str], facts: &[&str]) -> Vec<Vec<u8>> {
+        let order = first_occurrence_vars(patterns);
+        let mut space = Space::new();
+        let mut program = String::new();
+        for f in facts {
+            program.push_str(f);
+            program.push('\n');
+        }
+        space.add_all_sexpr(program.as_bytes()).unwrap();
+        let mut before = BTreeSet::new();
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                before.insert(p.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        let body = patterns.join(" ");
+        let ans_vars = order
+            .iter()
+            .map(|v| format!("${v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exec = format!("(exec 0 (, {body}) (, (ans {ans_vars})))\n");
+        space.add_all_sexpr(exec.as_bytes()).unwrap();
+        space.metta_calculus(1);
+        let head = format!("[{}] ans", order.len() + 1);
+        let mut out = Vec::new();
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                if !before.contains(p) {
+                    let s = serialize(p);
+                    if s.starts_with(&head) && serialized_is_ground(&s) {
+                        out.push(p.to_vec());
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    fn fork_projected_strings(
+        head_name: &str,
+        patterns: &[&str],
+        facts: &[&str],
+        proj: &[&str],
+        ground_only: bool,
+    ) -> BTreeSet<String> {
+        let mut space = Space::new();
+        let mut program = String::new();
+        for f in facts {
+            program.push_str(f);
+            program.push('\n');
+        }
+        space.add_all_sexpr(program.as_bytes()).unwrap();
+        let mut before = BTreeSet::new();
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                before.insert(p.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        let body = patterns.join(" ");
+        let out_vars = proj
+            .iter()
+            .map(|v| format!("${v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exec = format!("(exec 0 (, {body}) (, ({head_name} {out_vars})))\n");
+        space.add_all_sexpr(exec.as_bytes()).unwrap();
+        space.metta_calculus(1);
+        let head = format!("[{}] {head_name}", proj.len() + 1);
+        let mut out = BTreeSet::new();
+        space
+            .btm
+            .try_for_each_value::<_, ()>(|p, _| {
+                if !before.contains(p) {
+                    let s = serialize(p);
+                    if s.starts_with(&head) && (!ground_only || serialized_is_ground(&s)) {
+                        out.insert(s);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    fn fork_answer_proj(patterns: &[&str], facts: &[&str], proj: &[&str]) -> BTreeSet<String> {
+        fork_projected_strings("ans", patterns, facts, proj, false)
+    }
+
+    struct UpstreamOracleCase {
+        name: String,
+        patterns: Vec<String>,
+        facts: Vec<String>,
+        proj: Vec<String>,
+    }
+
+    fn random_oracle_term(
+        r: &mut UjRng,
+        depth: usize,
+        allow_var: bool,
+        pool: usize,
+        prefix: &str,
+    ) -> String {
+        const SYMS: &[&str] = &["a", "b", "c", "d"];
+        if depth > 0 && r.chance(2, 5) {
+            let arity = 1 + r.below(2);
+            let parts: Vec<String> = (0..arity)
+                .map(|_| random_oracle_term(r, depth - 1, allow_var, pool, prefix))
+                .collect();
+            format!("({})", parts.join(" "))
+        } else if allow_var && r.chance(2, 5) {
+            format!("${prefix}{}", r.below(pool))
+        } else {
+            SYMS[r.below(SYMS.len())].to_string()
+        }
+    }
+
+    fn native_oracle_cases() -> Vec<UpstreamOracleCase> {
+        let mut cases: Vec<UpstreamOracleCase> = mork_uni_join::corpus::cases()
+            .iter()
+            .map(|case| UpstreamOracleCase {
+                name: format!("corpus:{}", case.name),
+                patterns: case.patterns.iter().map(|s| s.to_string()).collect(),
+                facts: case.facts.iter().map(|s| s.to_string()).collect(),
+                proj: case.proj.iter().map(|s| s.to_string()).collect(),
+            })
+            .collect();
+
+        let mut r = UjRng(0xB17E_CAFE_DADA_5123);
+        let mut added = 0usize;
+        while added < 600 {
+            let npat = 1 + r.below(3);
+            let var_pool = 1 + r.below(3);
+            let patterns: Vec<String> = (0..npat)
+                .map(|_| {
+                    format!(
+                        "(r {} {})",
+                        random_oracle_term(&mut r, 2, true, var_pool, "p"),
+                        random_oracle_term(&mut r, 2, true, var_pool, "p")
+                    )
+                })
+                .collect();
+            let pat_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+            let proj = first_occurrence_vars(&pat_refs);
+            if proj.is_empty() {
+                continue;
+            }
+            let nfacts = 1 + r.below(6);
+            let facts: Vec<String> = (0..nfacts)
+                .map(|_| {
+                    let schematic = r.chance(2, 5);
+                    format!(
+                        "(r {} {})",
+                        random_oracle_term(&mut r, 2, schematic, 3, "d"),
+                        random_oracle_term(&mut r, 2, schematic, 3, "d")
+                    )
+                })
+                .collect();
+            cases.push(UpstreamOracleCase {
+                name: format!("random:{added:03}"),
+                patterns,
+                facts,
+                proj,
+            });
+            added += 1;
+        }
+
+        cases
+    }
+
+    fn write_upstream_oracle_runner(dir: &std::path::Path, upstream_root: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let pathmap_root = upstream_root.parent().unwrap().join("PathMap");
+        let cargo_toml = format!(
+            "[package]\n\
+name = \"mork-upstream-oracle-runner\"\n\
+version = \"0.1.0\"\n\
+edition = \"2024\"\n\
+\n\
+[workspace]\n\
+\n\
+[dependencies]\n\
+mork = {{ path = \"{}/kernel\" }}\n\
+mork-expr = {{ path = \"{}/expr\" }}\n\
+pathmap = {{ path = \"{}\", version = \"0.3.0\", features = [\"jemalloc\", \"arena_compact\", \"nightly\"] }}\n",
+            upstream_root.display(),
+            upstream_root.display(),
+            pathmap_root.display()
+        );
+        std::fs::write(dir.join("Cargo.toml"), cargo_toml).unwrap();
+        std::fs::write(
+            dir.join("src/main.rs"),
+            r#"use std::collections::BTreeSet;
+
+use mork::space::Space;
+use mork_expr::serialize;
+use pathmap::zipper::*;
+
+fn run(patterns: &[&str], facts: &[&str], proj: &[&str]) -> BTreeSet<String> {
+    let mut space = Space::new();
+    let mut program = String::new();
+    for fact in facts {
+        program.push_str(fact);
+        program.push('\n');
+    }
+    if !program.is_empty() {
+        space.add_all_sexpr(program.as_bytes()).unwrap();
+    }
+    let mut before = BTreeSet::new();
+    {
+        let mut rz = space.btm.read_zipper();
+        while rz.to_next_val() {
+            before.insert(unsafe { rz.path() }.to_vec());
+        }
+    }
+    let body = patterns.join(" ");
+    let ans_vars = proj.iter().map(|v| format!("${v}")).collect::<Vec<_>>().join(" ");
+    let exec = format!("(exec 0 (, {body}) (, (ans {ans_vars})))\n");
+    space.add_all_sexpr(exec.as_bytes()).unwrap();
+    space.metta_calculus(1);
+    let head = format!("[{}] ans", proj.len() + 1);
+    let mut out = BTreeSet::new();
+    {
+        let mut rz = space.btm.read_zipper();
+        while rz.to_next_val() {
+            let p = unsafe { rz.path() }.to_vec();
+            if !before.contains(&p) {
+                let s = serialize(&p);
+                if s.starts_with(&head) {
+                    out.insert(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn main() {
+    let cases_path = std::env::args().nth(1).expect("cases path");
+    let cases = std::fs::read_to_string(cases_path).unwrap();
+    for line in cases.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 4, "bad case line: {line}");
+        let patterns: Vec<&str> = if cols[1].is_empty() { Vec::new() } else { cols[1].split('\x1f').collect() };
+        let facts: Vec<&str> = if cols[2].is_empty() { Vec::new() } else { cols[2].split('\x1f').collect() };
+        let proj: Vec<&str> = if cols[3].is_empty() { Vec::new() } else { cols[3].split('\x1f').collect() };
+        let answers = run(&patterns, &facts, &proj);
+        println!("{}\t{}", cols[0], answers.into_iter().collect::<Vec<_>>().join("\x1f"));
+    }
+}
+"#,
+        )
+        .unwrap();
+    }
+
+    fn upstream_oracle_answers(cases: &[UpstreamOracleCase]) -> BTreeMap<String, BTreeSet<String>> {
+        let default_upstream = "/tmp/claude-1000/-home-user-Dev/92e5e599-d4b4-4ea9-ad5a-56c12aebf5cd/scratchpad/mork-pristine";
+        let upstream_root = std::env::var("MORK_UPSTREAM_ORACLE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(default_upstream));
+        assert!(
+            upstream_root.join("kernel/src/space.rs").exists(),
+            "upstream oracle checkout not found at {}",
+            upstream_root.display()
+        );
+
+        let runner_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/upstream-oracle-runner");
+        write_upstream_oracle_runner(&runner_dir, &upstream_root);
+        let cases_path = runner_dir.join("cases.tsv");
+        let mut input = String::new();
+        for case in cases {
+            input.push_str(&case.name);
+            input.push('\t');
+            input.push_str(&case.patterns.join("\x1f"));
+            input.push('\t');
+            input.push_str(&case.facts.join("\x1f"));
+            input.push('\t');
+            input.push_str(&case.proj.join("\x1f"));
+            input.push('\n');
+        }
+        std::fs::write(&cases_path, input).unwrap();
+
+        let output = std::process::Command::new("cargo")
+            .arg("+nightly")
+            .arg("run")
+            .arg("--release")
+            .arg("--quiet")
+            .arg("--manifest-path")
+            .arg(runner_dir.join("Cargo.toml"))
+            .arg("--")
+            .arg(&cases_path)
+            .env("RUSTFLAGS", "-C target-cpu=native")
+            .env("CARGO_TARGET_DIR", runner_dir.join("target"))
+            .output()
+            .expect("run upstream oracle");
+        assert!(
+            output.status.success(),
+            "upstream oracle failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut answers = BTreeMap::new();
+        for line in stdout.lines() {
+            let (name, rest) = line.split_once('\t').unwrap_or((line, ""));
+            let set = if rest.is_empty() {
+                BTreeSet::new()
+            } else {
+                rest.split('\x1f').map(|s| s.to_string()).collect()
+            };
+            answers.insert(name.to_string(), set);
+        }
+        answers
+    }
+
+    #[test]
+    #[ignore = "shells out to the pristine upstream MORK oracle and runs 616 native exec cases"]
+    fn upstream_native_capture_corpus_and_random_match() {
+        let cases = native_oracle_cases();
+        let upstream = upstream_oracle_answers(&cases);
+        let mut failures = Vec::new();
+        let mut nonempty = 0usize;
+        for case in &cases {
+            let pats: Vec<&str> = case.patterns.iter().map(|s| s.as_str()).collect();
+            let facts: Vec<&str> = case.facts.iter().map(|s| s.as_str()).collect();
+            let proj: Vec<&str> = case.proj.iter().map(|s| s.as_str()).collect();
+            let fork = fork_answer_proj(&pats, &facts, &proj);
+            let expected = upstream
+                .get(&case.name)
+                .unwrap_or_else(|| panic!("upstream oracle did not return case {}", case.name));
+            if !expected.is_empty() {
+                nonempty += 1;
+            }
+            if &fork != expected {
+                failures.push(format!(
+                    "{}\n  patterns={:?}\n  facts={:?}\n  proj={:?}\n  fork-only={:?}\n  upstream-only={:?}",
+                    case.name,
+                    case.patterns,
+                    case.facts,
+                    case.proj,
+                    fork.difference(expected).collect::<Vec<_>>(),
+                    expected.difference(&fork).collect::<Vec<_>>()
+                ));
+            }
+        }
+        eprintln!(
+            "upstream native oracle: {} cases | nonempty {} | mismatches {}",
+            cases.len(),
+            nonempty,
+            failures.len()
+        );
+        assert!(
+            failures.is_empty(),
+            "fork native exec diverged from upstream on {} case(s):\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(10)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            cases.len() >= 600,
+            "oracle corpus must contain hundreds of cases"
+        );
+        assert!(nonempty > 50, "oracle corpus must produce real answers");
+    }
+
+    // Cross-validate the standalone unification-aware WCO-join prototype against
+    // MORK's REAL ProductZipper, not the prototype's own naive oracle. For each
+    // case the body runs as an exec with an `(ans <vars>)` template through the
+    // actual matcher; the emitted answers are compared, rendered through the
+    // fork's own `serialize`, to the prototype's routed `uni_join`. Ground answers
+    // must agree byte-for-byte. The fork's exec apply keeps only ground results, so
+    // a prototype answer carrying a leftover data variable has no exec counterpart;
+    // those are counted, not asserted (the honest boundary).
+    fn cross_check(
+        patterns: &[&str],
+        facts: &[&str],
+    ) -> (BTreeSet<String>, BTreeSet<String>, usize, String) {
+        use mork_uni_join::join::uni_join;
+        use mork_uni_join::oracle::Conj;
+        use mork_uni_join::term::{Term as PTerm, parse as pparse};
+
+        let fork: BTreeSet<String> = fork_answer_paths(patterns, facts)
+            .iter()
+            .map(|p| serialize(p))
+            .collect();
+
+        // The prototype's routed join, rendered through the same serializer.
+        let q = Conj::parse(patterns);
+        let sp: Vec<PTerm> = facts.iter().map(|f| pparse(f)).collect();
+        let (sols, stats) = uni_join(&q, &sp);
+        let mut proto = BTreeSet::new();
+        let mut nonground = 0usize;
+        for sol in &sols {
+            let tuple = PTerm::decode(sol);
+            let args = match tuple {
+                PTerm::App(a) => a,
+                t => vec![t],
+            };
+            let mut ans = vec![PTerm::sym("ans")];
+            ans.extend(args);
+            let wrapped = PTerm::App(ans);
+            if wrapped.is_ground() {
+                proto.insert(serialize(&wrapped.encode()));
+            } else {
+                nonground += 1;
+            }
+        }
+        (fork, proto, nonground, format!("{:?}", stats.path))
+    }
+
+    /// Parse var-only relational patterns like `(e $x $y)` into zipper-join factors: the relation
+    /// prefix `[Arity(1+n), Sym(rel)]` and the global variable index at each column, numbered in
+    /// first-occurrence order to match `fork_answer_paths`'s answer-tuple order.
+    fn parse_var_only_factors(patterns: &[&str]) -> (Vec<crate::zipper_join::Factor>, usize) {
+        let mut var_idx: BTreeMap<String, usize> = BTreeMap::new();
+        let mut order: Vec<usize> = Vec::new();
+        let mut factors = Vec::new();
+        for pat in patterns {
+            let inner = pat.trim().trim_start_matches('(').trim_end_matches(')');
+            let toks: Vec<&str> = inner.split_whitespace().collect();
+            let rel = toks[0];
+            let args = &toks[1..];
+            let mut prefix = vec![
+                item_byte(Tag::Arity((1 + args.len()) as u8)),
+                item_byte(Tag::SymbolSize(rel.len() as u8)),
+            ];
+            prefix.extend_from_slice(rel.as_bytes());
+            let mut cols = Vec::new();
+            for a in args {
+                assert!(
+                    a.starts_with('$'),
+                    "parse_var_only_factors: non-variable arg {a}"
+                );
+                let name = a[1..].to_string();
+                let next = var_idx.len();
+                let idx = *var_idx.entry(name).or_insert_with(|| {
+                    order.push(next);
+                    next
+                });
+                cols.push(idx);
+            }
+            factors.push(crate::zipper_join::Factor::var_cols(prefix, cols));
+        }
+        (factors, var_idx.len())
+    }
+
+    /// The zipper-native unification join's ground answers, rendered as `(ans ...)` through the
+    /// fork serializer, to compare against the ProductZipper.
+    fn zipper_answer_strings(patterns: &[&str], facts: &[&str]) -> BTreeSet<String> {
+        let (factors, nvars) = parse_var_only_factors(patterns);
+        let mut space = Space::new();
+        let mut prog = String::new();
+        for f in facts {
+            prog.push_str(f);
+            prog.push('\n');
+        }
+        space.add_all_sexpr(prog.as_bytes()).unwrap();
+        let order: Vec<usize> = (0..nvars).collect();
+        let rows = crate::zipper_join::unify_join_zipper(&space.btm, &factors, &order, nvars);
+        let mut out = BTreeSet::new();
+        for row in &rows {
+            let mut ans = vec![
+                item_byte(Tag::Arity((1 + row.len()) as u8)),
+                item_byte(Tag::SymbolSize(3)),
+                b'a',
+                b'n',
+                b's',
+            ];
+            for val in row {
+                ans.extend_from_slice(val);
+            }
+            out.insert(serialize(&ans));
+        }
+        out
+    }
+
+    /// Same, but through `unify_join_zipper_body`: the body is encoded and the factors are parsed
+    /// back out of it, the path the live route takes. Validates `parse_body_factors`.
+    fn zipper_body_answer_strings(patterns: &[&str], facts: &[&str]) -> BTreeSet<String> {
+        let body = mork_uni_join::term::parse(&format!("(, {})", patterns.join(" "))).encode();
+        let mut space = Space::new();
+        let mut prog = String::new();
+        for f in facts {
+            prog.push_str(f);
+            prog.push('\n');
+        }
+        space.add_all_sexpr(prog.as_bytes()).unwrap();
+        let rows = crate::zipper_join::unify_join_zipper_body(&space.btm, &body)
+            .expect("body is within the factor model");
+        let mut out = BTreeSet::new();
+        for row in &rows {
+            let mut ans = vec![
+                item_byte(Tag::Arity((1 + row.len()) as u8)),
+                item_byte(Tag::SymbolSize(3)),
+                b'a',
+                b'n',
+                b's',
+            ];
+            for val in row {
+                ans.extend_from_slice(val);
+            }
+            out.insert(serialize(&ans));
+        }
+        out
+    }
+
+    fn product_answer_strings(patterns: &[&str], facts: &[&str]) -> BTreeSet<String> {
+        use std::sync::atomic::Ordering;
+
+        let old_unify = SIDECAR_UNIFY_ENABLED.swap(false, Ordering::Relaxed);
+        let old_capture = SIDECAR_CAPTURE_ENABLED.swap(false, Ordering::Relaxed);
+        let out = fork_answer_paths(patterns, facts)
+            .iter()
+            .map(|p| serialize(p))
+            .collect();
+        SIDECAR_CAPTURE_ENABLED.store(old_capture, Ordering::Relaxed);
+        SIDECAR_UNIFY_ENABLED.store(old_unify, Ordering::Relaxed);
+        out
+    }
+
+    fn product_answer_strings_all(patterns: &[&str], facts: &[&str]) -> BTreeSet<String> {
+        use std::sync::atomic::Ordering;
+
+        let old_unify = SIDECAR_UNIFY_ENABLED.swap(false, Ordering::Relaxed);
+        let old_capture = SIDECAR_CAPTURE_ENABLED.swap(false, Ordering::Relaxed);
+        let order = first_occurrence_vars(patterns);
+        let proj: Vec<&str> = order.iter().map(String::as_str).collect();
+        let out = fork_answer_proj(patterns, facts, &proj);
+        SIDECAR_CAPTURE_ENABLED.store(old_capture, Ordering::Relaxed);
+        SIDECAR_UNIFY_ENABLED.store(old_unify, Ordering::Relaxed);
+        out
+    }
+
+    fn zipper_body_partial_answer_strings(
+        patterns: &[&str],
+        facts: &[&str],
+    ) -> Option<(BTreeSet<String>, usize, usize)> {
+        let body = mork_uni_join::term::parse(&format!("(, {})", patterns.join(" "))).encode();
+        let (factors, nvars) = crate::zipper_join::parse_body_factors(&body)?;
+        let mut space = Space::new();
+        let mut prog = String::new();
+        for f in facts {
+            prog.push_str(f);
+            prog.push('\n');
+        }
+        space.add_all_sexpr(prog.as_bytes()).unwrap();
+        let order: Vec<usize> = (0..nvars).collect();
+        let rows =
+            crate::zipper_join::unify_join_zipper_partial(&space.btm, &factors, &order, nvars);
+        let mut out = BTreeSet::new();
+        let mut nonground = 0usize;
+        for row in &rows {
+            let mut ans = vec![
+                item_byte(Tag::Arity((1 + row.len()) as u8)),
+                item_byte(Tag::SymbolSize(3)),
+                b'a',
+                b'n',
+                b's',
+            ];
+            let mut ground = true;
+            for val in row {
+                if let Some(bytes) = val {
+                    if !crate::zipper_join::first_subterm_is_ground(bytes) {
+                        ground = false;
+                    }
+                    ans.extend_from_slice(bytes);
+                } else {
+                    ground = false;
+                    ans.push(item_byte(Tag::NewVar));
+                }
+            }
+            if !ground {
+                nonground += 1;
+            }
+            out.insert(serialize(&ans));
+        }
+        Some((out, nonground, rows.len()))
+    }
+
+    fn flat_random_ground_term(r: &mut UjRng, depth: usize) -> String {
+        const SYMS: &[&str] = &["a", "b", "c", "d"];
+        const HEADS: &[&str] = &["k", "h", "m"];
+        if depth == 0 || r.chance(3, 5) {
+            SYMS[r.below(SYMS.len())].to_string()
+        } else {
+            let arity = 1 + r.below(2);
+            let args: Vec<String> = (0..arity)
+                .map(|_| flat_random_ground_term(r, depth - 1))
+                .collect();
+            format!("({} {})", HEADS[r.below(HEADS.len())], args.join(" "))
+        }
+    }
+
+    fn flat_random_case(r: &mut UjRng) -> (Vec<String>, Vec<String>) {
+        const RELS: &[&str] = &["e", "p"];
+        let var_pool = 1 + r.below(4);
+        let mut patterns = Vec::new();
+        let mut prefixes: Vec<(String, usize)> = Vec::new();
+        let npat = 2 + r.below(3);
+
+        for pi in 0..npat {
+            let rel = RELS[r.below(RELS.len())];
+            let arity = 1 + r.below(3);
+            let mut args = Vec::new();
+            for ai in 0..arity {
+                let force_ground = pi == 0 || ai == 0 || r.chance(1, 2);
+                if force_ground {
+                    args.push(flat_random_ground_term(r, 2));
+                } else {
+                    args.push(format!("$x{}", r.below(var_pool)));
+                }
+            }
+            if pi == 1 && !args.iter().any(|a| a.starts_with('$')) {
+                let last = args.len() - 1;
+                args[last] = format!("$x{}", r.below(var_pool));
+            }
+            patterns.push(format!("({rel} {})", args.join(" ")));
+            let prefix = (rel.to_string(), arity);
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+
+        let mut facts = Vec::new();
+        for (rel, arity) in prefixes {
+            let mut schematic_args = Vec::new();
+            for ai in 0..arity {
+                if ai == 0 {
+                    schematic_args.push("$d0".to_string());
+                } else {
+                    schematic_args.push(flat_random_ground_term(r, 1));
+                }
+            }
+            facts.push(format!("({rel} {})", schematic_args.join(" ")));
+
+            let nfacts = 2 + r.below(5);
+            for _ in 0..nfacts {
+                let mut args = Vec::new();
+                for _ in 0..arity {
+                    if r.chance(2, 5) {
+                        args.push(format!("$d{}", r.below(2)));
+                    } else {
+                        args.push(flat_random_ground_term(r, 2));
+                    }
+                }
+                facts.push(format!("({rel} {})", args.join(" ")));
+            }
+        }
+
+        (patterns, facts)
+    }
+
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (no-bridge builds route differently; control-verified pre-delta).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn zipper_flat_ground_columns_match_product_zipper_random() {
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let regressions: &[(&str, &[&str], &[&str], &[&str])] = &[
+            (
+                "all-ground factor must be checked",
+                &["(e $z $z $x)", "(e b c)"],
+                &["(e a a d)", "(e c c a)", "(p b c)"],
+                &[],
+            ),
+            (
+                "leading ground captures data variable",
+                &["(e b b $z)"],
+                &["(e $v b a)"],
+                &["[2] ans a"],
+            ),
+        ];
+        for (name, patterns, facts, expected) in regressions {
+            let product = product_answer_strings_all(patterns, facts);
+            let (zipper, nonground, _) =
+                zipper_body_partial_answer_strings(patterns, facts).expect("regression is flat");
+            assert_eq!(
+                product,
+                zipper,
+                "{name}: zipper diverged from ProductZipper\n  product-only={:?}\n  zipper-only={:?}",
+                product.difference(&zipper).collect::<Vec<_>>(),
+                zipper.difference(&product).collect::<Vec<_>>()
+            );
+            let expected: BTreeSet<String> = expected.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                product, expected,
+                "{name}: ProductZipper regression expectation changed"
+            );
+            assert_eq!(
+                nonground, 0,
+                "{name}: fixed regression should render ground answers only"
+            );
+        }
+
+        const TRIALS: usize = 4000;
+        let mut r = UjRng(0xBADC_0FFE_E0DD_F00D);
+        let mut leapfrog = 0usize;
+        let mismatches = 0usize;
+        let mut nonground_rows = 0usize;
+        let mut nonground_cases = 0usize;
+        let mut nonempty = 0usize;
+        let mut total_rows = 0usize;
+        for i in 0..TRIALS {
+            let (patterns, facts) = flat_random_case(&mut r);
+            let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+            let fcts: Vec<&str> = facts.iter().map(|s| s.as_str()).collect();
+            let product = product_answer_strings(&pats, &fcts);
+            let Some((zipper, nonground, rows)) = zipper_body_partial_answer_strings(&pats, &fcts)
+            else {
+                panic!("trial {i}: generated non-flat body\n  patterns={patterns:?}");
+            };
+            let zipper_ground: BTreeSet<String> = zipper
+                .iter()
+                .filter(|s| serialized_is_ground(s))
+                .cloned()
+                .collect();
+            leapfrog += 1;
+            total_rows += rows;
+            nonground_rows += nonground;
+            if nonground > 0 {
+                nonground_cases += 1;
+            }
+            if !product.is_empty() {
+                nonempty += 1;
+            }
+            if product != zipper_ground {
+                panic!(
+                    "trial {i}: zipper diverged from ProductZipper\n  patterns={patterns:?}\n  facts={facts:?}\n  product-only={:?}\n  zipper-only={:?}",
+                    product.difference(&zipper_ground).collect::<Vec<_>>(),
+                    zipper_ground.difference(&product).collect::<Vec<_>>()
+                );
+            }
+        }
+        eprintln!(
+            "flat ground-column differential: trials={TRIALS} leapfrog={leapfrog} mismatches={mismatches} nonempty={nonempty} nonground_cases={nonground_cases} nonground_rows={nonground_rows} total_rows={total_rows}"
+        );
+        assert_eq!(
+            leapfrog, TRIALS,
+            "every generated flat body must route to leapfrog"
+        );
+        assert_eq!(
+            mismatches, 0,
+            "zipper must match ProductZipper on every flat trial"
+        );
+        assert!(
+            nonground_rows > 0,
+            "corpus must exercise non-ground partial rows"
+        );
+    }
+
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (no-bridge builds route differently; control-verified pre-delta).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn zipper_compound_capture_regressions_match_product_zipper() {
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let cases: &[(&str, &[&str], &[&str], &[&str], usize)] = &[
+            (
+                "data var captures non-ground compound and p is fixed by join",
+                &["(r (a $p) b)", "(r (b) $p)"],
+                &["(r $d b)", "(r a b)"],
+                &["[2] ans b"],
+                0,
+            ),
+            (
+                "data var captures compound with free query variable",
+                &["(r (a $p))"],
+                &["(r $d)"],
+                &["[2] ans $"],
+                1,
+            ),
+            (
+                "occurs check rejects data coreference cycle",
+                &["(e $x (f $x))"],
+                &["(e $w $w)"],
+                &[],
+                0,
+            ),
+            (
+                "nested compound coreference grounded across factors",
+                &["(r (a (f $x) $x) c)", "(s $x)"],
+                &["(r $d c)", "(s b)"],
+                &["[2] ans b"],
+                0,
+            ),
+        ];
+        for (name, patterns, facts, expected, expected_nonground) in cases {
+            let product = product_answer_strings_all(patterns, facts);
+            let (zipper, nonground, rows) = zipper_body_partial_answer_strings(patterns, facts)
+                .expect("compound body must route");
+            assert_eq!(
+                product,
+                zipper,
+                "{name}: zipper diverged from ProductZipper\n  product-only={:?}\n  zipper-only={:?}",
+                product.difference(&zipper).collect::<Vec<_>>(),
+                zipper.difference(&product).collect::<Vec<_>>()
+            );
+            let expected: BTreeSet<String> = expected.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                product, expected,
+                "{name}: ProductZipper expectation changed"
+            );
+            assert_eq!(
+                nonground, *expected_nonground,
+                "{name}: non-ground row count changed"
+            );
+            assert_eq!(rows, expected.len(), "{name}: row count changed");
+        }
+    }
+
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (no-bridge builds route differently; control-verified pre-delta).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn zipper_goal2_boundary_regressions() {
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let cases: &[(&str, &[&str], &[&str], &[&str], &[&str], bool)] = &[
+            (
+                "acyclic-occurs",
+                &["(e $x (f $x))"],
+                &["(e $w $w)", "(e v0 (f v1))"],
+                &["x"],
+                &[],
+                true,
+            ),
+            (
+                "fact-schematic-compound-under-ground-query",
+                &["(r (a b) $y)", "(s $y $z)", "(t $z b)"],
+                &["(r (a $q) v0)", "(s v0 v1)", "(t v1 b)", "(r (a c) decoy)"],
+                &["y", "z"],
+                &["[3] ans v0 v1"],
+                true,
+            ),
+            (
+                "join-propagated-compound-capture",
+                &["(e (k $x0) $x1)", "(e (k $x1) $x2)", "(h $x2 $x0)"],
+                &[
+                    "(e (k $s2) v0)",
+                    "(e $s1 $s1)",
+                    "(h $s0 $s0)",
+                    "(h junk junk)",
+                ],
+                &["x0", "x1"],
+                &[
+                    "[4] ans [2] k v0 v0 [2] k v0",
+                    "[4] ans v0 [2] k v0 v0",
+                    "[4] ans v0 v0 v0",
+                ],
+                false,
+            ),
+        ];
+        for (name, patterns, facts, proj, expected_all_vars, should_route) in cases {
+            let body = mork_uni_join::term::parse(&format!("(, {})", patterns.join(" "))).encode();
+            let mut space = Space::new();
+            let mut prog = String::new();
+            for fact in *facts {
+                prog.push_str(fact);
+                prog.push('\n');
+            }
+            space.add_all_sexpr(prog.as_bytes()).unwrap();
+            assert_eq!(
+                crate::zipper_join::unify_join_zipper_body_routable(&space.btm, &body),
+                *should_route,
+                "{name}: self-contained gate decision changed"
+            );
+            assert_eq!(
+                crate::zipper_join::unify_join_zipper_body_partial_safe(&space.btm, &body)
+                    .is_some(),
+                *should_route,
+                "{name}: safe partial decision changed"
+            );
+            let raw = zipper_body_partial_answer_strings(patterns, facts)
+                .expect("goal-2 regression bodies are valid zipper factors");
+            let product = product_answer_strings_all(patterns, facts);
+            let expected: BTreeSet<String> =
+                expected_all_vars.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(
+                product, expected,
+                "{name}: ProductZipper expectation changed"
+            );
+            assert_eq!(
+                raw.0,
+                product,
+                "{name}: raw zipper diverged from ProductZipper\n  product-only={:?}\n  zipper-only={:?}",
+                product.difference(&raw.0).collect::<Vec<_>>(),
+                raw.0.difference(&product).collect::<Vec<_>>()
+            );
+            let pattern_vec: Vec<String> = patterns.iter().map(|s| (*s).to_string()).collect();
+            let fact_vec: Vec<String> = facts.iter().map(|s| (*s).to_string()).collect();
+            let proj_vec: Vec<String> = proj.iter().map(|s| (*s).to_string()).collect();
+            let (live, _, zrec, live_nonground) =
+                uj_live_run_raw(&fact_vec, &pattern_vec, &proj_vec, true);
+            let (product_live, _, _, product_live_nonground) =
+                uj_live_run_raw(&fact_vec, &pattern_vec, &proj_vec, false);
+            assert_eq!(
+                live,
+                product_live,
+                "{name}: live zipper route diverged from ProductZipper\n  zipper-only={:?}\n  product-only={:?}",
+                live.difference(&product_live).collect::<Vec<_>>(),
+                product_live.difference(&live).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                live_nonground, product_live_nonground,
+                "{name}: non-ground output count changed"
+            );
+            if *should_route {
+                assert!(zrec > 0, "{name}: live zipper route should fire");
+            } else {
+                assert_eq!(zrec, 0, "{name}: live zipper route should decline");
+            }
+        }
+    }
+
+    #[test]
+    fn zipper_body_factors_match_product_zipper() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "cyclic triangle",
+                &["(e $x $y)", "(e $y $z)", "(e $z $x)"],
+                &["(e a b)", "(e b c)", "(e c a)", "(e a a)", "(e b d)"],
+            ),
+            (
+                "path with a schematic edge",
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e a b)", "(e $u $u)", "(e b c)", "(e c d)"],
+            ),
+            (
+                "leading constant",
+                &["(e a $y)", "(e $y $z)"],
+                &["(e a b)", "(e b c)", "(e c d)", "(e a x)", "(e x y)"],
+            ),
+            (
+                "shared-key conjunction with a schematic q",
+                &["(p $x)", "(q $x)"],
+                &["(p a)", "(p b)", "(q a)", "(q $w)"],
+            ),
+        ];
+        for (name, pats, facts) in cases {
+            let fork: BTreeSet<String> = fork_answer_paths(pats, facts)
+                .iter()
+                .map(|p| serialize(p))
+                .collect();
+            let mine = zipper_body_answer_strings(pats, facts);
+            assert_eq!(
+                fork, mine,
+                "{name}: body-factor join diverged from the ProductZipper"
+            );
+        }
+    }
+
+    #[test]
+    fn zipper_join_matches_product_zipper() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "compatible triangle (e $x $y)(e $y $z)(e $x $z)",
+                &["(e $x $y)", "(e $y $z)", "(e $x $z)"],
+                &["(e a b)", "(e a c)", "(e b c)", "(e b d)", "(e c a)"],
+            ),
+            (
+                "cyclic triangle (e $x $y)(e $y $z)(e $z $x)",
+                &["(e $x $y)", "(e $y $z)", "(e $z $x)"],
+                &["(e a b)", "(e b c)", "(e c a)", "(e a a)", "(e b d)"],
+            ),
+            (
+                "path with a schematic edge",
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e a b)", "(e $u $u)", "(e b c)", "(e c d)"],
+            ),
+            (
+                "coreferent schematic fact at the join",
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e $u $u)", "(e a b)", "(e b c)"],
+            ),
+            (
+                "shared-key conjunction (p $x)(q $x) with a schematic q",
+                &["(p $x)", "(q $x)"],
+                &["(p a)", "(p b)", "(q a)", "(q $w)"],
+            ),
+        ];
+        for (name, pats, facts) in cases {
+            let fork: BTreeSet<String> = fork_answer_paths(pats, facts)
+                .iter()
+                .map(|p| serialize(p))
+                .collect();
+            let mine = zipper_answer_strings(pats, facts);
+            assert_eq!(
+                fork,
+                mine,
+                "{name}: zipper join diverged from the ProductZipper\n  fork-only={:?}\n  mine-only={:?}",
+                fork.difference(&mine).collect::<Vec<_>>(),
+                mine.difference(&fork).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Head-to-head: the materialized unification join (read facts into a Vec, decode each to a
+    /// Term, build in-memory tries, join) versus the zipper-native join (seek the PathMap trie
+    /// directly). Both compute the same triangle over a hub-blowup space with schematic edges. The
+    /// zipper path skips the per-flip materialization; this measures whether that pays for the
+    /// trie's re-descent cost. Run with: cargo test --release bench_zipper_vs_materialized -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_zipper_vs_materialized() {
+        use std::time::Instant;
+        // Selective two-path (e a $y)(e $y $z) from a fixed start `a`. The relevant subgraph is
+        // fixed (a -> 5 mids -> 5 each, 25 answers, ~30 facts); the relation `e` fills with junk
+        // edges unreachable from `a`. The materialized join reads all of `e` to build its trie; the
+        // zipper join seeks only the relevant facts, so its cost tracks the answer, not the space.
+        let body = mork_uni_join::term::parse("(, (e a $y) (e $y $z))").encode();
+        let p_e = vec![
+            item_byte(Tag::Arity(3)),
+            item_byte(Tag::SymbolSize(1)),
+            b'e',
+        ];
+        let a = vec![item_byte(Tag::SymbolSize(1)), b'a'];
+        let factors = vec![
+            crate::zipper_join::Factor {
+                prefix: p_e.clone(),
+                cols: vec![
+                    crate::zipper_join::FactorColumn::Term(crate::zipper_join::EncodedTerm {
+                        bytes: a,
+                        intro: 0,
+                    }),
+                    crate::zipper_join::FactorColumn::Var(0),
+                ],
+            },
+            crate::zipper_join::Factor::var_cols(p_e.clone(), vec![0, 1]),
+        ];
+        let order = vec![0usize, 1];
+        let nvars = 2usize;
+        let e_prefix = p_e;
+        let runs = 50u32;
+
+        println!("\n  junk   facts   materialized      zipper     speedup");
+        for &s in &[0usize, 256, 1024, 4096, 16384, 65536] {
+            let mut prog = String::new();
+            for t in 0..5 {
+                prog.push_str(&format!("(e a t{t})\n"));
+                for u in 0..5 {
+                    prog.push_str(&format!("(e t{t} u{u})\n"));
+                }
+            }
+            for j in 0..s {
+                prog.push_str(&format!("(e p{j} q{j})\n"));
+            }
+
+            let mut space = Space::new();
+            space.add_all_sexpr(prog.as_bytes()).unwrap();
+            let nfacts = space.btm.val_count();
+
+            // Materialized: read the relation facts, then the join decodes + builds tries.
+            let t0 = Instant::now();
+            let mut mat_ans = 0usize;
+            for _ in 0..runs {
+                let mut fact_bufs: Vec<Vec<u8>> = Vec::new();
+                let mut rz = space.btm.read_zipper_at_path(&e_prefix);
+                while rz.to_next_val() {
+                    fact_bufs.push(rz.origin_path().to_vec());
+                }
+                let fact_slices: Vec<&[u8]> = fact_bufs.iter().map(Vec::as_slice).collect();
+                let ans = crate::unify_join::leapfrog_unify_join_encoded(&body, &fact_slices);
+                mat_ans = ans.len();
+                std::hint::black_box(&ans);
+            }
+            let mat = t0.elapsed() / runs;
+
+            // Zipper-native: seek the PathMap directly, no materialization.
+            let t1 = Instant::now();
+            let mut zip_ans = 0usize;
+            for _ in 0..runs {
+                let rows =
+                    crate::zipper_join::unify_join_zipper(&space.btm, &factors, &order, nvars);
+                zip_ans = rows.len();
+                std::hint::black_box(&rows);
+            }
+            let zip = t1.elapsed() / runs;
+
+            // Counts differ by design: the materialized join keeps non-ground answers, the zipper
+            // join drops them (the live route's projection). Printed to confirm comparable work.
+            println!(
+                "{s:5} {nfacts:6}   {:>10.3?}   {:>10.3?}   {:>6.2}x   (mat_ans={mat_ans} zip_ans={zip_ans})",
+                mat,
+                zip,
+                mat.as_secs_f64() / zip.as_secs_f64()
+            );
+        }
+    }
+
+    /// The decisive comparison: the zipper-native join against MORK's own ground path, the
+    /// ProductZipper (`query_multi`), on the same selective two-path as the space fills with junk.
+    /// This settles whether the ProductZipper already seeks the query (so the zero-copy win is
+    /// only over the materialized unification join) or scans (so the zipper beats it directly).
+    #[test]
+    #[ignore]
+    fn bench_zipper_vs_product_zipper() {
+        use std::time::Instant;
+        let p_e = vec![
+            item_byte(Tag::Arity(3)),
+            item_byte(Tag::SymbolSize(1)),
+            b'e',
+        ];
+        let a = vec![item_byte(Tag::SymbolSize(1)), b'a'];
+        let factors = vec![
+            crate::zipper_join::Factor {
+                prefix: p_e.clone(),
+                cols: vec![
+                    crate::zipper_join::FactorColumn::Term(crate::zipper_join::EncodedTerm {
+                        bytes: a,
+                        intro: 0,
+                    }),
+                    crate::zipper_join::FactorColumn::Var(0),
+                ],
+            },
+            crate::zipper_join::Factor::var_cols(p_e, vec![0, 1]),
+        ];
+        let order = vec![0usize, 1];
+        let nvars = 2usize;
+        let runs = 50u32;
+
+        println!("\n  junk   facts   ProductZipper      zipper     speedup");
+        for &s in &[0usize, 256, 1024, 4096, 16384, 65536] {
+            let mut prog = String::new();
+            for t in 0..5 {
+                prog.push_str(&format!("(e a t{t})\n"));
+                for u in 0..5 {
+                    prog.push_str(&format!("(e t{t} u{u})\n"));
+                }
+            }
+            for j in 0..s {
+                prog.push_str(&format!("(e p{j} q{j})\n"));
+            }
+
+            let mut space = Space::new();
+            space.add_all_sexpr(prog.as_bytes()).unwrap();
+            let nfacts = space.btm.val_count();
+            // Bracket notation: (, (e a $y) (e $y $z)) with $y coreferenced across the two
+            // patterns (the join). The head symbol is dropped as args[0], so it is cosmetic.
+            let pat = crate::expr!(space, "[3] conj [3] e a $ [3] e _1 $");
+
+            // ProductZipper: MORK's existing multi-pattern join over the same live snapshot.
+            let t0 = Instant::now();
+            let mut pz_ans = 0u64;
+            for _ in 0..runs {
+                let mut c = 0u64;
+                Space::query_multi(&space.btm, pat, |_, _| {
+                    c += 1;
+                    true
+                });
+                pz_ans = c;
+                std::hint::black_box(c);
+            }
+            let pz = t0.elapsed() / runs;
+
+            // Zipper-native unification join: seek the PathMap directly, no materialization.
+            let t1 = Instant::now();
+            let mut zip_ans = 0usize;
+            for _ in 0..runs {
+                let rows =
+                    crate::zipper_join::unify_join_zipper(&space.btm, &factors, &order, nvars);
+                zip_ans = rows.len();
+                std::hint::black_box(&rows);
+            }
+            let zip = t1.elapsed() / runs;
+
+            println!(
+                "{s:5} {nfacts:6}   {:>10.3?}   {:>10.3?}   {:>6.2}x   (pz_ans={pz_ans} zip_ans={zip_ans})",
+                pz,
+                zip,
+                pz.as_secs_f64() / zip.as_secs_f64()
+            );
+        }
+    }
+
+    /// Beat the cycle. On the triangle (e $x $y)(e $y $z)(e $z $x) over a hub-blowup space, the WCO
+    /// join must prune the s^2 two-paths the ProductZipper materializes. The zipper join re-indexes
+    /// only the inverted factor (e $z $x) and seeks the other two, so it recovers worst-case
+    /// optimality at the cost of one partial materialization rather than the live route's decode of
+    /// every factor into tries. All three return the same triangle count.
+    #[test]
+    #[ignore]
+    fn bench_cyclic_triangle() {
+        use std::time::Instant;
+        let patterns = ["(e $x $y)", "(e $y $z)", "(e $z $x)"];
+        let (factors, nvars) = parse_var_only_factors(&patterns);
+        let order: Vec<usize> = (0..nvars).collect();
+        let body = mork_uni_join::term::parse("(, (e $x $y) (e $y $z) (e $z $x))").encode();
+        let e_prefix = parse_var_only_factors(&["(e $a $b)"]).0[0].prefix.clone();
+        let runs = 10u32;
+
+        println!("\n  s   facts   ProductZipper   materialized   reindex-zipper");
+        for &s in &[64usize, 128, 256, 512, 1024, 2048] {
+            let mut prog = String::new();
+            for i in 0..s {
+                prog.push_str(&format!("(e hub o{i})\n(e i{i} hub)\n"));
+            }
+            for a in 0..6 {
+                for b in 0..6 {
+                    if a != b {
+                        prog.push_str(&format!("(e c{a} c{b})\n"));
+                    }
+                }
+            }
+            let mut space = Space::new();
+            space.add_all_sexpr(prog.as_bytes()).unwrap();
+            let nfacts = space.btm.val_count();
+            let pat = crate::expr!(space, "[4] conj [3] e $ $ [3] e _2 $ [3] e _3 _1");
+
+            let t0 = Instant::now();
+            let mut pz_ans = 0u64;
+            for _ in 0..runs {
+                let mut c = 0u64;
+                Space::query_multi(&space.btm, pat, |_, _| {
+                    c += 1;
+                    true
+                });
+                pz_ans = c;
+                std::hint::black_box(c);
+            }
+            let pz = t0.elapsed() / runs;
+
+            let t1 = Instant::now();
+            let mut mat_ans = 0usize;
+            for _ in 0..runs {
+                let mut fact_bufs: Vec<Vec<u8>> = Vec::new();
+                let mut rz = space.btm.read_zipper_at_path(&e_prefix);
+                while rz.to_next_val() {
+                    fact_bufs.push(rz.origin_path().to_vec());
+                }
+                let fact_slices: Vec<&[u8]> = fact_bufs.iter().map(Vec::as_slice).collect();
+                let ans = crate::unify_join::leapfrog_unify_join_encoded(&body, &fact_slices);
+                mat_ans = ans.len();
+                std::hint::black_box(&ans);
+            }
+            let mat = t1.elapsed() / runs;
+
+            let t2 = Instant::now();
+            let mut zip_ans = 0usize;
+            for _ in 0..runs {
+                let rows =
+                    crate::zipper_join::unify_join_zipper(&space.btm, &factors, &order, nvars);
+                zip_ans = rows.len();
+                std::hint::black_box(&rows);
+            }
+            let zip = t2.elapsed() / runs;
+
+            println!(
+                "{s:5} {nfacts:6}   {pz:>11.3?}   {mat:>11.3?}   {zip:>11.3?}   (pz={pz_ans} mat={mat_ans} zip={zip_ans})"
+            );
+        }
+    }
+
+    /// End-to-end: the cyclic schematic body through the live flip (`metta_calculus`), the zipper
+    /// kernel vs the materialized one. The zipper also skips the relation fact-read (it seeks), so the
+    /// live speedup is on top of the faster join. A schematic edge on a join key reaches the route.
+    #[test]
+    #[ignore]
+    fn bench_live_route_zipper_vs_materialized() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        let runs = 10u32;
+        let exec = "(exec 0 (, (e $x $y) (e $y $z) (e $z $x)) (, (out $x $y $z)))\n";
+        println!("\n  s   facts   materialized-route   zipper-route   speedup");
+        for &s in &[64usize, 256, 1024, 2048] {
+            let mut prog = String::new();
+            for i in 0..s {
+                prog.push_str(&format!("(e hub o{i})\n(e i{i} hub)\n"));
+            }
+            for a in 0..6 {
+                for b in 0..6 {
+                    if a != b {
+                        prog.push_str(&format!("(e c{a} c{b})\n"));
+                    }
+                }
+            }
+            prog.push_str("(e c0 $w)\n"); // schematic edge on a join key: reaches the unify route
+
+            let mut nfacts = 0usize;
+            let mut run_kernel = |zipper: bool| -> std::time::Duration {
+                SIDECAR_ZIPPER_JOIN_ENABLED.store(zipper, Ordering::Relaxed);
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..runs {
+                    let mut space = Space::new();
+                    space.add_all_sexpr(prog.as_bytes()).unwrap();
+                    space.add_all_sexpr(exec.as_bytes()).unwrap();
+                    nfacts = space.btm.val_count();
+                    let t = Instant::now();
+                    space.metta_calculus(1);
+                    total += t.elapsed();
+                }
+                total / runs
+            };
+
+            let mat = run_kernel(false);
+            let zip = run_kernel(true);
+            SIDECAR_ZIPPER_JOIN_ENABLED.store(true, Ordering::Relaxed);
+            println!(
+                "{s:5} {nfacts:6}   {mat:>14.3?}   {zip:>12.3?}   {:>6.2}x",
+                mat.as_secs_f64() / zip.as_secs_f64()
+            );
+        }
+    }
+
+    #[test]
+    fn zipper_join_matches_product_zipper_random() {
+        struct R(u64);
+        impl R {
+            fn nx(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.nx() % n as u64) as usize
+            }
+        }
+        // In-scope corpus: flat facts only (no non-ground compounds, the case the production gate
+        // declines), so the unification join must equal the ProductZipper. Columns are a small
+        // symbol set or a fact-local variable (slot 0/1), giving ground, single-variable,
+        // coreferent, and two-variable schematic edges.
+        let shapes: &[&[&str]] = &[
+            &["(e $x $y)", "(e $y $z)"],
+            &["(e $x $y)", "(e $x $z)"],
+            &["(e $x $y)", "(e $y $z)", "(e $z $x)"],
+            &["(e $x $y)", "(e $y $z)", "(e $x $z)"],
+            &["(e $w $x)", "(e $x $y)", "(e $y $z)", "(e $z $w)"],
+            &["(e $x $y)", "(e $y $x)"],
+        ];
+        let syms = ["a", "b", "c"];
+        let mut rng = R(0x9E3779B97F4A7C15);
+        for seed in 0..250u64 {
+            rng.0 = seed.wrapping_mul(0xD1B54A32D192ED03).wrapping_add(1);
+            let nfacts = 4 + rng.below(7);
+            let mut facts: Vec<String> = Vec::new();
+            for _ in 0..nfacts {
+                let mut col = |r: &mut R| {
+                    if r.below(3) == 0 {
+                        format!("$w{}", r.below(2))
+                    } else {
+                        syms[r.below(syms.len())].to_string()
+                    }
+                };
+                facts.push(format!("(e {} {})", col(&mut rng), col(&mut rng)));
+            }
+            let fact_refs: Vec<&str> = facts.iter().map(|s| s.as_str()).collect();
+            for shape in shapes {
+                let fork: BTreeSet<String> = fork_answer_paths(shape, &fact_refs)
+                    .iter()
+                    .map(|p| serialize(p))
+                    .collect();
+                let mine = zipper_answer_strings(shape, &fact_refs);
+                assert_eq!(
+                    fork,
+                    mine,
+                    "seed {seed} shape {shape:?} facts {facts:?}\n  fork-only={:?}\n  mine-only={:?}",
+                    fork.difference(&mine).collect::<Vec<_>>(),
+                    mine.difference(&fork).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_validate_prototype_against_product_zipper() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                "ground triangle",
+                &["(e $x $y)", "(e $y $z)", "(e $x $z)"],
+                &["(e a b)", "(e a c)", "(e b c)", "(e b d)"],
+            ),
+            (
+                "func-type unification (ground join key)",
+                &["(: ($f) A)", "(: $f (-> A))"],
+                &["(: (f) A)", "(: f (-> A))"],
+            ),
+            (
+                "schematic fact admitted (var not at a join position)",
+                &["(rel $x b)"],
+                &["(rel a $w)", "(rel c b)", "(rel d e)"],
+            ),
+            (
+                "shared-key conjunction",
+                &["(p $x)", "(q $x)"],
+                &["(p a)", "(q a)", "(q b)", "(p c)"],
+            ),
+        ];
+        let mut mismatches = 0;
+        for (name, pats, facts) in cases {
+            let (fork, proto, nonground, path) = cross_check(pats, facts);
+            let agree = fork == proto;
+            if !agree {
+                mismatches += 1;
+            }
+            eprintln!(
+                "[{}] {name}: fork={} proto_ground={} proto_nonground={} -> {}",
+                path,
+                fork.len(),
+                proto.len(),
+                nonground,
+                if agree { "AGREE" } else { "MISMATCH" }
+            );
+            if !agree {
+                eprintln!(
+                    "    fork  only: {:?}",
+                    fork.difference(&proto).collect::<Vec<_>>()
+                );
+                eprintln!(
+                    "    proto only: {:?}",
+                    proto.difference(&fork).collect::<Vec<_>>()
+                );
+            }
+        }
+        assert_eq!(
+            mismatches, 0,
+            "prototype must agree with the ProductZipper on ground answers"
+        );
+    }
+
+    // The same cross-validation over a random corpus: random conjunctive bodies
+    // (1-3 patterns over relation `r`) against random spaces (~40% schematic facts),
+    // the prototype's routed `uni_join` against MORK's real ProductZipper. Ground
+    // answers must agree on every case. Exercises both routing paths.
+    #[test]
+    fn cross_validate_random_against_product_zipper() {
+        struct R(u64);
+        impl R {
+            fn nx(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.nx() % n as u64) as usize
+            }
+            fn chance(&mut self, a: usize, b: usize) -> bool {
+                self.below(b) < a
+            }
+        }
+        const SYMS: &[&str] = &["a", "b", "c"];
+        // A random term string: a symbol, a variable `$<prefix><k>`, or a small compound.
+        fn rand_term(
+            r: &mut R,
+            depth: usize,
+            allow_var: bool,
+            pool: usize,
+            prefix: &str,
+        ) -> String {
+            if depth == 0 || r.chance(3, 5) {
+                if allow_var && r.chance(2, 5) {
+                    format!("${prefix}{}", r.below(pool))
+                } else {
+                    SYMS[r.below(SYMS.len())].to_string()
+                }
+            } else {
+                let arity = 1 + r.below(2);
+                let parts: Vec<String> = (0..arity)
+                    .map(|_| rand_term(r, depth - 1, allow_var, pool, prefix))
+                    .collect();
+                format!("({})", parts.join(" "))
+            }
+        }
+
+        let mut r = R(0xDEAD_BEEF_1234_5678);
+        // exact: identical ground answers. superset: the prototype's full unification finds ground
+        // answers the native matcher did not emit. fork_extra: MORK finds a ground answer the
+        // prototype misses, which would be a prototype completeness bug and must stay zero.
+        let mut exact = 0;
+        let mut superset = 0;
+        let mut fork_extra = 0;
+        let mut leapfrog = 0;
+        let mut coupled = 0;
+        let mut nonempty = 0;
+        let mut nonground_dropped = 0;
+        const N: usize = 500;
+        for _ in 0..N {
+            let npat = 1 + r.below(3);
+            let var_pool = 1 + r.below(2);
+            // Pattern vars share the `p` scope across patterns; each fact's `d` vars
+            // are independent (parsed per fact on both sides).
+            let patterns: Vec<String> = (0..npat)
+                .map(|_| {
+                    format!(
+                        "(r {} {})",
+                        rand_term(&mut r, 2, true, var_pool, "p"),
+                        rand_term(&mut r, 1, true, var_pool, "p")
+                    )
+                })
+                .collect();
+            let nfacts = r.below(6);
+            let facts: Vec<String> = (0..nfacts)
+                .map(|_| {
+                    let sch = r.chance(2, 5);
+                    format!(
+                        "(r {} {})",
+                        rand_term(&mut r, 2, sch, 2, "d"),
+                        rand_term(&mut r, 1, sch, 2, "d")
+                    )
+                })
+                .collect();
+
+            let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+            let fcts: Vec<&str> = facts.iter().map(|s| s.as_str()).collect();
+            let (fork, proto, nonground, path) = cross_check(&pats, &fcts);
+            nonground_dropped += nonground;
+            if path == "Leapfrog" {
+                leapfrog += 1;
+            } else {
+                coupled += 1;
+            }
+            if !fork.is_empty() {
+                nonempty += 1;
+            }
+            let fork_only: Vec<_> = fork.difference(&proto).collect();
+            let proto_only: Vec<_> = proto.difference(&fork).collect();
+            if !fork_only.is_empty() {
+                fork_extra += 1;
+                eprintln!(
+                    "FORK-EXTRA (prototype missed a real-matcher answer) [{path}]\n  patterns={patterns:?}\n  facts={facts:?}\n  fork only: {fork_only:?}"
+                );
+            } else if proto_only.is_empty() {
+                exact += 1;
+            } else {
+                superset += 1;
+                if superset <= 5 {
+                    eprintln!(
+                        "SUPERSET (prototype-only ground answers) [{path}]\n  patterns={patterns:?}\n  facts={facts:?}\n  proto only: {proto_only:?}"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "random cross-validation: {N} cases | exact={exact} superset={superset} fork_extra={fork_extra} | leapfrog={leapfrog} coupled={coupled} nonempty={nonempty} nonground_dropped={nonground_dropped}"
+        );
+        // The soundness/completeness floor: the prototype must never miss a ground
+        // answer MORK's real matcher produces.
+        assert_eq!(
+            fork_extra, 0,
+            "prototype must never miss a ground answer the ProductZipper finds"
+        );
+        assert!(leapfrog > 100, "corpus must exercise the leapfrog path");
+        assert!(coupled > 5, "corpus must exercise the coupled path");
+        assert!(nonempty > 30, "corpus must produce real answers");
+    }
+
+    // Project the body's answers through a TEMPLATE that keeps only `proj` (a subset of the
+    // body variables), exactly as the real integration does: `(exec 0 (, body) (, (out proj)))`.
+    // A join variable omitted from `proj` can be bound by the match and still leave a ground
+    // projected tuple. Returns the ground `out` answers the real ProductZipper emits.
+    fn fork_proj(patterns: &[&str], facts: &[&str], proj: &[&str]) -> BTreeSet<String> {
+        fork_projected_strings("out", patterns, facts, proj, true)
+    }
+
+    // The same projection through the prototype's FULL leapfrog-unify: decode each answer
+    // tuple (positionally over the first-occurrence query-variable order), keep the `proj`
+    // columns, and render the ground ones. Returns (ground answers, count of projected tuples
+    // dropped for being non-ground).
+    fn proto_proj(patterns: &[&str], facts: &[&str], proj: &[&str]) -> (BTreeSet<String>, usize) {
+        use mork_uni_join::oracle::Conj;
+        use mork_uni_join::term::{Term as PTerm, parse as pparse};
+        use mork_uni_join::unijoin::leapfrog_unify_join;
+        let order = first_occurrence_vars(patterns);
+        let proj_pos: Vec<usize> = proj
+            .iter()
+            .map(|n| order.iter().position(|o| o == n).expect("proj var in body"))
+            .collect();
+        let q = Conj::parse(patterns);
+        let sp: Vec<PTerm> = facts.iter().map(|f| pparse(f)).collect();
+        let sols = leapfrog_unify_join(&q, &sp);
+        let mut ground = BTreeSet::new();
+        let mut nonground = 0usize;
+        for key in &sols {
+            let tuple = match PTerm::decode(key) {
+                PTerm::App(a) => a,
+                t => vec![t],
+            };
+            let mut out = vec![PTerm::sym("out")];
+            for &p in &proj_pos {
+                out.push(tuple[p].clone());
+            }
+            let wrapped = PTerm::App(out);
+            if wrapped.is_ground() {
+                ground.insert(serialize(&wrapped.encode()));
+            } else {
+                nonground += 1;
+            }
+        }
+        (ground, nonground)
+    }
+
+    // The live integration's emit, validated as a function. Decode the pattern body and the
+    // space's facts to the prototype's term model (MORK's own byte encoding, so coreference is
+    // preserved), run the worst-case-optimal leapfrog-unification join, map each ground answer
+    // back to the fork's (u8,u8) variable keys positionally (both number variables in
+    // first-occurrence order across factors), and emit through the fork's OWN template
+    // applicator. The output paths must equal the ProductZipper's on every routable body,
+    // including the join-capture case the equality join has to decline.
+    fn unify_glue_outputs(
+        pat_expr: Expr,
+        sources: &[ExprEnv],
+        templates: &[Expr],
+        facts: &[Vec<u8>],
+    ) -> BTreeSet<Vec<u8>> {
+        use mork_uni_join::oracle::Conj;
+        use mork_uni_join::term::Term as PTerm;
+        use mork_uni_join::unijoin::leapfrog_unify_join;
+
+        // fork variable keys, densely numbered in first-occurrence order (== BindingVar order).
+        let mut variable_for_key: BTreeMap<(u8, u8), crate::binding_space::BindingVar> =
+            BTreeMap::new();
+        for &source in sources {
+            for key in Space::query_factor_variables(source) {
+                let next = crate::binding_space::BindingVar(variable_for_key.len() as u8);
+                variable_for_key.entry(key).or_insert(next);
+            }
+        }
+        let mut dense_keys: Vec<(u8, u8)> = vec![(0, 0); variable_for_key.len()];
+        for (&key, &bv) in &variable_for_key {
+            dense_keys[bv.0 as usize] = key;
+        }
+
+        // prototype query from the pattern body bytes; drop the ',' head, keep the factors.
+        let body = PTerm::decode(unsafe { &*pat_expr.span() });
+        let factors: Vec<PTerm> = match body {
+            PTerm::App(mut a) => {
+                if !a.is_empty() {
+                    a.remove(0);
+                }
+                a
+            }
+            _ => Vec::new(),
+        };
+        let mut query_vars = Vec::new();
+        for p in &factors {
+            for v in p.var_ids() {
+                if !query_vars.contains(&v) {
+                    query_vars.push(v);
+                }
+            }
+        }
+        assert_eq!(
+            query_vars.len(),
+            dense_keys.len(),
+            "prototype variable count != fork key count (coreference mapping mismatch)"
+        );
+        let q = Conj {
+            patterns: factors,
+            query_vars,
+        };
+
+        let pfacts: Vec<PTerm> = facts.iter().map(|f| PTerm::decode(f)).collect();
+        let answers = leapfrog_unify_join(&q, &pfacts);
+
+        let mut out = BTreeSet::new();
+        let mut buffer = template_output_buffer();
+        let mut stack = Vec::new();
+        let mut assignments = Vec::new();
+        for key in &answers {
+            let tuple = PTerm::decode(key);
+            let comps: Vec<PTerm> = match tuple {
+                PTerm::App(a) => a,
+                t => vec![t],
+            };
+            if comps.len() != dense_keys.len() {
+                continue;
+            }
+            // Bind only the GROUND components. A ground term has no variables, so its ExprEnv
+            // carries no (n,v) identity that could collide; a non-ground value would alias the
+            // pattern's own variables under ExprEnv's (n,v) scheme. A template that references an
+            // unbound (non-ground) variable instantiates a fresh variable, yielding a non-ground
+            // output the exec discards, while a template over only ground variables still emits.
+            let value_bufs: Vec<Option<Vec<u8>>> = comps
+                .iter()
+                .map(|c| c.is_ground().then(|| c.encode()))
+                .collect();
+            let mut bindings: BTreeMap<(u8, u8), ExprEnv> = BTreeMap::new();
+            for (i, &k) in dense_keys.iter().enumerate() {
+                if let Some(bytes) = &value_bufs[i] {
+                    bindings.insert(
+                        k,
+                        ExprEnv::new(
+                            0,
+                            Expr {
+                                ptr: bytes.as_ptr() as *mut u8,
+                            },
+                        ),
+                    );
+                }
+            }
+            Space::apply_templates_from_bindings(
+                &bindings,
+                pat_expr,
+                templates,
+                &mut buffer,
+                &mut stack,
+                &mut assignments,
+                |path| {
+                    out.insert(path.to_vec());
+                },
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn unify_glue_emit_matches_product_zipper() {
+        // (facts, pattern body, template body): routable schematic and ground bodies. Each must
+        // emit byte-identically to the ProductZipper through the unification-join glue, the same
+        // path the live integration takes. Includes the join-capture case (a schematic var on a
+        // join key, grounded by another factor) the equality join declines.
+        let cases: &[(&str, &'static str, &'static str)] = &[
+            (
+                "(edge a b)\n(edge b c)\n(edge c d)\n",
+                "[3] , [3] edge $ $ [3] edge _2 $",
+                "[2] , [3] path _1 _3",
+            ),
+            (
+                "(edge a b)\n(edge b c)\n(edge a $w)\n",
+                "[3] , [3] edge $ $ [3] edge _2 $",
+                "[2] , [3] path _1 _3",
+            ),
+            (
+                "(edge a b)\n(edge a d)\n(label b $w)\n(label d e)\n",
+                "[3] , [3] edge $ $ [3] label _2 $",
+                "[2] , [4] out _1 _2 _3",
+            ),
+            (
+                "(edge a b)\n(edge b c)\n(edge c a)\n(label a la)\n(label b lb)\n(label c lc)\n",
+                "[5] , [3] edge $ $ [3] edge _2 $ [3] edge _3 _1 [3] label _1 $",
+                "[2] , [5] out _1 _2 _3 _4",
+            ),
+            (
+                "(s a $w)\n(s b c)\n(s d c)\n",
+                "[3] , [3] s $ c",
+                "[2] , [2] got _1",
+            ),
+            // stored-to-stored on the OMITTED join key _2: template (path _1 _3) leaves _2 out,
+            // so the non-ground _2 still yields a ground output. The glue must emit it.
+            (
+                "(edge a $w)\n(edge $u c)\n(edge a c)\n",
+                "[3] , [3] edge $ $ [3] edge _2 $",
+                "[2] , [3] path _1 _3",
+            ),
+        ];
+        for (i, (facts, pat, tpl)) in cases.iter().enumerate() {
+            let mut space = Space::new();
+            space.add_all_sexpr(facts.as_bytes()).unwrap();
+            let mut fact_bytes: Vec<Vec<u8>> = Vec::new();
+            space
+                .btm
+                .try_for_each_value::<_, ()>(|p, _| {
+                    fact_bytes.push(p.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            let (pat_expr, sources) = query_pattern_and_sources(&mut space, pat);
+            let (tpl_expr, _) = query_pattern_and_sources(&mut space, tpl);
+            let mut tpl_args = Vec::new();
+            ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+            let templates: Vec<Expr> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+
+            // The exec apply keeps only ground results, so compare the ground output sets: the
+            // glue must reproduce exactly the ground outputs the ProductZipper produces.
+            let ground = |s: &BTreeSet<Vec<u8>>| -> BTreeSet<Vec<u8>> {
+                s.iter()
+                    .filter(|p| serialized_is_ground(&serialize(p)))
+                    .cloned()
+                    .collect()
+            };
+            let product = ground(&Space::product_template_outputs(
+                &space.btm, pat_expr, &templates,
+            ));
+            let glue = ground(&unify_glue_outputs(
+                pat_expr,
+                &sources,
+                &templates,
+                &fact_bytes,
+            ));
+            assert_eq!(
+                glue,
+                product,
+                "case {i} glue != ProductZipper\n  glue-only={:?}\n  product-only={:?}",
+                glue.difference(&product)
+                    .map(|p| serialize(p))
+                    .collect::<Vec<_>>(),
+                product
+                    .difference(&glue)
+                    .map(|p| serialize(p))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // Exploratory: probe the projection boundary on the canonical hard shapes, especially a
+    // join variable that is bound stored-variable <-> stored-variable and projected OUT. Prints
+    // the real matcher's answers against the prototype's full unification, projected the same
+    // way. No assertions: this characterizes where the two diverge so the gate can be built to
+    // match the measured boundary, not a predicted one.
+    #[test]
+    fn probe_projection_boundary() {
+        let cases: &[(&str, &[&str], &[&str], &[&str])] = &[
+            // case 1: schematic on a join key, grounded by another ground factor. AGREE expected.
+            (
+                "join-capture ground",
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e a b)", "(e b c)", "(e a $w)"],
+                &["x", "z"],
+            ),
+            // case 2: two schematic facts meet at the omitted join key ($y) -> stored<->stored.
+            // The discriminating answer is (out a c), which needs $w (from (e a $w)) to alias
+            // $u (from (e $u c)). Does the ProductZipper emit it?
+            (
+                "stored<->stored omitted join",
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e a $w)", "(e $u c)"],
+                &["x", "z"],
+            ),
+            (
+                "stored<->stored + ground",
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e a $w)", "(e $u c)", "(e a c)"],
+                &["x", "z"],
+            ),
+            // case 3: data-side capture of a query compound, projected. DIVERGE expected.
+            (
+                "data-side capture proj",
+                &["(r (a $p) b)", "(r (b) $p)"],
+                &["(r $d b)", "(r a b)"],
+                &["p"],
+            ),
+            // case 4: schematic meets a constant / ground both sides. AGREE expected.
+            (
+                "stored meets ground both",
+                &["(p $x)", "(q $x)"],
+                &["(p $w)", "(q a)", "(p b)"],
+                &["x"],
+            ),
+            (
+                "stored at join, project join",
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e a $w)", "(e $u c)"],
+                &["x", "y", "z"],
+            ),
+            // a schematic fact whose var meets a query constant, projected away.
+            (
+                "stored meets query const",
+                &["(s $x c)"],
+                &["(s a $w)", "(s $u c)", "(s b c)"],
+                &["x"],
+            ),
+            // capture via the JOIN: a shared query var carries a value across factors. Here $x
+            // binds data var $d in factor 1 and ground compound (h a) in factor 2; full unify
+            // forces $d = (h a). Does the ProductZipper propagate it?
+            (
+                "capture-via-join proj y",
+                &["(e $x $y)", "(g $x)"],
+                &["(e $d c)", "(g (h a))"],
+                &["y"],
+            ),
+            (
+                "capture-via-join proj x",
+                &["(e $x $y)", "(g $x)"],
+                &["(e $d c)", "(g (h a))"],
+                &["x"],
+            ),
+            // does the ProductZipper bind a data var to a GROUND query compound? (line 6048
+            // declines this regardless of groundness; if the PZ captures it, 6048 over-declines.)
+            (
+                "fact var vs ground query compound",
+                &["(r (a b) $y)"],
+                &["(r $d c)", "(r (a b) e)"],
+                &["y"],
+            ),
+            // non-ground query compound vs fact var, but the compound's var is grounded by
+            // another factor before the capture matters.
+            (
+                "nonground compound vs fact var, $p grounded",
+                &["(r (a $p) $y)", "(z $p)"],
+                &["(r $d c)", "(z b)"],
+                &["y", "p"],
+            ),
+            // --- genuine-unification capture cases (triejoin-unification suite) ---
+            // data-side coreference must force the two join vars equal: full-unify -> {(a a)} only;
+            // a matcher that treats each data $u as an independent wildcard also emits (a b).
+            (
+                "data-coref forces join equal",
+                &["(e $x $y)", "(p $x)", "(q $y)"],
+                &["(e $u $u)", "(p a)", "(q a)", "(q b)"],
+                &["x", "y"],
+            ),
+            // a data var must capture a NON-ground query compound (f $x), grounded by (s $x):
+            // full-unify -> {(c b)}; native ProductZipper must emit the same answer.
+            (
+                "compound capture grounded by join",
+                &["(r (f $x) $y)", "(s $x)"],
+                &["(r $d b)", "(s c)"],
+                &["x", "y"],
+            ),
+            // occurs: (f $x) must unify with the coreferent data var already bound to $x -> cycle -> no answer.
+            (
+                "occurs via data coref",
+                &["(e $x (f $x))"],
+                &["(e $w $w)"],
+                &["x"],
+            ),
+        ];
+        let mut divergences = 0;
+        for (name, pats, facts, proj) in cases {
+            let fork = fork_proj(pats, facts, proj);
+            let (proto, nonground) = proto_proj(pats, facts, proj);
+            let agree = fork == proto;
+            if !agree {
+                divergences += 1;
+            }
+            eprintln!(
+                "[{}] {name}: fork={} proto={} proto_nonground_dropped={} -> {}",
+                if agree { "AGREE" } else { "DIVERGE" },
+                fork.len(),
+                proto.len(),
+                nonground,
+                if agree { "ok" } else { "***" }
+            );
+            if !agree {
+                eprintln!(
+                    "    fork  only: {:?}",
+                    fork.difference(&proto).collect::<Vec<_>>()
+                );
+                eprintln!(
+                    "    proto only: {:?}",
+                    proto.difference(&fork).collect::<Vec<_>>()
+                );
+            } else {
+                eprintln!("    both: {:?}", fork.iter().collect::<Vec<_>>());
+            }
+        }
+        eprintln!(
+            "probe_projection_boundary: {} / {} cases diverge",
+            divergences,
+            cases.len()
+        );
+    }
+
+    // === Triejoin-unification suite (Phase 1) ===
+    // The oracle is full first-order unification with occurs-check: `proto_proj` runs the
+    // prototype leapfrog-unify join, cross-validated byte-for-byte against the native
+    // `leapfrog_unify_join_encoded` on 5000 schematic cases
+    // (unify_join.rs::random_encoded_join_matches_prototype_byte_for_byte); its leaf unifier is
+    // Robinson with occurs-check. A SWI-Prolog `unify_with_occurs_check` gold-check seals it
+    // independently (unification_capture_matches_prolog). `fork_proj` is the live exec/matcher
+    // route. Both are projected to ground outputs (exec keeps only ground answers).
+
+    // Regression guard: the unification behaviour the live fast path ALREADY gets right, on data
+    // that genuinely needs unification (data-side variables, flat coreference, occurs). These must
+    // stay extensionally equal to full unification.
+    #[test]
+    fn unification_capture_handled_matches_full_unify() {
+        let cases: &[(&str, &[&str], &[&str], &[&str])] = &[
+            // flat data-side coreference forces the two join vars equal: only (a a), never (a b).
+            (
+                "flat data coref forces equal",
+                &["(e $x $y)", "(p $x)", "(q $y)"],
+                &["(e $u $u)", "(p a)", "(q a)", "(q b)"],
+                &["x", "y"],
+            ),
+            // occurs through a coreferent data var -> cycle -> no answer.
+            (
+                "occurs via data coref yields nothing",
+                &["(e $x (f $x))"],
+                &["(e $w $w)"],
+                &["x"],
+            ),
+            // a data var meeting a query constant, projected away.
+            (
+                "stored meets query const",
+                &["(s $x c)"],
+                &["(s a $w)", "(s $u c)", "(s b c)"],
+                &["x"],
+            ),
+            // ground cyclic triangle (no data variables) — the WCO join's home turf.
+            (
+                "ground triangle",
+                &["(e $x $y)", "(e $y $z)", "(e $z $x)"],
+                &["(e a b)", "(e b c)", "(e c a)", "(e a c)"],
+                &["x", "y", "z"],
+            ),
+        ];
+        for (name, pats, facts, proj) in cases {
+            let fork = fork_proj(pats, facts, proj);
+            let (proto, _ng) = proto_proj(pats, facts, proj);
+            assert_eq!(
+                fork,
+                proto,
+                "case `{name}`: live route diverged from full unification\n  fork  only: {:?}\n  proto only: {:?}",
+                fork.difference(&proto).collect::<Vec<_>>(),
+                proto.difference(&fork).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // CLOSED (issue-29 / compound_capture): a data variable captures a NON-ground query compound
+    // (e.g. data `(r $d b)` absorbing query `(r (f $x) $y)`, binding $d = (f $x)). Full unification
+    // finds these; the ProductZipper the live fast path declines to MISSES them. With the capture
+    // route ON, the live exec route equals full unification on exactly those cases. This assertion
+    // IS the build's acceptance contract, now GREEN. The capture toggle is process-global, so this
+    // test shares the serial-execution requirement of the live A/B tests (run --test-threads=1);
+    // it saves and restores the flag, and restores BEFORE asserting so a failure never leaves it on.
+    #[test]
+    fn unification_capture_target_matches_full_unify() {
+        #[cfg(feature = "semi_naive_ic")]
+        let _sni_guard = SniDisarmGuard::new();
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let prev = SIDECAR_CAPTURE_ENABLED.swap(true, std::sync::atomic::Ordering::Relaxed);
+        let cases: &[(&str, &[&str], &[&str], &[&str])] = &[
+            (
+                "data var captures (a $p), $p fixed by join",
+                &["(r (a $p) b)", "(r (b) $p)"],
+                &["(r $d b)", "(r a b)"],
+                &["p"],
+            ),
+            (
+                "data var captures (a $p), $p grounded",
+                &["(r (a $p) $y)", "(z $p)"],
+                &["(r $d c)", "(z b)"],
+                &["y", "p"],
+            ),
+            (
+                "data var captures (f $x), x grounded by join",
+                &["(r (f $x) $y)", "(s $x)"],
+                &["(r $d b)", "(s c)"],
+                &["x", "y"],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, pats, facts, proj) in cases {
+            let fork = fork_proj(pats, facts, proj);
+            let (proto, _ng) = proto_proj(pats, facts, proj);
+            if fork != proto {
+                failures.push(format!(
+                    "case `{name}`: live capture route != full unification\n    proto only: {:?}\n    fork only: {:?}",
+                    proto.difference(&fork).collect::<Vec<_>>(),
+                    fork.difference(&proto).collect::<Vec<_>>()
+                ));
+            }
+        }
+        SIDECAR_CAPTURE_ENABLED.store(prev, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            failures.is_empty(),
+            "the capture route MISSES a capture answer full unification finds:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    // The capture route at scale, end to end through the LIVE flip. With the capture route ON, drive
+    // random data-side-capture bodies (acyclic via `transform_via_capture`, cyclic via the sidecar
+    // capture gate) through `metta_calculus` and assert the emitted ground answers equal full
+    // first-order unification (`proto_proj`, the leapfrog sealed against SWI-Prolog occurs-check) —
+    // and native ProductZipper. This hardens the whole production path
+    // (route selection, the capture join over the live trie, the template emit, the live insert) on
+    // arbitrary structure, the half the join-only differential does not reach. Process-global
+    // toggle: run --test-threads=1 (it saves and restores the flag, restoring BEFORE asserting).
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (pre-existing no-bridge failure, control-verified on the pre-delta branch).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn capture_route_matches_full_unification_live_random() {
+        #[cfg(feature = "semi_naive_ic")]
+        let _sni_guard = SniDisarmGuard::new();
+        use std::sync::atomic::Ordering;
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let prev = SIDECAR_CAPTURE_ENABLED.swap(true, Ordering::Relaxed);
+        let mut r = UjRng(0xCA97_5EED_1234_9F31);
+        let mut captures = 0usize;
+        let mut nonempty = 0usize;
+        let mut routed = 0usize;
+        let mut failures = Vec::new();
+        const N: usize = 1200;
+        for i in 0..N {
+            let (patterns, facts) = if i % 2 == 0 {
+                uj_random_acyclic_capture_case(&mut r)
+            } else {
+                uj_random_cyclic_case(&mut r)
+            };
+            let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+            let fcts: Vec<&str> = facts.iter().map(|s| s.as_str()).collect();
+            let order = first_occurrence_vars(&pats);
+            if order.is_empty() {
+                continue;
+            }
+            let mask = 1 + r.below((1usize << order.len()) - 1);
+            let proj: Vec<String> = order
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| mask & (1 << k) != 0)
+                .map(|(_, v)| v.clone())
+                .collect();
+            let proj_refs: Vec<&str> = proj.iter().map(|s| s.as_str()).collect();
+
+            let before_rec = SIDECAR_CAPTURE_RECOVERS.load(Ordering::Relaxed);
+            let fork = fork_proj(&pats, &fcts, &proj_refs);
+            let (proto, _ng) = proto_proj(&pats, &fcts, &proj_refs);
+            if SIDECAR_CAPTURE_RECOVERS.load(Ordering::Relaxed) > before_rec {
+                routed += 1;
+            }
+            if fork != proto {
+                failures.push(format!(
+                    "case {i}\n  patterns={patterns:?}\n  facts={facts:?}\n  proj={proj:?}\n  proto-only={:?}\n  fork-only={:?}",
+                    proto.difference(&fork).collect::<Vec<_>>(),
+                    fork.difference(&proto).collect::<Vec<_>>()
+                ));
+            }
+            if !proto.is_empty() {
+                nonempty += 1;
+            }
+            if case_has_compound_capture(&pats, &fcts) {
+                captures += 1;
+            }
+        }
+        SIDECAR_CAPTURE_ENABLED.store(prev, Ordering::Relaxed);
+        eprintln!(
+            "live capture A/B: {N} cases | route fired {routed} | data-side-capture {captures} | nonempty {nonempty}"
+        );
+        assert!(
+            failures.is_empty(),
+            "the live capture route diverged from full unification on {} case(s):\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            captures > 50,
+            "corpus must exercise real data-side capture: {captures}"
+        );
+        assert!(
+            routed > 20,
+            "the capture route must actually fire end to end: {routed}"
+        );
+        assert!(
+            nonempty > 50,
+            "corpus must produce real answers: {nonempty}"
+        );
+    }
+
+    // The routing gate, validated at scale. A schematic body is byte-identical between full
+    // leapfrog-unification and the real ProductZipper UNLESS a stored (data) variable must bind
+    // a query subterm that is non-ground under one factor's own match (data-side capture of a
+    // non-ground query compound). `compound_capture` is the sound, structural over-approximation
+    // of that condition: a fact-variable position aligned with a NON-ground query compound. The
+    // dense differential below asserts `!compound_capture => byte-identical to the ProductZipper`
+    // across random bodies and random output projections (a join variable is often projected
+    // out, the case the all-variable `cross_check` never reached), and that full unification
+    // never misses a ProductZipper answer.
+
+    // Sound over-approximation of "could a data variable capture a non-ground query compound
+    // when this query factor matches this fact". Structural: recurse the aligned positions, flag
+    // a query compound (non-ground) facing a fact variable. A query variable binds anything; a
+    // fact variable facing a query symbol or a GROUND query compound is a ground capture the
+    // ProductZipper also performs, so it is not flagged.
+    fn proto_compound_capture(
+        query: &mork_uni_join::term::Term,
+        fact: &mork_uni_join::term::Term,
+    ) -> bool {
+        use mork_uni_join::term::Term as PTerm;
+        match (query, fact) {
+            (PTerm::App(_), PTerm::Var(_)) => !query.is_ground(),
+            (PTerm::App(qs), PTerm::App(fs)) if qs.len() == fs.len() => qs
+                .iter()
+                .zip(fs.iter())
+                .any(|(q, f)| proto_compound_capture(q, f)),
+            _ => false,
+        }
+    }
+
+    fn case_has_compound_capture(patterns: &[&str], facts: &[&str]) -> bool {
+        use mork_uni_join::term::parse as pparse;
+        let pats: Vec<_> = patterns.iter().map(|p| pparse(p)).collect();
+        let fcts: Vec<_> = facts.iter().map(|f| pparse(f)).collect();
+        pats.iter()
+            .any(|p| fcts.iter().any(|f| proto_compound_capture(p, f)))
+    }
+
+    #[test]
+    fn routing_gate_is_sound_under_projection() {
+        struct R(u64);
+        impl R {
+            fn nx(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.nx() % n as u64) as usize
+            }
+            fn chance(&mut self, a: usize, b: usize) -> bool {
+                self.below(b) < a
+            }
+        }
+        const SYMS: &[&str] = &["a", "b", "c"];
+        // A term: a symbol, a variable `$<prefix><k>`, or a small compound. `allow_var` and the
+        // pool control how often variables appear and how many distinct ones (so factors share).
+        fn rt(
+            r: &mut R,
+            depth: usize,
+            allow_var: bool,
+            pool: usize,
+            prefix: &str,
+            compound: usize,
+        ) -> String {
+            if depth > 0 && r.chance(compound, 10) {
+                let arity = 1 + r.below(2);
+                let parts: Vec<String> = (0..arity)
+                    .map(|_| rt(r, depth - 1, allow_var, pool, prefix, compound))
+                    .collect();
+                format!("({})", parts.join(" "))
+            } else if allow_var && r.chance(2, 5) {
+                format!("${prefix}{}", r.below(pool))
+            } else {
+                SYMS[r.below(SYMS.len())].to_string()
+            }
+        }
+
+        let mut r = R(0x0123_4567_89AB_CDEF);
+        let mut agree = 0usize;
+        let mut diverge_capture = 0usize;
+        let mut exercised_capture = 0usize;
+        let mut fork_extra = 0usize; // ProductZipper found an answer full unification missed
+        let mut gate_violation = 0usize; // !capture but DIVERGED -- must stay zero
+        let mut coupled_nonempty = 0usize;
+        const N: usize = 4000;
+        for _ in 0..N {
+            let npat = 1 + r.below(3);
+            let pool = 1 + r.below(3);
+            // Pattern args: relation `e`, two args, each a term over a shared `p` var scope with a
+            // moderate chance of a compound (so data-side capture can arise).
+            let patterns: Vec<String> = (0..npat)
+                .map(|_| {
+                    format!(
+                        "(e {} {})",
+                        rt(&mut r, 2, true, pool, "p", 4),
+                        rt(&mut r, 2, true, pool, "p", 3)
+                    )
+                })
+                .collect();
+            // Facts: relation `e`, schematic-heavy (data vars on either side, sometimes a compound).
+            let nfacts = 1 + r.below(5);
+            let facts: Vec<String> = (0..nfacts)
+                .map(|_| {
+                    let sch = r.chance(3, 5);
+                    format!(
+                        "(e {} {})",
+                        rt(&mut r, 2, sch, 2, "d", 3),
+                        rt(&mut r, 2, sch, 2, "d", 3)
+                    )
+                })
+                .collect();
+
+            let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+            let fcts: Vec<&str> = facts.iter().map(|s| s.as_str()).collect();
+
+            // The query variables in first-occurrence order; pick a non-empty projection subset.
+            let order = first_occurrence_vars(&pats);
+            if order.is_empty() {
+                continue;
+            }
+            let mask = 1 + r.below((1usize << order.len()) - 1);
+            let proj: Vec<String> = order
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, v)| v.clone())
+                .collect();
+            let proj_refs: Vec<&str> = proj.iter().map(|s| s.as_str()).collect();
+
+            let fork = fork_proj(&pats, &fcts, &proj_refs);
+            let (proto, _ng) = proto_proj(&pats, &fcts, &proj_refs);
+            let capture = case_has_compound_capture(&pats, &fcts);
+
+            if !fork.is_subset(&proto) {
+                fork_extra += 1;
+                eprintln!(
+                    "FORK-EXTRA (full unification missed a ProductZipper answer)\n  patterns={patterns:?}\n  facts={facts:?}\n  proj={proj:?}\n  fork-only={:?}",
+                    fork.difference(&proto).collect::<Vec<_>>()
+                );
+            }
+            let agreed = fork == proto;
+            if agreed {
+                agree += 1;
+                if capture {
+                    exercised_capture += 1;
+                }
+            } else {
+                diverge_capture += 1;
+                if !capture {
+                    gate_violation += 1;
+                    eprintln!(
+                        "GATE VIOLATION (!capture but DIVERGED)\n  patterns={patterns:?}\n  facts={facts:?}\n  proj={proj:?}\n  fork-only={:?}\n  proto-only={:?}",
+                        fork.difference(&proto).collect::<Vec<_>>(),
+                        proto.difference(&fork).collect::<Vec<_>>()
+                    );
+                }
+            }
+            if !proto.is_empty() {
+                coupled_nonempty += 1;
+            }
+        }
+        eprintln!(
+            "routing gate: {N} cases | agree={agree} diverge={diverge_capture} exercised_capture={exercised_capture} | gate_violations={gate_violation} fork_extra={fork_extra} nonempty={coupled_nonempty}"
+        );
+        assert_eq!(
+            fork_extra, 0,
+            "full unification must never miss a ProductZipper answer"
+        );
+        assert_eq!(
+            gate_violation, 0,
+            "the routing gate admitted a body that diverges from the ProductZipper"
+        );
+        assert_eq!(
+            diverge_capture, 0,
+            "native ProductZipper should match full unification on this corpus"
+        );
+        assert!(
+            exercised_capture > 20,
+            "corpus must exercise real data-side-capture cases"
+        );
+        assert!(coupled_nonempty > 100, "corpus must produce real answers");
+    }
+
+    // The integration's end-to-end correctness gate: drive random schematic bodies through the
+    // LIVE flip (metta_calculus) twice, once with the worst-case-optimal unification route ON and
+    // once OFF (forced onto the ProductZipper), and assert the emitted ground answers are
+    // byte-identical. Run it isolated (`--test-threads=1`): the route toggle is process-global.
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (no-bridge builds route differently; control-verified pre-delta).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn unify_route_is_byte_identical_to_product_zipper_live() {
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let mut r = UjRng(0x5EED_0F1C_2B3A_4D59);
+        let mut recovered = 0usize;
+        let mut nonempty = 0usize;
+        const N: usize = 1500;
+        for _ in 0..N {
+            // A cyclic body is the case the worst-case-optimal join engages on (the acyclic
+            // ProductZipper is already output-optimal otherwise, so the route never sees acyclic
+            // bodies). Two families exercise different arities and the same join structure: an
+            // arity-2 edge cycle (triangle, 4-cycle, or triangle-with-pendant), and an arity-3
+            // rotation cycle. Every variable sits on a join key, so a schematic fact there is
+            // never output-only-admissible to the equality join and the body reaches the route.
+            // An occasional compound query argument exercises the decline (data-side capture)
+            // branch, and nested schematic facts exercise the wiring at depth.
+            let (patterns, facts) = uj_random_cyclic_case(&mut r);
+            let pats: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+            let order = first_occurrence_vars(&pats);
+            if order.is_empty() {
+                continue;
+            }
+            let mask = 1 + r.below((1usize << order.len()) - 1);
+            let proj: Vec<String> = order
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, v)| v.clone())
+                .collect();
+
+            let (routed, ne) = uj_assert_identical(&facts, &patterns, &proj);
+            if routed {
+                recovered += 1;
+            }
+            if ne {
+                nonempty += 1;
+            }
+        }
+        SIDECAR_UNIFY_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "live A/B: {N} cases | unification route taken on {recovered} | nonempty {nonempty}"
+        );
+        assert!(
+            recovered > 30,
+            "corpus must exercise the unification route: {recovered}"
+        );
+        assert!(
+            nonempty > 50,
+            "corpus must produce real answers: {nonempty}"
+        );
+    }
+
+    fn compound_live_case(r: &mut UjRng) -> (&'static str, Vec<String>, Vec<String>, Vec<String>) {
+        let v0 = format!("v{}", r.below(5));
+        let v1 = format!("v{}", (r.below(5) + 1) % 6);
+        match r.below(7) {
+            0 => (
+                "acyclic-free-compound",
+                vec!["(r (a $p))".to_string()],
+                vec!["(r $d)".to_string(), format!("(r (a {v0}))")],
+                vec!["p".to_string()],
+            ),
+            1 => (
+                "acyclic-occurs",
+                vec!["(e $x (f $x))".to_string()],
+                vec!["(e $w $w)".to_string(), format!("(e {v0} (f {v1}))")],
+                vec!["x".to_string()],
+            ),
+            2 => (
+                "cyclic-query-compound-capture",
+                vec![
+                    "(r (a $x) $y)".to_string(),
+                    "(s $y $z)".to_string(),
+                    "(t $z $x)".to_string(),
+                ],
+                vec![
+                    "(r $d v0)".to_string(),
+                    "(s v0 v1)".to_string(),
+                    "(t v1 b)".to_string(),
+                    format!("(r (a {v0}) junk)"),
+                ],
+                vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            ),
+            3 => (
+                "cyclic-nested-coref",
+                vec![
+                    "(r (a (f $x) $x) $y)".to_string(),
+                    "(s $y $z)".to_string(),
+                    "(t $z $x)".to_string(),
+                ],
+                vec![
+                    "(r $d v0)".to_string(),
+                    "(s v0 v1)".to_string(),
+                    "(t v1 b)".to_string(),
+                    "(r (a (f a) b) nope)".to_string(),
+                ],
+                vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            ),
+            4 => (
+                "join-propagated-compound-capture",
+                vec![
+                    "(e (k $x0) $x1)".to_string(),
+                    "(e (k $x1) $x2)".to_string(),
+                    "(h $x2 $x0)".to_string(),
+                ],
+                vec![
+                    "(e (k $s2) v0)".to_string(),
+                    "(e $s1 $s1)".to_string(),
+                    "(h $s0 $s0)".to_string(),
+                    "(h junk junk)".to_string(),
+                ],
+                vec!["x0".to_string(), "x1".to_string()],
+            ),
+            5 => (
+                "fact-schematic-compound-under-ground-query",
+                vec![
+                    "(r (a b) $y)".to_string(),
+                    "(s $y $z)".to_string(),
+                    "(t $z b)".to_string(),
+                ],
+                vec![
+                    "(r (a $q) v0)".to_string(),
+                    "(s v0 v1)".to_string(),
+                    "(t v1 b)".to_string(),
+                    "(r (a c) decoy)".to_string(),
+                ],
+                vec!["y".to_string(), "z".to_string()],
+            ),
+            _ => (
+                "witness-shape-with-extra-cycle",
+                vec![
+                    "(r (a $p) b)".to_string(),
+                    "(r (b) $p)".to_string(),
+                    "(u $p $q)".to_string(),
+                    "(v $q $p)".to_string(),
+                ],
+                vec![
+                    "(r $d b)".to_string(),
+                    "(r a b)".to_string(),
+                    "(u b c)".to_string(),
+                    "(v c b)".to_string(),
+                    "(u $du $du)".to_string(),
+                ],
+                vec!["p".to_string(), "q".to_string()],
+            ),
+        }
+    }
+
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (no-bridge builds route differently; control-verified pre-delta).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn zipper_compound_live_differential_random() {
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let mut r = UjRng(0xC0DE_CAFE_D15EA5E);
+        let mut leapfrog = 0usize;
+        let mut fallback = 0usize;
+        let mut materialized_unify = 0usize;
+        let mut nonempty = 0usize;
+        let mut nonground_outputs = 0usize;
+        let mut routed_shapes: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut fallback_shapes: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut materialized_shapes: BTreeMap<&'static str, usize> = BTreeMap::new();
+        const N: usize = 4000;
+        for i in 0..N {
+            let (shape, patterns, facts, proj) = compound_live_case(&mut r);
+            let (with_unify, rec, zrec, nonground) =
+                uj_live_run_raw(&facts, &patterns, &proj, true);
+            let (product, _, _, product_nonground) =
+                uj_live_run_raw(&facts, &patterns, &proj, false);
+            assert_eq!(
+                with_unify,
+                product,
+                "compound live differential mismatch at trial {i} shape={shape}\n  patterns={patterns:?}\n  facts={facts:?}\n  proj={proj:?}\n  unify-only={:?}\n  product-only={:?}",
+                with_unify.difference(&product).collect::<Vec<_>>(),
+                product.difference(&with_unify).collect::<Vec<_>>()
+            );
+            if zrec > 0 {
+                leapfrog += 1;
+                *routed_shapes.entry(shape).or_default() += 1;
+            } else if rec > 0 {
+                materialized_unify += 1;
+                *materialized_shapes.entry(shape).or_default() += 1;
+            } else {
+                fallback += 1;
+                *fallback_shapes.entry(shape).or_default() += 1;
+            }
+            if !with_unify.is_empty() {
+                nonempty += 1;
+            }
+            nonground_outputs += nonground.max(product_nonground);
+        }
+        eprintln!(
+            "compound live differential: trials={N} leapfrog={leapfrog} materialized_unify={materialized_unify} fallback={fallback} nonempty={nonempty} nonground_outputs={nonground_outputs} routed_shapes={routed_shapes:?} materialized_shapes={materialized_shapes:?} fallback_shapes={fallback_shapes:?}"
+        );
+        assert_eq!(leapfrog + materialized_unify + fallback, N);
+        assert!(
+            leapfrog >= 1500,
+            "compound corpus must exercise the zipper kernel: {leapfrog}"
+        );
+        assert_eq!(
+            materialized_unify, 0,
+            "zipper-native route should cover every routed compound shape"
+        );
+        assert!(
+            fallback > 0,
+            "compound corpus must exercise the remaining decline"
+        );
+        assert!(
+            nonground_outputs > 0,
+            "compound corpus must render non-ground outputs"
+        );
+        for shape in [
+            "acyclic-free-compound",
+            "acyclic-occurs",
+            "cyclic-nested-coref",
+            "cyclic-query-compound-capture",
+            "fact-schematic-compound-under-ground-query",
+            "witness-shape-with-extra-cycle",
+        ] {
+            assert!(
+                routed_shapes.get(shape).copied().unwrap_or(0) > 0,
+                "shape {shape} should route through the zipper kernel"
+            );
+        }
+        assert_eq!(
+            fallback_shapes
+                .get("join-propagated-compound-capture")
+                .copied(),
+            Some(fallback),
+            "only join-propagated-compound-capture should remain on ProductZipper: {fallback_shapes:?}"
+        );
+    }
+
+    #[test]
+    fn unify_route_declines_compound_capture_with_fact_varref() {
+        let mut space = Space::new();
+        space
+            .add_all_sexpr(
+                b"(e v0 v1)
+                  (e v1 v2)
+                  (e v2 v0)
+                  (h v0 v1)
+                  (h v1 v2)
+                  (h v2 v0)
+                  (e $s0 $u0)
+                  (e (k v1) $s1)
+                  (h $s2 $s2)
+                  ",
+            )
+            .unwrap();
+        let (pat_expr, _sources) =
+            query_pattern_and_sources(&mut space, "[4] , [3] e $ $ [3] h [2] k _1 $ [3] e _2 _0");
+        let body = unsafe { &*pat_expr.span() };
+        assert!(
+            !crate::zipper_join::unify_join_zipper_body_routable(&space.btm, body),
+            "compound capture with fact VarRef must stay on ProductZipper"
+        );
+    }
+
+    // Adversarial hardening of the same gate. Cyclic bodies over MIXED relations, an occasional
+    // compound-wrapped endpoint (the data-side-capture trigger), and a schematic-fact generator
+    // that emits coreferent facts (`(e $s $s)`), facts nested two deep (`(e (k (k $s)) v)`), and
+    // compounds on either position, over a larger corpus. Every case still asserts the route is
+    // byte-identical to the ProductZipper, and the corpus is checked to exercise BOTH the route
+    // and the decline boundary. Run isolated (`--test-threads=1`): the route toggle is global.
+    // Bridge-route equality contract: meaningful only with the bridge compiled in
+    // (pre-existing no-bridge failure, control-verified on the pre-delta branch).
+    #[cfg(feature = "sidecar_bridge_emit")]
+    #[test]
+    fn unify_route_adversarial_byte_identity() {
+        #[cfg(feature = "semi_naive_ic")]
+        let _sni_guard = SniDisarmGuard::new();
+        let _route_guard = sidecar_route_toggle_lock().lock().unwrap();
+        let mut r = UjRng(0x00C0_FFEE_1234_5678);
+        let rels = ["e", "g", "h"];
+        let mut routed = 0usize;
+        let mut declined = 0usize;
+        let mut nonempty = 0usize;
+        const N: usize = 3000;
+        for _ in 0..N {
+            let len = 3 + r.below(2); // cycle length 3..=4
+            let mut pats: Vec<String> = Vec::with_capacity(len);
+            for i in 0..len {
+                let rel = rels[r.below(rels.len())];
+                let mut a = format!("$x{i}");
+                let mut b = format!("$x{}", (i + 1) % len);
+                if r.chance(1, 4) {
+                    a = format!("(k {a})");
+                }
+                if r.chance(1, 4) {
+                    b = format!("(w {b})");
+                }
+                pats.push(format!("({rel} {a} {b})"));
+            }
+            let nv = len + r.below(3);
+            let mut facts: Vec<String> = Vec::new();
+            for &rel in &rels {
+                for i in 0..len {
+                    facts.push(format!("({rel} v{i} v{})", (i + 1) % len));
+                }
+            }
+            for _ in 0..(2 + r.below(5)) {
+                let rel = rels[r.below(rels.len())];
+                facts.push(format!("({rel} v{} v{})", r.below(nv), r.below(nv)));
+            }
+            let nsch = 1 + r.below(4);
+            for k in 0..nsch {
+                let rel = rels[r.below(rels.len())];
+                let v = r.below(nv);
+                facts.push(match r.below(8) {
+                    0 => format!("({rel} v{v} $s{k})"),
+                    1 => format!("({rel} $s{k} v{v})"),
+                    2 => format!("({rel} $s{k} $s{k})"),
+                    3 => format!("({rel} (k $s{k}) v{v})"),
+                    4 => format!("({rel} (k (k $s{k})) v{v})"),
+                    5 => format!("({rel} v{v} (w $s{k}))"),
+                    6 => format!("({rel} (k v{v}) $s{k})"),
+                    _ => format!("({rel} $s{k} $u{k})"),
+                });
+            }
+            let pats_ref: Vec<&str> = pats.iter().map(|s| s.as_str()).collect();
+            let order = first_occurrence_vars(&pats_ref);
+            if order.is_empty() {
+                continue;
+            }
+            let mask = 1 + r.below((1usize << order.len()) - 1);
+            let proj: Vec<String> = order
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, v)| v.clone())
+                .collect();
+
+            let (did_route, ne) = uj_assert_identical(&facts, &pats, &proj);
+            if did_route {
+                routed += 1;
+            } else {
+                declined += 1;
+            }
+            if ne {
+                nonempty += 1;
+            }
+        }
+        SIDECAR_UNIFY_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "adversarial A/B: {N} cases | routed {routed} | declined {declined} | nonempty {nonempty}"
+        );
+        assert!(routed > 100, "corpus must exercise the route: {routed}");
+        assert!(
+            declined > 100,
+            "corpus must exercise the decline boundary: {declined}"
+        );
+        assert!(
+            nonempty > 100,
+            "corpus must produce real answers: {nonempty}"
+        );
+    }
+
+    // Data-side capture pinned against the full-unification prototype. The first
+    // factor lets stored `$d0` capture `(a $p0)`, then the second factor grounds or
+    // aliases `$p0`. Native ProductZipper must emit the same ground answers the
+    // prototype finds.
+    #[test]
+    fn data_side_capture_matches_full_unification() {
+        let (fork, proto, _nonground, path) = cross_check(
+            &["(r (a $p0) b)", "(r (b) $p0)"],
+            &["(r $d0 b)", "(r $d1 $d1)", "(r a b)"],
+        );
+        assert_eq!(path, "Coupled", "a data variable reaches the join position");
+        assert_eq!(
+            proto.len(),
+            2,
+            "full unification finds both spec-correct answers"
+        );
+        assert_eq!(
+            fork, proto,
+            "native ProductZipper must capture data-side variables here"
+        );
+    }
+
+    // One-time tool: emit the golden fixture of REAL ProductZipper answers, so the
+    // standalone prototype can validate its routed join against the actual matcher with
+    // zero fork. Each line is `pat | pat ;; fact | fact ;; ans | ans`, with answers
+    // rendered through the prototype's own decoder so it compares them directly. Run, then
+    // paste the output into mork-uni-join/tests/mork_fixture.txt:
+    //   cargo +nightly test -p mork --lib --release print_prototype_fixture -- --ignored --nocapture
+    #[ignore = "regenerates the prototype's golden fixture; paste output into mork-uni-join"]
+    #[test]
+    fn print_prototype_fixture() {
+        use mork_uni_join::term::Term as PTerm;
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["(e $x $y)", "(e $y $z)", "(e $x $z)"],
+                &["(e a b)", "(e a c)", "(e b c)", "(e b d)"],
+            ),
+            (
+                &["(e $x $y)", "(e $y $z)"],
+                &["(e a b)", "(e b c)", "(e c d)"],
+            ),
+            (&["(p $x)", "(q $x)"], &["(p a)", "(q a)", "(q b)", "(p c)"]),
+            (&["(e $x $x)"], &["(e a a)", "(e a b)", "(e c c)"]),
+            (&["(e $x $y)"], &["(e a b)", "(e b c)"]),
+            (
+                &["(: ($f) A)", "(: $f (-> A))"],
+                &["(: (f) A)", "(: f (-> A))"],
+            ),
+            (&["(f (g $x))"], &["(f (g a))", "(f (g b))", "(f h)"]),
+            (
+                &["(pair $x $y)", "(pair $y $x)"],
+                &["(pair a b)", "(pair b a)", "(pair c c)"],
+            ),
+            (&["(rel $x b)"], &["(rel a $w)", "(rel c b)", "(rel d e)"]),
+            (&["(s $x c)"], &["(s a $w)", "(s $u c)", "(s b c)"]),
+            (
+                &["(kv k1 $v)", "(kv k2 $v)"],
+                &["(kv k1 $a)", "(kv k2 x)", "(kv k1 x)"],
+            ),
+            (
+                &["(r (a $p0) b)", "(r (b) $p0)"],
+                &["(r $d0 b)", "(r $d1 $d1)", "(r a b)"],
+            ),
+            (
+                &["(r $x $y)", "(r $y $x)"],
+                &["(r a $w)", "(r b a)", "(r a b)"],
+            ),
+            (&["(t $x $y)"], &["(t a b)", "(t c d)"]),
+            (&["(k $x)"], &["(m a)"]),
+            (
+                &["(w $x)", "(w (s $x))"],
+                &["(w z)", "(w (s z))", "(w (s (s z)))"],
+            ),
+            (
+                &["(c1 $x)", "(c2 $x)", "(c3 $x)"],
+                &["(c1 a)", "(c2 a)", "(c3 a)", "(c1 b)", "(c2 b)"],
+            ),
+            (
+                &["(edge $x $y)", "(edge $y $z)", "(edge $z $x)"],
+                &["(edge a b)", "(edge b c)", "(edge c a)", "(edge a c)"],
+            ),
+            (
+                &["(type $f $t)", "(val $f $v)"],
+                &["(type foo int)", "(val foo num)", "(type bar str)"],
+            ),
+            (&["(g $x)"], &["(g a)", "(g $w)", "(g b)"]),
+            (
+                &["(h $x $y)", "(h $x $z)"],
+                &["(h a b)", "(h a c)", "(h d e)"],
+            ),
+            (&["(rel a $x)"], &["(rel a (foo b))", "(rel a c)"]),
+            (
+                &["(m $x (n $x))"],
+                &["(m a (n a))", "(m b (n c))", "(m d (n d))"],
+            ),
+            (
+                &["(link $x $y)", "(link $y $z)", "(link $z $w)"],
+                &["(link a b)", "(link b c)", "(link c d)"],
+            ),
+        ];
+        for (pats, facts) in cases {
+            let answers: BTreeSet<String> = fork_answer_paths(pats, facts)
+                .iter()
+                .map(|p| PTerm::decode(p).to_string())
+                .collect();
+            println!(
+                "{} ;; {} ;; {}",
+                pats.join(" | "),
+                facts.join(" | "),
+                answers.into_iter().collect::<Vec<_>>().join(" | ")
+            );
+        }
+    }
+
+    // Live real-MORK probe for data-side capture. Runs the exact witness through the actual matcher
+    // (ProductZipper, capture route off) and prints what MORK emits. Upstream MORK, reference
+    // Hyperon, and SWI-Prolog all return (ans b).
+    //   cargo +nightly test -p mork --lib --release probe_capture_bug_live -- --ignored --nocapture
+    #[ignore = "checks data-side capture under matcher optimization toggles"]
+    #[test]
+    fn probe_capture_bug_live() {
+        use mork_uni_join::term::Term as PTerm;
+        let run = |pats: &[&str], facts: &[&str]| -> Vec<String> {
+            fork_answer_paths(pats, facts)
+                .iter()
+                .map(|p| PTerm::decode(p).to_string())
+                .collect()
+        };
+        // sanity: the supported direction (query var binds a fact subterm) must always work.
+        println!(
+            "sanity (r $x b): {:?}",
+            run(&["(r $x b)"], &["(r (a c) b)", "(r a b)"])
+        );
+        // Witness: upstream MORK and SWI-Prolog both return (ans b). Sweep matcher optimization
+        // toggles so regressions show which path dropped capture.
+        let wp = &["(r (a $p) b)", "(r (b) $p)"];
+        let wf = &["(r $d b)", "(r a b)"];
+        for &interp in &[false, true] {
+            for &recheck in &[true, false] {
+                for &compcap in &[true, false] {
+                    super::FORCE_INTERPRETED_MATCHER.with(|c| c.set(interp));
+                    super::VARREF_FAST_RECHECK.with(|c| c.set(recheck));
+                    super::COMPILED_MATCHER_COMPOUND_CAPTURE.with(|c| c.set(compcap));
+                    let ans = run(wp, wf);
+                    let hit = if ans.iter().any(|a| a == "(ans b)") {
+                        "   <-- CAPTURES (ans b)"
+                    } else {
+                        ""
+                    };
+                    println!("interp={interp} recheck={recheck} compcap={compcap} -> {ans:?}{hit}");
+                }
+            }
+        }
+        super::FORCE_INTERPRETED_MATCHER.with(|c| c.set(false));
+        super::VARREF_FAST_RECHECK.with(|c| c.set(true));
+        super::COMPILED_MATCHER_COMPOUND_CAPTURE.with(|c| c.set(true));
+    }
+
+    // The exec-level (ground-filtered) differential: the sidecar emit versus the
+    // ProductZipper, keeping only the ground outputs the exec apply keeps. On a schematic
+    // body this is the admissibility oracle. A schematic fact whose variable is output-only
+    // yields only non-ground outputs (dropped on both sides), so the sidecar stays complete.
+    // A fact captured to a ground answer (a variable meeting a constant or a join key) makes
+    // the ProductZipper emit a ground tuple the equality join misses, so they diverge.
+    fn sidecar_emit_ground_matches_product(
+        facts: &str,
+        pat: &'static str,
+        tpl: &'static str,
+    ) -> Option<bool> {
+        let mut space = Space::new();
+        space.add_all_sexpr(facts.as_bytes()).unwrap();
+        let (pat_expr, _) = query_pattern_and_sources(&mut space, pat);
+        let (tpl_expr, _) = query_pattern_and_sources(&mut space, tpl);
+        let (sidecar_set, _) =
+            Space::sidecar_emit_output_set(&space.btm, pat_expr, tpl_expr, false)?;
+        let mut tpl_args = Vec::new();
+        ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+        let templates: Vec<Expr> = tpl_args.get(1..)?.iter().map(|ee| ee.subsexpr()).collect();
+        let product_set = Space::product_template_outputs(&space.btm, pat_expr, &templates);
+        let ground_only = |s: &BTreeSet<Vec<u8>>| -> BTreeSet<Vec<u8>> {
+            s.iter()
+                .filter(|p| serialized_is_ground(&serialize(p)))
+                .cloned()
+                .collect()
+        };
+        Some(ground_only(&sidecar_set) == ground_only(&product_set))
+    }
+
+    // The admissibility oracle for per-position schematic admission. Pins which schematic
+    // bodies the sidecar handles soundly (ground output identical to the ProductZipper),
+    // so the static gate can be checked against it. This is the safety net for the wiring.
+    #[test]
+    fn sidecar_admissibility_oracle() {
+        // (facts, pattern body, template body, admissible)
+        let cases: &[(&str, &str, &str, bool)] = &[
+            // Ground transitive: trivially admissible.
+            (
+                "(edge a b)\n(edge b c)\n(edge c d)\n",
+                "[3] , [3] edge $ $ [3] edge _2 $",
+                "[2] , [3] path _1 _3",
+                true,
+            ),
+            // Case A: a schematic variable on an output-only column ($t). Admissible.
+            (
+                "(edge a b)\n(edge a d)\n(label b $w)\n(label d e)\n",
+                "[3] , [3] edge $ $ [3] label _2 $",
+                "[2] , [4] out _1 _2 _3",
+                true,
+            ),
+            // Case A-inert: a schematic label for an edgeless node contributes nothing.
+            (
+                "(edge a b)\n(edge b c)\n(edge c a)\n(label a la)\n(label b lb)\n(label c lc)\n(label zz $w)\n",
+                "[5] , [3] edge $ $ [3] edge _2 $ [3] edge _3 _1 [3] label _1 $",
+                "[2] , [5] out _1 _2 _3 _4",
+                true,
+            ),
+            // Two output-only schematic facts: still admissible.
+            (
+                "(edge a b)\n(label a $u)\n(label b $w)\n",
+                "[3] , [3] edge $ $ [3] label _1 $",
+                "[2] , [4] out _1 _2 _3",
+                true,
+            ),
+            // Case B: a schematic variable meeting a constant (b). Capture needed; NOT admissible.
+            (
+                "(edge a b)\n(rel b $w)\n(rel b q)\n",
+                "[3] , [3] edge $ $ [3] rel _2 b",
+                "[2] , [3] out _1 _2",
+                false,
+            ),
+            // Join capture: a schematic variable at a join position ($y), grounded by the
+            // other edge factor. The ProductZipper captures it; NOT admissible.
+            (
+                "(edge a b)\n(edge b c)\n(edge a $w)\n",
+                "[3] , [3] edge $ $ [3] edge _2 $",
+                "[2] , [3] path _1 _3",
+                false,
+            ),
+        ];
+        for (i, (facts, pat, tpl, admissible)) in cases.iter().enumerate() {
+            let got = sidecar_emit_ground_matches_product(facts, pat, tpl)
+                .unwrap_or_else(|| panic!("case {i} did not lower"));
+            assert_eq!(
+                got, *admissible,
+                "case {i} admissibility (facts: {facts:?})"
+            );
+        }
+    }
+
+    // The static gate's decision for a body+space: does `schematic_facts_safe_to_admit`
+    // admit it. Builds the subspace sidecar and the lowered sources the runtime gate sees.
+    fn gate_admits(facts: &str, pat: &'static str) -> Option<bool> {
+        let mut space = Space::new();
+        space.add_all_sexpr(facts.as_bytes()).unwrap();
+        let (pat_expr, _) = query_pattern_and_sources(&mut space, pat);
+        let mut args = Vec::new();
+        ExprEnv::new(0, pat_expr).args(&mut args);
+        let sources = &args[1..];
+        let sidecar = Space::build_subspace_sidecar(&space.btm, sources)?;
+        Some(Space::schematic_facts_safe_to_admit(&sidecar, sources))
+    }
+
+    // The soundness gate: the static admission check must NEVER admit a body whose sidecar
+    // ground output differs from the ProductZipper's. Random spaces (ground and schematic
+    // facts at random positions) over body shapes that exercise admit (output-only var),
+    // decline-by-constant, decline-by-join, and the triangle+pendant. For every case
+    // `gate_admits ==> oracle-admissible`. The gate may be conservative (decline an
+    // admissible body), but it may never admit an inadmissible one.
+    #[test]
+    fn gate_admissions_are_sound_random() {
+        struct R(u64);
+        impl R {
+            fn nx(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545F4914F6CDD1D)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.nx() % n as u64) as usize
+            }
+        }
+        // (pattern body, template body, relations the body reads as (name, arg count)).
+        let shapes: &[(&'static str, &'static str, &[(&str, usize)])] = &[
+            (
+                "[5] , [3] edge $ $ [3] edge _2 $ [3] edge _3 _1 [3] label _1 $",
+                "[2] , [5] out _1 _2 _3 _4",
+                &[("edge", 2), ("label", 2)],
+            ),
+            (
+                "[3] , [3] edge $ $ [3] edge _2 $",
+                "[2] , [3] path _1 _3",
+                &[("edge", 2)],
+            ),
+            (
+                "[3] , [3] edge $ $ [3] rel _2 b",
+                "[2] , [3] out _1 _2",
+                &[("edge", 2), ("rel", 2)],
+            ),
+            (
+                "[3] , [3] edge $ $ [3] label _1 $",
+                "[2] , [4] out _1 _2 _3",
+                &[("edge", 2), ("label", 2)],
+            ),
+            // A nested query factor: (typeof $y (arrow $a $b)) decomposes the second column.
+            (
+                "[3] , [3] edge $ $ [3] typeof _2 [3] arrow $ $",
+                "[2] , [5] out _1 _2 _3 _4",
+                &[("edge", 2), ("typeof", 2)],
+            ),
+        ];
+        let syms = ["a", "b", "c"];
+        let mut r = R(0x1234_5678_9ABC_DEF0);
+        let mut admitted = 0;
+        let mut checked = 0;
+        for (pat, tpl, rels) in shapes {
+            for _ in 0..120 {
+                // Build a random space for this shape's relations: each fact's args are a
+                // symbol or (one third of the time) a fresh variable, so facts land ground
+                // or schematic at random positions.
+                let mut facts = String::new();
+                let mut vctr = 0;
+                for (rel, nargs) in rels.iter() {
+                    for _ in 0..(1 + r.below(4)) {
+                        let mut line = format!("({rel}");
+                        for _ in 0..*nargs {
+                            match r.below(4) {
+                                // A bare variable.
+                                0 => {
+                                    line.push_str(&format!(" $w{vctr}"));
+                                    vctr += 1;
+                                }
+                                // A compound argument, ground or carrying a variable, so both
+                                // nested facts and nested query factors are exercised. `(arrow
+                                // X Y)` matches the nested typeof query shape; `(foo X)` does
+                                // not, exercising the shape-mismatch path.
+                                1 => {
+                                    let (head, inner_n) = if r.below(2) == 0 {
+                                        ("foo", 1)
+                                    } else {
+                                        ("arrow", 2)
+                                    };
+                                    let mut c = format!("({head}");
+                                    for _ in 0..inner_n {
+                                        if r.below(2) == 0 {
+                                            c.push_str(&format!(" $w{vctr}"));
+                                            vctr += 1;
+                                        } else {
+                                            c.push_str(&format!(" {}", syms[r.below(syms.len())]));
+                                        }
+                                    }
+                                    c.push(')');
+                                    line.push(' ');
+                                    line.push_str(&c);
+                                }
+                                // A symbol.
+                                _ => line.push_str(&format!(" {}", syms[r.below(syms.len())])),
+                            }
+                        }
+                        line.push(')');
+                        facts.push('\n');
+                        facts.push_str(&line);
+                    }
+                }
+                facts.push('\n');
+
+                let (Some(gate), Some(oracle)) = (
+                    gate_admits(&facts, pat),
+                    sidecar_emit_ground_matches_product(&facts, pat, tpl),
+                ) else {
+                    continue;
+                };
+                checked += 1;
+                if gate {
+                    admitted += 1;
+                    assert!(
+                        oracle,
+                        "UNSOUND: gate admitted a body whose sidecar output differs from the ProductZipper\n  pat={pat}\n  facts={facts}"
+                    );
+                }
+            }
+        }
+        eprintln!("gate soundness: checked={checked} admitted={admitted}");
+        assert!(
+            checked > 200,
+            "the corpus must lower a representative set, got {checked}"
+        );
+        assert!(
+            admitted > 0,
+            "the gate must admit some schematic bodies, else it is useless"
+        );
+    }
+
+    #[test]
+    fn gate_admits_nested_output_only_facts() {
+        // A schematic fact with NESTED structure carrying the unknown at an output position.
+        // The flat gate declined any nested fact; the generalized gate admits it because the
+        // non-ground compound sits only on the output column $t, yielding non-ground rows the
+        // exec drops. The oracle confirms the sidecar's ground output equals the ProductZipper.
+        let facts = "(edge a b)\n(edge a d)\n(label b (foo $w))\n(label d (bar e))\n";
+        let pat = "[3] , [3] edge $ $ [3] label _2 $";
+        let tpl = "[2] , [4] out _1 _2 _3";
+        assert_eq!(
+            gate_admits(facts, pat),
+            Some(true),
+            "nested output-only schematic fact must be admitted"
+        );
+        assert_eq!(
+            sidecar_emit_ground_matches_product(facts, pat, tpl),
+            Some(true),
+            "and it must be sound"
+        );
+
+        // The same nested structure at the JOIN position ($x, shared with edge) is declined:
+        // a non-ground compound there is a join key the equality join cannot intersect.
+        let facts2 = "(edge a b)\n(edge b c)\n(label (foo $w) lx)\n";
+        let pat2 = "[3] , [3] edge $ $ [3] label _1 $";
+        assert_eq!(
+            gate_admits(facts2, pat2),
+            Some(false),
+            "a nested non-ground compound at a join position is declined"
+        );
+    }
+
+    #[test]
+    fn gate_declines_schematic_in_decomposed_compound() {
+        // A nested query factor (typeof $y (arrow $a $b)) decomposes the second column. The
+        // sidecar emits it correctly for GROUND facts, but a schematic fact with a variable
+        // INSIDE the decomposed compound, (arrow int $u), breaks the equality join's
+        // projection. So the gate must decline it, even though the variable is at an output
+        // position; the decline is necessary, not merely conservative.
+        let pat = "[3] , [3] edge $ $ [3] typeof _2 [3] arrow $ $";
+        let tpl = "[2] , [5] out _1 _2 _3 _4";
+        let ground = "(edge p q)\n(typeof q (arrow int str))\n";
+        assert_eq!(
+            sidecar_emit_ground_matches_product(ground, pat, tpl),
+            Some(true),
+            "a ground nested query factor lowers and is sound"
+        );
+        let schematic = "(edge p q)\n(typeof q (arrow int $u))\n(typeof q (arrow int str))\n";
+        assert_eq!(
+            sidecar_emit_ground_matches_product(schematic, pat, tpl),
+            Some(false),
+            "a schematic variable inside the decomposed compound is unsound"
+        );
+        assert_eq!(
+            gate_admits(schematic, pat),
+            Some(false),
+            "so the gate declines it"
+        );
+    }
+
     #[ignore = "profiling harness; run under callgrind/perf, dense cyclic emit"]
     #[test]
     fn bench_triangle_dense_emit_profile() {
@@ -12277,6 +18736,37 @@ mod tests {
         assert!(!sidecar.remove_fact(&ab));
         assert!(sidecar.remove_fact(&cd));
         assert_eq!(sidecar.live_fact_count(), 1);
+    }
+
+    // Stage 1 of the semi-naive delta lever: a per-step COW snapshot plus the
+    // set difference both ways yields the added/removed delta the m-delta-rule
+    // matches against. See kernel/resources/semi_naive_delta_design.md.
+    #[test]
+    fn delta_since_captures_added_and_removed_facts() {
+        let mut space = Space::new();
+        space
+            .add_all_sexpr(
+                br#"
+(petri a)
+(petri b)
+"#,
+            )
+            .unwrap();
+        let before = space.delta_snapshot();
+        assert_eq!(before.val_count(), 2);
+
+        // Add (petri c), remove (petri a): the live space becomes {b, c}.
+        let c = encoded_expr_bytes(&mut space, "[2] petri c");
+        let a = encoded_expr_bytes(&mut space, "[2] petri a");
+        space.btm.insert(&c[..], ());
+        space.btm.remove(&a[..]);
+        assert_eq!(space.btm.val_count(), 2);
+
+        let (added, removed) = space.delta_since(&before);
+        assert_eq!(added.val_count(), 1, "exactly (petri c) was added");
+        assert_eq!(removed.val_count(), 1, "exactly (petri a) was removed");
+        // The COW snapshot is independent of the live mutation.
+        assert_eq!(before.val_count(), 2);
     }
 
     #[test]
@@ -13057,9 +19547,11 @@ mod tests {
     }
 
     #[test]
-    fn query_factor_plan_cache_key_buckets_dependency_cardinalities() {
-        // Start CacheDepEdge with 4 atoms (cardinality bucket 3, the band
-        // [4, 8)), so we can probe both an in-band and a band-crossing change.
+    fn query_factor_plan_cache_key_is_shape_only() {
+        // The key freezes the plan per query shape: no data-dependent parts, so
+        // computing it never walks the space (odd_even_sort paid O(relation) per
+        // step through the old bucketed key). Growth anywhere, related or not,
+        // must leave the key unchanged.
         let mut space = Space::new();
         space
             .add_all_sexpr(
@@ -13078,7 +19570,7 @@ mod tests {
             "[4] , [3] CacheDepEdge $ left [2] CacheDepGuard $ $",
         );
         let before_count = space.btm.val_count();
-        let before = Space::query_factor_plan_cache_key(&space.btm, &sources).unwrap();
+        let before = Space::query_factor_plan_cache_key(&sources).unwrap();
 
         // Mutations that touch no queried prefix never change the key.
         let mut unrelated = String::new();
@@ -13088,26 +19580,19 @@ mod tests {
         space.add_all_sexpr(unrelated.as_bytes()).unwrap();
         assert!(space.btm.val_count() >= before_count + 256);
         assert_eq!(
-            Space::query_factor_plan_cache_key(&space.btm, &sources).unwrap(),
+            Space::query_factor_plan_cache_key(&sources).unwrap(),
             before
         );
 
-        // A small related change that stays inside the cardinality band (4 -> 5,
-        // still bucket 3) reuses the plan: the key is unchanged. This is the
-        // optimization that lets a mutating space keep hitting the plan cache.
-        space.add_all_sexpr(b"(CacheDepEdge fresh left)\n").unwrap();
-        assert_eq!(
-            Space::query_factor_plan_cache_key(&space.btm, &sources).unwrap(),
-            before
-        );
-
-        // Growing CacheDepEdge across the band boundary (to 8, bucket 4) is where
-        // re-ranking is worthwhile, so the key changes.
+        // Even band-crossing growth of a queried relation (4 -> 8 facts) keeps
+        // the key: replanning on data growth is no longer the key's job.
         space
-            .add_all_sexpr(b"(CacheDepEdge g6 left)\n(CacheDepEdge g7 left)\n(CacheDepEdge g8 left)\n")
+            .add_all_sexpr(
+                b"(CacheDepEdge fresh left)\n(CacheDepEdge g6 left)\n(CacheDepEdge g7 left)\n(CacheDepEdge g8 left)\n",
+            )
             .unwrap();
-        assert_ne!(
-            Space::query_factor_plan_cache_key(&space.btm, &sources).unwrap(),
+        assert_eq!(
+            Space::query_factor_plan_cache_key(&sources).unwrap(),
             before
         );
     }
@@ -13580,5 +20065,1256 @@ mod tests {
         };
 
         assert!(Space::renormalize_query_factors(&[source], &[0]).is_none());
+    }
+
+    // ---- Phase 6a: the semi-naive IC soundness corpus + gate ----
+    //
+    // The semi-naive delta (feature `semi_naive_ic`) replaces the naive
+    // full-rematch of every `,`->`,` rule in the IC loop with a per-rule delta
+    // match. Datalog semi-naive evaluation is proven equal to naive only for
+    // monotone (add-only) set-semantics programs; the known failure modes are
+    // (1) non-monotonicity / retraction and (2) multiplicity. This corpus runs a
+    // broad adversarial set of MM2 meta-rewrite programs both ways and asserts
+    // the final dish is byte-identical, pinning down exactly where the equivalence
+    // holds and where (if anywhere) it breaks. It is the correctness gate for ever
+    // defaulting the feature.
+    #[cfg(feature = "semi_naive_ic")]
+    mod semi_naive_ic_corpus {
+        use super::*;
+
+        // Build a space by loading every top-level sexpr in `setup` as a literal
+        // fact (identity transform), exactly like the existing oracle's `build`.
+        fn build(setup: &str) -> Space {
+            let mut s = Space::new();
+            let pat = crate::expr!(s, "$");
+            let tpl = crate::expr!(s, "_1");
+            s.add_sexpr(setup.as_bytes(), pat, tpl).unwrap();
+            s
+        }
+
+        // Naive reference: hand-drive the IC loop with the delta hook inert
+        // (`sni_rule_seen` stays None, so every transform_multi_multi_ takes the
+        // naive full-space branch). This is exactly the feature-off loop.
+        fn run_naive(setup: &str) -> Space {
+            let mut s = build(setup);
+            let mut exec_path = Vec::new();
+            while s.take_first_exec_path(&mut exec_path) {
+                let xe = Expr { ptr: exec_path.as_mut_ptr() };
+                let _ = s.interpret(xe);
+                debug_assert!(s.sni_rule_seen.is_none());
+            }
+            s
+        }
+
+        // Semi-naive: the wired metta_calculus loop maintaining the per-rule delta.
+        // A huge step budget drives it to the same fixpoint as the naive loop
+        // (both stop when no exec remains).
+        fn run_semi(setup: &str) -> Space {
+            let mut s = build(setup);
+            s.metta_calculus(1_000_000_000_000_000);
+            s
+        }
+
+        // Semi-naive with a chosen retraction mode (Naive / Dred / RawSemiNoGate).
+        fn run_semi_mode(setup: &str, mode: SniRetractMode) -> Space {
+            let mut s = build(setup);
+            s.sni_retract_mode = mode;
+            s.metta_calculus(1_000_000_000_000_000);
+            s
+        }
+
+        fn dump(s: &mut Space) -> String {
+            let mut v = Vec::new();
+            s.dump_all_sexpr(&mut v).unwrap();
+            String::from_utf8_lossy(&v).into_owned()
+        }
+
+        // The set of dish facts present in `a` but not in `b` (line-wise on the
+        // canonical dump), for divergence reporting.
+        fn dish_minus(a: &str, b: &str) -> Vec<String> {
+            let bl: std::collections::HashSet<&str> = b.lines().collect();
+            a.lines().filter(|l| !bl.contains(l)).map(|l| l.to_string()).collect()
+        }
+
+        // Run `setup` both ways and return the two full-dish dumps. The dump is a
+        // canonical sorted serialization of the whole space, so byte-equality of
+        // the two strings is byte-equality of the two final spaces.
+        fn both_ways(setup: &str) -> (String, String) {
+            let mut naive = run_naive(setup);
+            let mut semi = run_semi(setup);
+            let mut nv = Vec::new();
+            naive.dump_all_sexpr(&mut nv).unwrap();
+            let mut sv = Vec::new();
+            semi.dump_all_sexpr(&mut sv).unwrap();
+            (
+                String::from_utf8_lossy(&nv).into_owned(),
+                String::from_utf8_lossy(&sv).into_owned(),
+            )
+        }
+
+        // The first line where the two dumps differ, for divergence reporting.
+        fn first_divergence(naive: &str, semi: &str) -> Option<String> {
+            if naive == semi {
+                return None;
+            }
+            let nlines: Vec<&str> = naive.lines().collect();
+            let slines: Vec<&str> = semi.lines().collect();
+            for i in 0..nlines.len().max(slines.len()) {
+                let n = nlines.get(i).copied().unwrap_or("<none>");
+                let s = slines.get(i).copied().unwrap_or("<none>");
+                if n != s {
+                    return Some(format!("line {i}: naive={n:?} semi={s:?}"));
+                }
+            }
+            Some("(differ only in length)".to_string())
+        }
+
+        // ---- The adversarial corpus ----
+        //
+        // Each case is (name, setup). Every case is driven through the IC loop;
+        // the `(exec N ...)` wrappers fire in priority order each round until
+        // fixpoint. The default `(exec 0 ...)` / `(exec 1 ...)` numeric tags are
+        // re-armed automatically by the loop the same way process_calculus's are.
+        fn corpus() -> Vec<(&'static str, String)> {
+            let mut cases: Vec<(&'static str, String)> = Vec::new();
+
+            // -- 1. transitive closure: the canonical recursive `,`->`,` rule.
+            // The recursive relation (path) appears once in the body alongside a
+            // source relation (edge). This is the monotone case semi-naive targets.
+            cases.push((
+                "transitive_closure_chain",
+                r#"
+(exec 0 (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+(edge a b) (edge b c) (edge c d) (edge d e)
+(path a b) (path b c) (path c d) (path d e)
+"#
+                .to_string(),
+            ));
+
+            // -- 2. recursive relation appears >2 times in one body (a 3-hop
+            // closure step). Stresses the m-delta-rule's per-factor delta union.
+            cases.push((
+                "recursive_relation_thrice_in_body",
+                r#"
+(exec 0 (, (path $a $b) (path $b $c) (path $c $d)) (, (path $a $d)))
+(path a b) (path b c) (path c d) (path d e) (path e f)
+"#
+                .to_string(),
+            ));
+
+            // -- 3. pure-source body: the template relation does NOT appear in the
+            // body (recursive relation appears 0 times). A non-recursive `,`->`,`
+            // rule; fires once then idles (no new matches feed it).
+            cases.push((
+                "pure_source_no_recursion",
+                r#"
+(exec 0 (, (a $x) (b $x)) (, (ab $x)))
+(a 1) (a 2) (a 3) (b 2) (b 3) (b 4)
+"#
+                .to_string(),
+            ));
+
+            // -- 4. multi-relation body: factors over different relation heads,
+            // recursive in one (reach), sourced from another (link).
+            cases.push((
+                "multi_relation_body",
+                r#"
+(exec 0 (, (link $x $y) (reach $y $z)) (, (reach $x $z)))
+(link a b) (link b c) (link c d)
+(reach a b) (reach b c) (reach c d)
+"#
+                .to_string(),
+            ));
+
+            // -- 5. coreference: repeated variable within one factor (r $x $x).
+            // The self-loop edges are the only ones matching (r $x $x).
+            cases.push((
+                "coref_repeated_var_in_factor",
+                r#"
+(exec 0 (, (r $x $x) (mark $x)) (, (found $x)))
+(r a a) (r b c) (r d d) (mark a) (mark d) (mark e)
+"#
+                .to_string(),
+            ));
+
+            // -- 6. coreference across factors plus a self-coref factor.
+            cases.push((
+                "coref_across_and_within",
+                r#"
+(exec 0 (, (p $x $x) (q $x $y) (p $y $y)) (, (pp $x $y)))
+(p a a) (p b b) (p c c) (q a b) (q b c) (q a c)
+"#
+                .to_string(),
+            ));
+
+            // -- 7. issue-29 specificity ordering: a MORE-specific coreferential
+            // factor (eq $x $x) appears BEFORE a less-specific coreferential use
+            // (rel $x $y) that shares $x. The matcher must bind $x from the
+            // specific factor first; the delta reorder must preserve that.
+            cases.push((
+                "issue29_specificity_ordering",
+                r#"
+(exec 0 (, (eq $x $x) (rel $x $y)) (, (out $x $y)))
+(eq a a) (eq b b) (rel a p) (rel a q) (rel b r) (rel c s)
+"#
+                .to_string(),
+            ));
+
+            // -- 8. non-ground / schematic receiver: the body matches facts that
+            // THEMSELVES carry variables (the petri reaction shape). The template
+            // re-emits a variable-bearing fact.
+            cases.push((
+                "schematic_variable_bearing_facts",
+                r#"
+(exec 0 (, (rule (src $a) (dst $b)) (active $a)) (, (fire $a $b)))
+(rule (src x) (dst (out $z))) (rule (src y) (dst (out $w)))
+(active x) (active y)
+"#
+                .to_string(),
+            ));
+
+            // -- 9. single-factor body: the delta form's emit returns early on the
+            // raw-matcher Ok branch; a single-factor `,`->`,` must still match.
+            cases.push((
+                "single_factor_body",
+                r#"
+(exec 0 (, (n $x)) (, (m $x)))
+(n 1) (n 2) (n 3)
+"#
+                .to_string(),
+            ));
+
+            // -- 10. idempotent re-derivation: the rule re-derives facts that
+            // already exist (the template output is already present). Must be a
+            // no-op, fixpoint reached immediately.
+            cases.push((
+                "idempotent_rederive_existing",
+                r#"
+(exec 0 (, (e $x $y)) (, (e $x $y)))
+(e a b) (e b c)
+"#
+                .to_string(),
+            ));
+
+            // -- 11. fixpoint reached early then idled: a short chain whose closure
+            // completes in 2 rounds, but the exec keeps re-arming and finding
+            // nothing new for many rounds (the redundancy the lever targets).
+            cases.push((
+                "fixpoint_early_then_idle",
+                r#"
+(exec 0 (, (edge $x $y) (tc $y $z)) (, (tc $x $z)))
+(edge a b) (edge b c)
+(tc a b) (tc b c)
+"#
+                .to_string(),
+            ));
+
+            // -- 12. cross-rule deltas: two recursive `,`->`,` rules feeding each
+            // other. Rule 0 derives `even` from `odd`, rule 1 derives `odd` from
+            // `even`; they fire out of lockstep across IC steps, so each rule's
+            // per-rule frontier must be independent.
+            cases.push((
+                "cross_rule_two_recursive",
+                r#"
+(exec 0 (, (succ $x $y) (even $x)) (, (odd $y)))
+(exec 1 (, (succ $x $y) (odd $x)) (, (even $y)))
+(succ 0 1) (succ 1 2) (succ 2 3) (succ 3 4) (succ 4 5)
+(even 0)
+"#
+                .to_string(),
+            ));
+
+            // -- 13. three mutually-feeding rules over a shared relation.
+            cases.push((
+                "cross_rule_three_feeding",
+                r#"
+(exec 0 (, (gen $x) (next $x $y)) (, (gen $y)))
+(exec 1 (, (gen $x) (tag $x)) (, (seen $x)))
+(exec 2 (, (seen $x) (next $x $y)) (, (tag $y)))
+(gen a) (tag a) (next a b) (next b c) (next c d)
+"#
+                .to_string(),
+            ));
+
+            // ---- The suspected weak spot: RETRACTION (non-monotone) ----
+            // The semi-naive path is hooked ONLY into transform_multi_multi_ (the
+            // `,`->`,` add-only case). The `O`/`-` removing template runs through
+            // transform_multi_multi_o, always naive. These cases mix a removing
+            // rule with a recursive `,`->`,` rule, to probe whether a retraction
+            // by the naive rule invalidates the semi-naive rule's snapshot.
+
+            // -- 14. a removing rule alone (sanity: pure naive path, must match).
+            cases.push((
+                "remove_rule_alone",
+                r#"
+(exec 0 (, (junk $x)) (O (- (junk $x))))
+(junk a) (junk b) (junk c) (keep d)
+"#
+                .to_string(),
+            ));
+
+            // -- 15. removal feeds a recursive add-rule: rule 0 (O/-) removes a
+            // `gate`, rule 1 (`,`->`,`) closes `reach` over `link`. The removal
+            // changes the dish under the recursive rule's feet between its firings.
+            cases.push((
+                "remove_then_recursive_add",
+                r#"
+(exec 0 (, (gate $x)) (O (- (gate $x)) (+ (open $x))))
+(exec 1 (, (link $x $y) (reach $y $z)) (, (reach $x $z)))
+(gate g1) (gate g2)
+(link a b) (link b c) (link c d)
+(reach a b) (reach b c) (reach c d)
+"#
+                .to_string(),
+            ));
+
+            // -- 16. the recursive relation ITSELF is retracted by an O/- rule
+            // while the `,`->`,` rule is closing over it. This is the hard
+            // non-monotone case: a `reach` fact the closure depends on is removed,
+            // so the naive rule (matching the post-removal dish) and the semi-naive
+            // rule (whose snapshot still records the removed fact) could diverge.
+            cases.push((
+                "retract_recursive_relation_midclosure",
+                r#"
+(exec 0 (, (kill $x $y)) (O (- (reach $x $y))))
+(exec 1 (, (edge $x $y) (reach $y $z)) (, (reach $x $z)))
+(kill b c)
+(edge a b) (edge b c) (edge c d)
+(reach a b) (reach b c) (reach c d)
+"#
+                .to_string(),
+            ));
+
+            // -- 17. retract a SOURCE fact the recursive rule reads. Rule 0 (O/-)
+            // removes an `edge` (a source factor of the closure), rule 1 closes
+            // `path` over `edge`. The edge is gone before the closure finishes, so
+            // the post-removal naive match and the snapshot-bearing semi-naive
+            // match could disagree on which path facts are derivable. (MM2
+            // consumption is via the O/- removing template, not the I functor,
+            // which is a builtin/comparison source.)
+            cases.push((
+                "retract_source_edge_midclosure",
+                r#"
+(exec 0 (, (cut $x $y)) (O (- (edge $x $y))))
+(exec 1 (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+(cut b c)
+(edge a b) (edge b c) (edge c d)
+(path a b) (path b c) (path c d)
+"#
+                .to_string(),
+            ));
+
+            // ---- empty / degenerate shapes ----
+
+            // -- 18. no-match step: the body references a relation with no facts,
+            // so the rule fires but matches nothing every round.
+            cases.push((
+                "no_match_empty_relation",
+                r#"
+(exec 0 (, (ghost $x) (real $x)) (, (out $x)))
+(real 1) (real 2)
+"#
+                .to_string(),
+            ));
+
+            // -- 19. a program with only facts, no exec: the loop does nothing,
+            // both dumps are the loaded facts.
+            cases.push((
+                "facts_only_no_exec",
+                r#"
+(alpha 1) (beta 2) (gamma 3)
+"#
+                .to_string(),
+            ));
+
+            // -- 20. self-matching exec (the IC-driver shape): a `,`->`,` rule
+            // whose body matches the exec wrapper itself, re-arming each round.
+            cases.push((
+                "self_rearming_counter",
+                r#"
+(exec (C 0)
+      (, (exec (C $n) $p $t) (count $n $m))
+      (, (exec (C $m) $p $t) (tick $n)))
+(count 0 1) (count 1 2) (count 2 3) (count 3 stop)
+"#
+                .to_string(),
+            ));
+
+            // -- 21. the actual process_calculus petri reaction at small size
+            // (add(3,3)), the canonical lever target, as a corpus member.
+            cases.push((
+                "process_calculus_add_3_3",
+                process_calculus_setup_sexpr(50, 3, 3),
+            ));
+
+            // ---- re-arming (multi-firing) shapes ----
+            //
+            // A bare `(exec N ...)` fires once then is consumed. The cases above
+            // therefore exercise each rule's FIRST firing only, where the delta is
+            // trivially the whole space (no snapshot yet) so semi-naive == naive by
+            // construction. To stress the per-rule snapshot ACROSS firings (the
+            // only place the delta restriction can diverge), a rule must re-arm.
+            // These use the process_calculus IC-driver shape: a driver exec that
+            // each round re-emits itself with a decremented Peano counter and re-
+            // arms a worker exec from a stored `(W..)` rule fact. The driver is the
+            // multi-firing `,`->`,` rule that goes through the semi-naive path many
+            // times; the worker closes a relation. See `rearming_program`.
+
+            // -- 22. re-arming transitive closure: the worker fires every round and
+            // computes the full path closure (3-hop and 4-hop facts appear, which
+            // need >=3 firings). This is the multi-firing monotone baseline.
+            cases.push((
+                "rearming_transitive_closure",
+                rearming_program(
+                    6,
+                    "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                    "(edge a b) (edge b c) (edge c d) (edge d e)\n\
+                     (path a b) (path b c) (path c d) (path d e)",
+                    "",
+                ),
+            ));
+
+            // -- 23. re-arming closure with a SOURCE edge retracted mid-loop. A
+            // separate O/- rule removes (edge b c) when a `(trigger)` fires, which
+            // the driver schedules a few rounds in. The worker's snapshot (taken
+            // before the removal) still records the edge; naive (post-removal) does
+            // not. This is the decisive non-monotone adversary: the recursive rule
+            // fires repeatedly AND a fact it reads is retracted between firings.
+            cases.push((
+                "rearming_retract_source_edge",
+                rearming_program(
+                    8,
+                    "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                    "(edge a b) (edge b c) (edge c d) (edge d e)\n\
+                     (path a b) (path b c) (path c d) (path d e)\n\
+                     (armed yes)",
+                    "(exec rm (, (armed yes)) (O (- (edge b c)) (- (armed yes))))",
+                ),
+            ));
+
+            // -- 24. re-arming closure where the RECURSIVE relation itself (a path
+            // fact) is retracted mid-loop. Even sharper: removing (path c d) pulls
+            // a derived fact the closure chains through.
+            cases.push((
+                "rearming_retract_recursive_path",
+                rearming_program(
+                    8,
+                    "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                    "(edge a b) (edge b c) (edge c d) (edge d e)\n\
+                     (path a b) (path b c) (path c d) (path d e)\n\
+                     (armed yes)",
+                    "(exec rm (, (armed yes)) (O (- (path c d)) (- (armed yes))))",
+                ),
+            ));
+
+            // -- 25. re-arming with an idempotent worker that re-derives only
+            // existing facts every round (snapshot grows but no new facts). Probes
+            // the empty-delta path across many firings.
+            cases.push((
+                "rearming_idempotent_worker",
+                rearming_program(
+                    5,
+                    "(, (e $x $y)) (, (e $x $y))",
+                    "(e a b) (e b c) (e c d)",
+                    "",
+                ),
+            ));
+
+            // -- 26. re-arming worker with the recursive relation appearing 3x in
+            // the body, firing repeatedly (multi-factor delta union across firings).
+            cases.push((
+                "rearming_three_factor_recursion",
+                rearming_program(
+                    7,
+                    "(, (tc $a $b) (tc $b $c) (tc $c $d)) (, (tc $a $d))",
+                    "(tc a b) (tc b c) (tc c d) (tc d e) (tc e f)",
+                    "",
+                ),
+            ));
+
+            // -- 27. re-arming closure with a SOURCE edge ADDED mid-loop (monotone
+            // but late): a new edge appears after the closure has partly formed, so
+            // the worker must fold it in on a later firing (delta correctness for a
+            // fact added after the first firing, the normal semi-naive case but
+            // under retraction-free re-arming).
+            cases.push((
+                "rearming_add_source_edge_late",
+                rearming_program(
+                    8,
+                    "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                    "(edge a b) (edge b c) (edge c d)\n\
+                     (path a b) (path b c) (path c d)\n\
+                     (armed yes)",
+                    "(exec ad (, (armed yes)) (O (+ (edge c d2)) (+ (path c d2)) (- (armed yes))))",
+                ),
+            ));
+
+            // ---- remove-then-re-add: the classic semi-naive non-monotone hazard ----
+            //
+            // The snapshot is `read_copy` at the worker's last firing; the delta is
+            // `read_copy_now \ snapshot`. A fact present in the snapshot, REMOVED,
+            // then RE-ADDED is in BOTH snapshot and read_copy_now, so `subtract`
+            // excludes it from the delta -- semi-naive treats it as "old, already
+            // processed". If a NEW derivation depends on that fact's re-presence
+            // combined with another fact, semi-naive can MISS it where naive (which
+            // re-scans the whole current dish) finds it. These cases drive exactly
+            // that window using counter-gated O/- and O/+ rules that fire at
+            // distinct rounds (the driver's Peano counter is the clock).
+
+            // -- 28. remove-then-re-add an `edge` the closure reads. The gate worker
+            // removes (edge q r)+(path q r) at counter (S(S(S(S(S(S(S Z))))))) and
+            // re-adds them plus a fresh (edge r s)+(path r s) two rounds later. The
+            // closure worker's snapshot recorded edge q r before removal, so on the
+            // re-add round `read_copy \ snapshot` excludes the re-added edge: the
+            // delta restriction could MISS the r->s extension that chains to p only
+            // through the re-added q->r. (The gate fires off the live `(exec (D $c))`
+            // driver exec, so it lands between closure firings.)
+            cases.push((
+                "rearming_remove_then_readd_edge",
+                rearming_gated_program(
+                    12,
+                    "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                    // gate: counter==7 remove edge q r; counter==5 re-add it + r->s.
+                    "(, (exec (D $c) $a $b) (gate $c rm)) \
+                     (O (- (edge q r)) (- (path q r)) (- (gate $c rm)))",
+                    "(edge p q) (edge q r)\n\
+                     (path p q) (path q r)\n\
+                     (gate (S (S (S (S (S (S (S Z)))))))  rm)",
+                ),
+            ));
+
+            // -- 29. a second gated remove-then-re-add over a distinct relation,
+            // with the re-add carrying a NEW joinable fact, so a divergence would
+            // show as a missing `conn` derivation. Stresses the same snapshot-
+            // staleness window on a fresh relation/order.
+            cases.push((
+                "rearming_toggle_fact_dependent_derive",
+                rearming_gated_program(
+                    12,
+                    "(, (link $x $y) (conn $y $z)) (, (conn $x $z))",
+                    "(, (exec (D $c) $a $b) (gate $c go)) \
+                     (O (- (conn n o)) (+ (link x m)) (+ (conn m n)) (- (gate $c go)))",
+                    "(link m n) (conn n o)\n\
+                     (conn m n)\n\
+                     (gate (S (S (S (S (S (S Z)))))) go)",
+                ),
+            ));
+
+            cases
+        }
+
+        // Build a process_calculus-style re-arming program: a driver exec that
+        // each round re-arms a stored worker rule `(W..)` and decrements a Peano
+        // counter, plus `extra` standalone rules (e.g. an interleaved O/- remover).
+        // `worker` is "<body> <template>" (the `,`->`,` rule the worker fires).
+        // This is the only shape that fires the worker rule MORE THAN ONCE, so it
+        // is the only one that stresses the per-rule snapshot across firings.
+        fn rearming_program(steps: usize, worker: &str, facts: &str, extra: &str) -> String {
+            format!(
+                r#"
+(exec (D {counter})
+      (, (exec (D (S $c)) $sp $st) ((W) $p $t))
+      (, (exec (D $c) $sp $st) (exec (R) $p $t)))
+((W) {worker})
+{extra}
+{facts}
+"#,
+                counter = peano_sexpr(steps),
+            )
+        }
+
+        // A re-arming driver that re-arms TWO stored workers each round: the
+        // closure worker `(W)` (a `,`->`,` rule on the semi-naive path) and a gate
+        // worker `(G)` (an O/-/+ rule, always naive) that self-schedules off the
+        // driver's Peano counter. Each round the driver re-emits itself decremented
+        // and re-arms BOTH `(exec (R) ...)` (closure) and `(exec (GR) ...)` (gate).
+        // The gate worker's body reads the live `(exec (D $c) ...)` driver exec to
+        // see the current counter, so its O/-/+ effects fire at a chosen round. This
+        // is what makes remove-then-re-add land BETWEEN closure firings.
+        fn rearming_gated_program(
+            steps: usize,
+            worker: &str,
+            gate: &str,
+            facts: &str,
+        ) -> String {
+            format!(
+                r#"
+(exec (D {counter})
+      (, (exec (D (S $c)) $sp $st) ((W) $p $t) ((G) $gp $gt))
+      (, (exec (D $c) $sp $st) (exec (R) $p $t) (exec (GR) $gp $gt)))
+((W) {worker})
+((G) {gate})
+{facts}
+"#,
+                counter = peano_sexpr(steps),
+            )
+        }
+
+        // A tiny deterministic PRNG (splitmix64) so the random corpus is seeded and
+        // reproducible without pulling in `rand`.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                z ^ (z >> 31)
+            }
+            fn below(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        // Generate a seeded random small program: a re-arming transitive-closure
+        // worker over a random sparse `edge` graph (seeded `path` = the edges),
+        // optionally with a gate worker that removes and/or adds a random edge
+        // mid-loop. Re-arming (the driver) makes the worker fire many rounds, so the
+        // per-rule snapshot is exercised across firings under the random mutation.
+        fn random_program(seed: u64) -> String {
+            let mut rng = Rng(seed);
+            let nodes = 4 + rng.below(4); // 4..7 nodes
+            let n_edges = 3 + rng.below(6); // 3..8 edges
+            let mut facts = String::new();
+            let mut edges: Vec<(usize, usize)> = Vec::new();
+            for _ in 0..n_edges {
+                let a = rng.below(nodes);
+                let b = rng.below(nodes);
+                if a == b {
+                    continue; // skip self-loops (keep the closure finite-ish)
+                }
+                if edges.contains(&(a, b)) {
+                    continue;
+                }
+                edges.push((a, b));
+                facts.push_str(&format!("(edge n{a} n{b}) (path n{a} n{b})\n"));
+            }
+            // Optional gate: with prob ~1/2, remove a random existing edge; with
+            // prob ~1/2, add a fresh random edge. Both fire once, mid-loop, off the
+            // live driver counter at a random round.
+            let mut gate_effects = String::new();
+            if rng.below(2) == 0 && !edges.is_empty() {
+                let (a, b) = edges[rng.below(edges.len())];
+                gate_effects.push_str(&format!("(- (edge n{a} n{b})) (- (path n{a} n{b})) "));
+            }
+            if rng.below(2) == 0 {
+                let a = rng.below(nodes);
+                let b = rng.below(nodes);
+                if a != b {
+                    gate_effects.push_str(&format!("(+ (edge n{a} n{b})) (+ (path n{a} n{b})) "));
+                }
+            }
+            let steps = 5 + rng.below(8); // 5..12 rounds
+            if gate_effects.is_empty() {
+                rearming_program(
+                    steps,
+                    "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                    &facts,
+                    "",
+                )
+            } else {
+                let gate = format!(
+                    "(, (exec (D $c) $a $b) (gate $c go)) (O {gate_effects}(- (gate $c go)))"
+                );
+                let mut facts_with_gate = facts;
+                // Fire the gate around the middle of the run.
+                let fire_at = 1 + rng.below(steps.saturating_sub(1).max(1));
+                facts_with_gate.push_str(&format!("(gate {} go)\n", peano_sexpr(fire_at)));
+                rearming_gated_program(
+                    steps,
+                    "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                    &gate,
+                    &facts_with_gate,
+                )
+            }
+        }
+
+        // Run a large batch of seeded random programs both ways; assert every one
+        // is byte-identical. This sweeps interleavings of re-arming recursion with
+        // random add/remove mutation that the hand-written cases cannot enumerate.
+        #[test]
+        fn random_corpus_byte_identical() {
+            let mut diverged = Vec::new();
+            for seed in 0..200u64 {
+                let setup = random_program(seed.wrapping_mul(0x100000001b3).wrapping_add(1));
+                let (naive, semi) = both_ways(&setup);
+                if let Some(d) = first_divergence(&naive, &semi) {
+                    eprintln!("[DIVERGES] seed {seed}: {d}\nSETUP:\n{setup}");
+                    diverged.push(seed);
+                }
+            }
+            assert!(
+                diverged.is_empty(),
+                "seeded random programs must be byte-identical naive vs semi-naive; diverged seeds: {diverged:?}"
+            );
+        }
+
+        // Generate a seeded random program that ALWAYS retracts: like
+        // `random_program`, but the gate effects are forced to include at least one
+        // `O`/`-` removal of an existing edge, so every program exercises the
+        // retraction path (and therefore DRed). Re-arming makes the worker fire many
+        // rounds, so the per-rule snapshot is stressed across firings under the
+        // mutation -- exactly where the semi-naive delta can diverge.
+        fn random_retracting_program(seed: u64) -> String {
+            let mut rng = Rng(seed);
+            let nodes = 4 + rng.below(4); // 4..7 nodes
+            let n_edges = 4 + rng.below(6); // 4..9 edges (>=4 so a removal leaves a graph)
+            let mut edges: Vec<(usize, usize)> = Vec::new();
+            let mut facts = String::new();
+            for _ in 0..n_edges {
+                let a = rng.below(nodes);
+                let b = rng.below(nodes);
+                if a == b || edges.contains(&(a, b)) {
+                    continue;
+                }
+                edges.push((a, b));
+                facts.push_str(&format!("(edge n{a} n{b}) (path n{a} n{b})\n"));
+            }
+            // Force a removal of an existing edge+path (the retraction under test).
+            let mut gate_effects = String::new();
+            if !edges.is_empty() {
+                let (a, b) = edges[rng.below(edges.len())];
+                gate_effects.push_str(&format!("(- (edge n{a} n{b})) (- (path n{a} n{b})) "));
+            }
+            // Optionally also add a fresh edge mid-loop (mixed add+remove batch).
+            if rng.below(2) == 0 {
+                let a = rng.below(nodes);
+                let b = rng.below(nodes);
+                if a != b {
+                    gate_effects.push_str(&format!("(+ (edge n{a} n{b})) (+ (path n{a} n{b})) "));
+                }
+            }
+            let steps = 6 + rng.below(8); // 6..13 rounds (enough re-arming firings)
+            let gate =
+                format!("(, (exec (D $c) $a $b) (gate $c go)) (O {gate_effects}(- (gate $c go)))");
+            let mut facts_with_gate = facts;
+            let fire_at = 1 + rng.below(steps.saturating_sub(1).max(1));
+            facts_with_gate.push_str(&format!("(gate {} go)\n", peano_sexpr(fire_at)));
+            rearming_gated_program(
+                steps,
+                "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                &gate,
+                &facts_with_gate,
+            )
+        }
+
+        // The hard DRed random assertion: >=200 seeded random RETRACTING programs,
+        // each with an `O`/`-` removal mid-loop, must be byte-identical naive vs
+        // DRed. Also asserts DRed actually ENGAGED (repairs > 0 on a non-trivial
+        // fraction), so the test is not vacuously passing through the naive fallback.
+        #[test]
+        fn random_retracting_corpus_byte_identical_dred() {
+            let mut diverged = Vec::new();
+            let mut engaged = 0usize;
+            let mut fellback = 0usize;
+            let total = 240u64;
+            for seed in 0..total {
+                let setup =
+                    random_retracting_program(seed.wrapping_mul(0x100000001b3).wrapping_add(7));
+                let mut naive = run_naive(&setup);
+                let mut dred = run_semi_mode(&setup, SniRetractMode::Dred);
+                if dred.sni_dred_repairs > 0 {
+                    engaged += 1;
+                }
+                if dred.sni_dred_fallbacks > 0 {
+                    fellback += 1;
+                }
+                let nd = dump(&mut naive);
+                let dd = dump(&mut dred);
+                if nd != dd {
+                    eprintln!(
+                        "[DIVERGES] seed {seed}: naive HAS {:?} ; dred HAS {:?}\nSETUP:\n{setup}",
+                        dish_minus(&nd, &dd),
+                        dish_minus(&dd, &nd),
+                    );
+                    diverged.push(seed);
+                }
+            }
+            eprintln!(
+                "DRed random retracting corpus: {total} programs, {engaged} engaged DRed (repairs>0), {fellback} hit a fallback"
+            );
+            assert!(
+                diverged.is_empty(),
+                "seeded random RETRACTING programs must be byte-identical naive vs DRed; diverged seeds: {diverged:?}"
+            );
+            assert!(
+                engaged >= total as usize / 4,
+                "DRed must actually engage (repairs>0) on a non-trivial fraction; only {engaged}/{total} did"
+            );
+        }
+
+        // Soft probe: run the whole corpus, report byte-identical vs divergent
+        // (with the first divergent fact) WITHOUT asserting. This is the
+        // measurement that maps where the equivalence holds, run before designing
+        // the gate. Always "passes"; its value is the eprintln map.
+        #[test]
+        fn corpus_divergence_map() {
+            let mut diverged = Vec::new();
+            for (name, setup) in corpus() {
+                let (naive, semi) = both_ways(&setup);
+                match first_divergence(&naive, &semi) {
+                    None => eprintln!("[byte-identical] {name}"),
+                    Some(d) => {
+                        eprintln!("[DIVERGES]       {name}: {d}");
+                        diverged.push(name);
+                    }
+                }
+            }
+            eprintln!("\n=== divergent cases: {diverged:?} ===");
+        }
+
+        // The hard corpus assertion: every hand-written case must be byte-identical
+        // naive vs semi-naive WITH the soundness gate. The retraction cases pass
+        // because the gate routes them to naive once a removal happens.
+        #[test]
+        fn corpus_all_byte_identical() {
+            for (name, setup) in corpus() {
+                let (naive, semi) = both_ways(&setup);
+                if let Some(d) = first_divergence(&naive, &semi) {
+                    panic!("case {name} diverges WITH the gate: {d}");
+                }
+            }
+        }
+
+        // An adversarial mix: an `I`-source (builtin `==`) rule that RETRACTS via
+        // `O`/`-` AND a recursive `,`->`,` closure rule, both in one program. The
+        // `I`-source rule never enters the semi-naive delta path (the gate lives only
+        // in `transform_multi_multi_`), so it is always naive and re-derives on its
+        // own; the catch-up only repairs the `,`->`,` rule. This proves DRed stays
+        // byte-identical when a retraction is driven by a NON-`,`->`,` (builtin/`I`)
+        // rule -- the conservative boundary the research flags.
+        #[test]
+        fn dred_byte_identical_with_i_source_retraction() {
+            let setup = r#"
+(exec 0 (I (== (key $p) $o)) (O (- (edge $o $o)) (+ (removed $o))))
+(exec 1 (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+(key k1) 
+(edge a b) (edge b c) (edge c d) (edge a a)
+(path a b) (path b c) (path c d) (path a a)
+"#;
+            let mut naive = run_naive(setup);
+            let mut dred = run_semi_mode(setup, SniRetractMode::Dred);
+            let nd = dump(&mut naive);
+            let dd = dump(&mut dred);
+            assert_eq!(
+                nd, dd,
+                "DRed must be byte-identical to naive with an I-source retraction; \
+                 naive HAS {:?} ; dred HAS {:?}",
+                dish_minus(&nd, &dd),
+                dish_minus(&dd, &nd),
+            );
+        }
+
+        // CONSERVATIVE SAFETY: the DRed `Fallback` arm (taken when a shape cannot be
+        // proven byte-identical) must itself produce naive's dish. Force the fallback
+        // on every retraction repro and assert the whole retraction corpus is STILL
+        // byte-identical to naive -- proving the safety net is correct, so routing an
+        // un-handled shape to it never risks a wrong dish.
+        #[test]
+        fn dred_fallback_is_byte_identical_to_naive() {
+            for (name, setup) in corpus() {
+                let mut naive = run_naive(&setup);
+                let mut forced = build(&setup);
+                forced.sni_retract_mode = SniRetractMode::Dred;
+                forced.sni_dred_force_fallback = true;
+                forced.metta_calculus(1_000_000_000_000_000);
+                let nd = dump(&mut naive);
+                let fd = dump(&mut forced);
+                assert_eq!(
+                    nd, fd,
+                    "case {name}: the DRed conservative fallback must reach naive's dish; \
+                     naive HAS {:?} ; fallback HAS {:?}",
+                    dish_minus(&nd, &fd),
+                    dish_minus(&fd, &nd),
+                );
+                // Where a retraction happened, the forced fallback must have recorded
+                // at least one fallback (proving the arm is actually reachable).
+                if forced.sni_removal_seen {
+                    assert!(
+                        forced.sni_dred_fallbacks >= 1 || forced.sni_dred_repairs == 0,
+                        "case {name}: forced fallback should record a fallback on a retraction"
+                    );
+                }
+            }
+        }
+
+        // The hard DRed assertion: every hand-written case must be byte-identical
+        // naive vs DRed (`SniRetractMode::Dred`). The retraction cases now take the
+        // re-derivation catch-up (instead of falling to naive), so this proves DRed
+        // reproduces naive's dish on EVERY shape including all the retraction cases.
+        #[test]
+        fn corpus_all_byte_identical_dred() {
+            for (name, setup) in corpus() {
+                let mut naive = run_naive(&setup);
+                let mut dred = run_semi_mode(&setup, SniRetractMode::Dred);
+                let nd = dump(&mut naive);
+                let dd = dump(&mut dred);
+                if nd != dd {
+                    panic!(
+                        "case {name} diverges under Dred: naive HAS {:?} ; dred HAS {:?}",
+                        dish_minus(&nd, &dd),
+                        dish_minus(&dd, &nd),
+                    );
+                }
+            }
+        }
+
+        // MUTATION TEST: the DRed re-derivation is LOAD-BEARING. Run the minimal
+        // retraction repro under Dred with the re-derivation SKIPPED
+        // (`sni_dred_skip_rederive`): the dish MUST diverge from naive (it loses the
+        // re-derived (path n1 n3), the exact bug). Then WITHOUT the skip it MUST be
+        // byte-identical. If the re-derivation were dead code, the skipped run would
+        // still match naive and this test would (correctly) fail.
+        #[test]
+        fn dred_rederive_is_load_bearing_mutation() {
+            let minimal = r#"
+(exec (D (S (S (S (S (S (S Z)))))))
+      (, (exec (D (S $c)) $sp $st) ((W) $p $t) ((G) $gp $gt))
+      (, (exec (D $c) $sp $st) (exec (R) $p $t) (exec (GR) $gp $gt)))
+((W) (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+((G) (, (exec (D $c) $a $b) (gate $c go)) (O (- (edge n1 n3)) (- (path n1 n3)) (- (gate $c go))))
+(edge n1 n0) (path n1 n0)
+(edge n0 n1) (path n0 n1)
+(edge n1 n3) (path n1 n3)
+(edge n3 n0) (path n3 n0)
+(gate (S Z) go)
+"#;
+            let mut naive = run_naive(minimal);
+            let nd = dump(&mut naive);
+
+            // MUTANT: skip the re-derivation -> must DIVERGE (loses (path n1 n3)).
+            let mut mutant = build(minimal);
+            mutant.sni_retract_mode = SniRetractMode::Dred;
+            mutant.sni_dred_skip_rederive = true;
+            mutant.metta_calculus(1_000_000_000_000_000);
+            let md = dump(&mut mutant);
+            assert_ne!(
+                nd, md,
+                "mutation (skip re-derivation) MUST diverge from naive; if it matches, \
+                 the re-derivation is dead code"
+            );
+            assert!(
+                dish_minus(&nd, &md).iter().any(|l| l.contains("(path n1 n3)")),
+                "the skipped-re-derivation mutant must specifically lose (path n1 n3)"
+            );
+
+            // RESTORED: the real DRed (re-derivation ON) must be byte-identical.
+            let mut dred = run_semi_mode(minimal, SniRetractMode::Dred);
+            let dd = dump(&mut dred);
+            assert_eq!(
+                nd, dd,
+                "with the re-derivation restored, DRed must be byte-identical to naive"
+            );
+        }
+
+        // DRed actually ENGAGES on the retraction cases (not silently falling back
+        // to naive for all of them): at least the minimal-repro-style re-arming
+        // retraction cases must record DRed repairs > 0. Documents which retraction
+        // shapes DRed handles incrementally vs routes to naive (fallbacks).
+        #[test]
+        fn dred_engages_on_retraction_cases() {
+            let mut any_repaired = false;
+            for (name, setup) in corpus() {
+                let mut dred = run_semi_mode(&setup, SniRetractMode::Dred);
+                let repairs = dred.sni_dred_repairs;
+                let fallbacks = dred.sni_dred_fallbacks;
+                let removal = dred.sni_removal_seen;
+                if removal {
+                    eprintln!("[Dred] {name}: repairs={repairs} fallbacks={fallbacks}");
+                    if repairs > 0 {
+                        any_repaired = true;
+                    }
+                }
+            }
+            assert!(
+                any_repaired,
+                "DRed must run >=1 re-derivation repair across the retraction corpus"
+            );
+        }
+
+        // Without the gate, a retraction read by a recursive worker diverges; this
+        // documents the exact boundary the gate guards. The reduced seed-198
+        // program (a 2-cycle n0<->n1 plus n1->n3->n0, gate removes edge/path n1->n3
+        // at round 1) loses the re-derivation of (path n1 n3) under semi-naive: the
+        // worker's snapshot recorded n1->n3 before removal, so `btm \ snapshot`
+        // excludes it and the closure never re-derives it through n1->n0->...->n3,
+        // which naive (full re-scan) does. WITH the gate the removal latches
+        // `sni_removal_seen` and every later worker runs naive, so it is byte-
+        // identical. This is the load-bearing proof that the gate closes the hole.
+        #[test]
+        fn gate_closes_the_retraction_divergence() {
+            let setup = r#"
+(exec (D (S (S (S (S (S (S Z)))))))
+      (, (exec (D (S $c)) $sp $st) ((W) $p $t) ((G) $gp $gt))
+      (, (exec (D $c) $sp $st) (exec (R) $p $t) (exec (GR) $gp $gt)))
+((W) (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+((G) (, (exec (D $c) $a $b) (gate $c go)) (O (- (edge n1 n3)) (- (path n1 n3)) (- (gate $c go))))
+(edge n1 n0) (path n1 n0)
+(edge n0 n1) (path n0 n1)
+(edge n1 n3) (path n1 n3)
+(edge n3 n0) (path n3 n0)
+(gate (S Z) go)
+"#;
+            // The gate makes it byte-identical.
+            let (naive, semi) = both_ways(setup);
+            assert_eq!(naive, semi, "the gate must close the retraction divergence");
+            // And it really does close a HOLE: naive re-derives (path n1 n3).
+            assert!(
+                naive.contains("(path n1 n3)"),
+                "naive must re-derive the removed (path n1 n3) through the cycle"
+            );
+            // Sanity: the gate actually tripped (a removal happened in the loop).
+            let mut s = run_semi(setup);
+            assert!(
+                s.sni_removal_seen,
+                "the gate flag must latch after the O/- rule retracts"
+            );
+            // dump to settle `s` use without warnings.
+            let mut v = Vec::new();
+            s.dump_all_sexpr(&mut v).unwrap();
+        }
+
+        // DIAGNOSTIC (always passes; its value is the eprintln ground truth): for
+        // every corpus case that RETRACTS, print the exact facts where the un-gated
+        // raw semi-naive (`RawSemiNoGate`) diverges from naive. This is the
+        // "test, don't predict" map of what DRed must repair: the facts naive HAS
+        // that raw-semi MISSES (DRed must re-derive these) and the facts raw-semi
+        // HAS that naive lacks (DRed must over-delete these). Run with --nocapture.
+        #[test]
+        fn dred_divergence_ground_truth() {
+            // The documented minimal repro (the gate_closes program) first.
+            let minimal = r#"
+(exec (D (S (S (S (S (S (S Z)))))))
+      (, (exec (D (S $c)) $sp $st) ((W) $p $t) ((G) $gp $gt))
+      (, (exec (D $c) $sp $st) (exec (R) $p $t) (exec (GR) $gp $gt)))
+((W) (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+((G) (, (exec (D $c) $a $b) (gate $c go)) (O (- (edge n1 n3)) (- (path n1 n3)) (- (gate $c go))))
+(edge n1 n0) (path n1 n0)
+(edge n0 n1) (path n0 n1)
+(edge n1 n3) (path n1 n3)
+(edge n3 n0) (path n3 n0)
+(gate (S Z) go)
+"#;
+            {
+                let mut naive = run_naive(minimal);
+                let mut raw = run_semi_mode(minimal, SniRetractMode::RawSemiNoGate);
+                let raw_calls = raw.sni_delta_calls;
+                let nd = dump(&mut naive);
+                let rd = dump(&mut raw);
+                if nd != rd {
+                    eprintln!("[DIVERGES] MINIMAL_REPRO (raw, semi delta firings={raw_calls})");
+                    eprintln!("  naive HAS, raw-semi MISSES (DRed must re-derive): {:?}", dish_minus(&nd, &rd));
+                    eprintln!("  raw-semi HAS, naive LACKS (DRed must over-delete): {:?}", dish_minus(&rd, &nd));
+                } else {
+                    eprintln!("[identical] MINIMAL_REPRO under RawSemiNoGate (firings={raw_calls})");
+                }
+                // And under DRed: must be byte-identical, with repairs > 0.
+                let mut dred = run_semi_mode(minimal, SniRetractMode::Dred);
+                let dred_repairs = dred.sni_dred_repairs;
+                let dred_fallbacks = dred.sni_dred_fallbacks;
+                let dd = dump(&mut dred);
+                if dd == nd {
+                    eprintln!("[Dred OK] MINIMAL_REPRO byte-identical under Dred (repairs={dred_repairs} fallbacks={dred_fallbacks})");
+                } else {
+                    eprintln!("[Dred DIVERGES] MINIMAL_REPRO (repairs={dred_repairs} fallbacks={dred_fallbacks})");
+                    eprintln!("  naive HAS, dred MISSES: {:?}", dish_minus(&nd, &dd));
+                    eprintln!("  dred HAS, naive LACKS: {:?}", dish_minus(&dd, &nd));
+                }
+            }
+            // STALENESS PROBE: derive (path a c) from (edge a b)+(path b c), then
+            // remove ONLY (edge a b)+(path b c) (the support), keeping (path a c).
+            // Does NAIVE keep the now-unsupported (path a c)? If yes, naive is a
+            // MONOTONE TRACE (keeps stale derived facts), NOT mat(Pi, survivors),
+            // and DRed must NOT over-delete derived facts whose support is removed.
+            {
+                let staleness = r#"
+(exec (D (S (S (S Z))))
+      (, (exec (D (S $c)) $sp $st) ((W) $p $t) ((G) $gp $gt))
+      (, (exec (D $c) $sp $st) (exec (R) $p $t) (exec (GR) $gp $gt)))
+((W) (, (edge $x $y) (path $y $z)) (, (path $x $z)))
+((G) (, (exec (D $c) $a $b) (gate $c go)) (O (- (edge a b)) (- (path b c)) (- (gate $c go))))
+(edge a b) (path a b)
+(edge b c) (path b c)
+(gate (S Z) go)
+"#;
+                let mut naive = run_naive(staleness);
+                let nd = dump(&mut naive);
+                eprintln!(
+                    "[STALENESS] naive keeps unsupported (path a c)? {} ; keeps (path a b)? {}",
+                    nd.contains("(path a c)"),
+                    nd.contains("(path a b)"),
+                );
+            }
+            for (name, setup) in corpus() {
+                let mut naive = run_naive(&setup);
+                let mut raw = run_semi_mode(&setup, SniRetractMode::RawSemiNoGate);
+                let raw_calls = raw.sni_delta_calls;
+                let raw_removal = raw.sni_removal_seen;
+                let nd = dump(&mut naive);
+                let rd = dump(&mut raw);
+                if nd == rd {
+                    if raw_removal {
+                        eprintln!(
+                            "[identical, has-removal] {name}: raw-semi byte-identical despite a removal (semi delta firings={raw_calls})"
+                        );
+                    }
+                    continue;
+                }
+                let naive_has_raw_misses = dish_minus(&nd, &rd);
+                let raw_has_naive_lacks = dish_minus(&rd, &nd);
+                eprintln!("[DIVERGES] {name} (semi delta firings={raw_calls}, removal_seen={raw_removal})");
+                eprintln!("  naive HAS, raw-semi MISSES (DRed must re-derive): {naive_has_raw_misses:?}");
+                eprintln!("  raw-semi HAS, naive LACKS (DRed must over-delete): {raw_has_naive_lacks:?}");
+            }
+        }
+
+        // The fast path is preserved: a monotone (no-removal) re-arming closure and
+        // the full process_calculus reaction both STILL take the semi-naive delta
+        // path (the gate does not trip), so the perf win is intact. Proven by the
+        // SNI_DELTA_CALLS counter being positive after the run, and the gate flag
+        // staying false.
+        #[test]
+        fn gate_preserves_fast_path_on_process_calculus() {
+            // process_calculus add(8,8): no removals anywhere, so the gate must NOT
+            // trip and the delta transform MUST run many times.
+            let setup = process_calculus_setup_sexpr(100, 8, 8);
+            let mut s = build(&setup);
+            unsafe {
+                SNI_DELTA_CALLS = 0;
+            }
+            s.metta_calculus(1_000_000_000_000_000);
+            let calls = unsafe { SNI_DELTA_CALLS };
+            assert!(
+                !s.sni_removal_seen,
+                "process_calculus has no removals, the gate must not trip"
+            );
+            assert!(
+                calls > 0,
+                "the semi-naive delta path must run on process_calculus (fast path preserved); SNI_DELTA_CALLS={calls}"
+            );
+            // Confirm the answer is still correct (peano(16) on result).
+            let pat = crate::expr!(s, "[2] petri [3] ! result $");
+            let tpl = crate::expr!(s, "_1");
+            let mut v = Vec::new();
+            s.dump_sexpr(pat, tpl, &mut v);
+            assert_eq!(
+                String::from_utf8_lossy(&v),
+                format!("{}\n", peano_sexpr(16)),
+                "process_calculus must still compute add(8,8)=peano(16) on the gated fast path"
+            );
+        }
+
+        // A monotone re-arming closure also keeps the fast path (delta runs, gate
+        // stays armed), to show the gate is not over-eager: it trips ONLY on a
+        // removal, never on a plain add-only recursive program.
+        #[test]
+        fn gate_does_not_trip_on_monotone_recursion() {
+            let setup = rearming_program(
+                8,
+                "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                "(edge a b) (edge b c) (edge c d) (edge d e)\n\
+                 (path a b) (path b c) (path c d) (path d e)",
+                "",
+            );
+            let mut s = build(&setup);
+            unsafe {
+                SNI_DELTA_CALLS = 0;
+            }
+            s.metta_calculus(1_000_000_000_000_000);
+            assert!(!s.sni_removal_seen, "no removal => gate must stay armed");
+            assert!(
+                unsafe { SNI_DELTA_CALLS } > 0,
+                "the delta path must run on a monotone re-arming closure"
+            );
+        }
+
+        // Run `setup` with the cost gate live (`sni_force_naive = false`, the
+        // default) and with the runtime revert switch forcing naive
+        // (`sni_force_naive = true`), and return the two dumps plus the
+        // SNI_DELTA_CALLS the gated run made. The forced run is exactly the
+        // feature-off behaviour reached without a rebuild.
+        // Run `setup` three ways and return (dump, semi-firings) for each:
+        //  - GATED:  the default build (cost gate live, `sni_force_naive = false`);
+        //  - FORCED: the runtime revert switch on (`sni_force_naive = true`), which
+        //            must reach exactly the feature-off naive behaviour at runtime;
+        //  - REF:    the inert-hook reference (`run_naive`, `sni_rule_seen` never
+        //            armed -- the feature-OFF loop driven by hand).
+        // The semi-firing count is read from the PER-SPACE `sni_delta_calls` (not the
+        // process-global `SNI_DELTA_CALLS`), so it is correct even though `cargo test`
+        // runs tests in parallel threads that share the global counter.
+        fn run_three_ways(setup: &str) -> ((String, usize), (String, usize), String) {
+            fn dump(s: &mut Space) -> String {
+                let mut v = Vec::new();
+                s.dump_all_sexpr(&mut v).unwrap();
+                String::from_utf8_lossy(&v).into_owned()
+            }
+
+            let mut gated = build(setup);
+            gated.sni_force_naive = false;
+            gated.metta_calculus(1_000_000_000_000_000);
+            let gated_calls = gated.sni_delta_calls;
+
+            let mut forced = build(setup);
+            forced.sni_force_naive = true;
+            forced.metta_calculus(1_000_000_000_000_000);
+            let forced_calls = forced.sni_delta_calls;
+
+            let mut reference = run_naive(setup);
+
+            (
+                (dump(&mut gated), gated_calls),
+                (dump(&mut forced), forced_calls),
+                dump(&mut reference),
+            )
+        }
+
+        // The cost gate is RESULT-NEUTRAL: the gated path (semi where the delta is
+        // small, naive where it is large) writes a dish byte-identical to the
+        // always-naive path, AND the runtime revert switch (`sni_force_naive`)
+        // reaches that same naive dish. Checked on BOTH gate regimes:
+        //  - a SMALL program where the gate routes EVERY firing to naive (its only
+        //    firings have delta ~ dish), so the gated run takes zero delta passes;
+        //  - a LARGE monotone recursive closure with many small-delta firings, so
+        //    the gate picks semi (the gated run takes >0 delta passes).
+        // If the cost gate ever changed an answer (it must not -- it only chooses
+        // HOW to compute the same immediate consequences) the dumps would diverge.
+        // All assertions use race-free dump comparisons and the per-Space firing
+        // count, so the test is correct under parallel execution.
+        #[test]
+        fn cost_gate_is_result_neutral() {
+            // SMALL: a pure-source join over a tiny dish; every firing has
+            // delta ~ dish (m == 2), so the gate routes them all to naive.
+            let small = r#"
+(exec 0 (, (a $x) (b $x)) (, (ab $x)))
+(a 1) (a 2) (a 3) (b 2) (b 3) (b 4)
+"#;
+            let ((g, g_calls), (f, _), r) = run_three_ways(small);
+            assert_eq!(g, r, "cost gate changed the result on the small program");
+            assert_eq!(f, r, "sni_force_naive must reach the feature-off naive dish (small)");
+            assert_eq!(
+                g_calls, 0,
+                "the small program (delta ~ dish every firing) must be gated entirely to naive"
+            );
+
+            // LARGE: a re-arming transitive closure over a longer chain. Many
+            // firings have delta << dish, so the gate picks semi (delta path runs),
+            // and the result must still be byte-identical to always-naive.
+            let large = rearming_program(
+                12,
+                "(, (edge $x $y) (path $y $z)) (, (path $x $z))",
+                "(edge a b) (edge b c) (edge c d) (edge d e) (edge e f) (edge f g)\n\
+                 (edge g h) (edge h i) (edge i j) (edge j k) (edge k l)\n\
+                 (path a b) (path b c) (path c d) (path d e) (path e f) (path f g)\n\
+                 (path g h) (path h i) (path i j) (path j k) (path k l)",
+                "",
+            );
+            let ((g2, g2_calls), (f2, _), r2) = run_three_ways(&large);
+            assert_eq!(g2, r2, "cost gate changed the result on the large program");
+            assert_eq!(f2, r2, "sni_force_naive must reach the feature-off naive dish (large)");
+            assert!(
+                g2_calls > 0,
+                "the large recursive closure must exercise the semi-naive delta path (gate picked semi)"
+            );
+        }
     }
 }

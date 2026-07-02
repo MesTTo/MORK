@@ -21,3 +21,14 @@ pub(crate) fn var() -> Vec<u8> {
 pub(crate) fn var_ref(slot: u8) -> Vec<u8> {
     vec![item_byte(Tag::VarRef(slot))]
 }
+
+/// A bare arity tag, for building truncated or hand-laid item sequences that
+/// [`app`] (which requires all children) cannot express.
+pub(crate) fn arity(n: u8) -> Vec<u8> {
+    vec![item_byte(Tag::Arity(n))]
+}
+
+/// Raw concatenation of encoded fragments.
+pub(crate) fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
+    parts.iter().flatten().copied().collect()
+}
