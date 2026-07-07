@@ -56,6 +56,9 @@ pub mod dense;
 #[cfg(feature = "blas")]
 pub mod blas_backend;
 
+#[cfg(feature = "dense")]
+pub mod ewise;
+
 #[cfg(feature = "csr")]
 pub mod csr;
 
