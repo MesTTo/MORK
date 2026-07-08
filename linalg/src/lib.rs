@@ -12,7 +12,10 @@
 //!   block-sparse tensor with AVX2+FMA kernels for attention.
 //! - [`einsum`] — VM-based einsum supporting arbitrary specs and mixed
 //!   sparse/dense inputs via [`einsum`](einsum::einsum) /
-//!   [`einsum_homogenous`](einsum::einsum_homogenous).
+//!   [`einsum_homogenous`](einsum::einsum_homogenous). Generalized
+//!   reductions over any ([`Reduce`](einsum::Reduce),
+//!   [`Combine`](einsum::Combine)) semiring — max-product, min-plus, … —
+//!   via [`einsum_reduce`](einsum::einsum_reduce).
 //! - [`blas_backend`] (feature `blas`) — OpenBLAS-backed dense `f32` matmul
 //!   and attention kernels for standard dense workloads.
 //!
