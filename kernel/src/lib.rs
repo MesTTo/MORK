@@ -6,6 +6,8 @@
 
 #[cfg(feature = "experimental_dnf")]
 pub mod path_dnf;
+#[cfg(feature = "pathspace_oracles")]
+pub mod path_space_ops;
 pub mod space;
 pub mod json_path_query;
 mod sources;
