@@ -1,3 +1,4 @@
+use pathmap::zipper::{ZipperIteration, ZipperMoving, ZipperValues};
 use pathmap::PathMap;
 
 /// Keeps accepted paths that have no accepted strict prefix: the prefix-minimal
@@ -57,7 +58,13 @@ pub fn shared_prefix_witnesses(left: &PathMap<()>, right: &PathMap<()>) -> PathM
 
 fn sorted_paths(map: &PathMap<()>) -> Vec<Vec<u8>> {
     let mut paths = Vec::new();
-    map.for_each_value(|path, _| paths.push(path.to_vec()));
+    let mut zipper = map.read_zipper();
+    if zipper.val().is_some() {
+        paths.push(zipper.path().to_vec());
+    }
+    while zipper.to_next_val() {
+        paths.push(zipper.path().to_vec());
+    }
     paths.sort();
     paths.dedup();
     paths
