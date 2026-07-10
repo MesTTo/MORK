@@ -3825,6 +3825,14 @@ mod tests {
                 continue;
             }
             let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            // Feature-gated resource programs (added by the sink PRs) run only
+            // when their sink is compiled in; under other configs their sink
+            // dispatch panics by design ("MORK was not built with ...").
+            if (name == "weighted_select" && !cfg!(feature = "weighted_select"))
+                || (name == "egraph_saturation" && !cfg!(feature = "egraph"))
+            {
+                continue;
+            }
             let program = std::fs::read_to_string(&path).expect("readable resource");
             let steps_list: &[usize] = if name.starts_with("decision_tree") || name == "ip_sudoku" {
                 &[1, 7]
