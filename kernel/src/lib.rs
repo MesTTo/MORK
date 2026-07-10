@@ -17,6 +17,8 @@ mod pure;
 pub use sinks::WriteResourceRequest;
 pub use sources::ResourceRequest;
 pub mod egraph;
+#[cfg(feature = "einsum")]
+pub mod graph_tensor;
 pub mod term_identity;
 
 #[doc(hidden)]
