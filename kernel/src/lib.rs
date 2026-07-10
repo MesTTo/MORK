@@ -23,8 +23,23 @@ pub mod term_identity;
 
 #[doc(hidden)]
 pub use mork_expr as __mork_expr;
+#[doc(hidden)]
+pub use mork_frontend as __mork_frontend;
 pub mod weighted_paths;
 pub use sinks::{
     wasm_linear_memory_policy, WasmLinearMemoryPolicy, WASM_LINEAR_MEMORY_GUARD_BYTES,
     WASM_LINEAR_MEMORY_RESERVATION_BYTES,
 };
+
+pub mod prefix {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Prefix<'a> {
+        pub slice: &'a [u8],
+    }
+
+    impl<'a> Prefix<'a> {
+        pub fn path(&self) -> &'a [u8] {
+            self.slice
+        }
+    }
+}
