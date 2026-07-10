@@ -636,28 +636,39 @@ mod tests {
     /// [`DnfPathSetError`]).
     mod differential {
         use super::*;
-        use pathmap::experimental::zipper_algebra::zipper_merge_dnf;
+        use pathmap::experimental::zipper_algebra::{zipper_merge_dnf, Clause};
         use pathmap::zipper::*;
 
         fn merged(clauses: &[&[&PathMap<()>]]) -> PathMap<()> {
+            // zipper_merge_dnf takes one zipper array plus per-clause member
+            // bitmasks (a Clause names its zippers by index). Zippers no clause
+            // names are never descended and an all-zeros Clause contributes the
+            // empty set to the union, so padding both to the harness bounds is
+            // semantically free.
+            const MAX_ZIPPERS: usize = 9;
+            const MAX_CLAUSES: usize = 3;
+            let total: usize = clauses.iter().map(|clause| clause.len()).sum();
+            assert!(
+                clauses.len() <= MAX_CLAUSES && total <= MAX_ZIPPERS,
+                "differential harness covers 1-3 clauses of at most 3 members"
+            );
             let mut out = PathMap::new();
-            let mut zippers: Vec<Vec<_>> = clauses
-                .iter()
-                .map(|clause| clause.iter().map(|m| m.read_zipper()).collect())
-                .collect();
-            let mut clause_refs: Vec<Vec<_>> = zippers
-                .iter_mut()
-                .map(|clause| clause.iter_mut().collect::<Vec<_>>())
-                .collect();
-            match &mut clause_refs[..] {
-                [a] => zipper_merge_dnf(&mut [&mut a[..]], &mut out.write_zipper()),
-                [a, b] => zipper_merge_dnf(&mut [&mut a[..], &mut b[..]], &mut out.write_zipper()),
-                [a, b, c] => zipper_merge_dnf(
-                    &mut [&mut a[..], &mut b[..], &mut c[..]],
-                    &mut out.write_zipper(),
-                ),
-                _ => panic!("differential harness covers 1-3 clauses"),
+            let empty = PathMap::new();
+            let mut sources: Vec<&PathMap<()>> = Vec::with_capacity(MAX_ZIPPERS);
+            let mut masks = [Clause::<MAX_ZIPPERS>::EMPTY; MAX_CLAUSES];
+            for (ci, clause) in clauses.iter().enumerate() {
+                let mut mask = 0u64;
+                for &member in clause.iter() {
+                    mask |= 1 << sources.len();
+                    sources.push(member);
+                }
+                masks[ci] = Clause::from_mask(mask);
             }
+            while sources.len() < MAX_ZIPPERS {
+                sources.push(&empty);
+            }
+            let mut zs: [_; MAX_ZIPPERS] = std::array::from_fn(|i| sources[i].read_zipper());
+            zipper_merge_dnf(&mut zs, masks, &mut out.write_zipper());
             out
         }
 
@@ -742,11 +753,10 @@ mod tests {
             );
 
             let mut out = PathMap::new();
-            let mut z1 = [trie1.read_zipper()];
-            let mut z1_refs: Vec<_> = z1.iter_mut().collect();
-            let mut empty_refs: Vec<&mut pathmap::zipper::ReadZipperUntracked<()>> = Vec::new();
+            let mut zs = [trie1.read_zipper()];
             zipper_merge_dnf(
-                &mut [&mut z1_refs[..], &mut empty_refs[..]],
+                &mut zs,
+                [Clause::<1>::singleton(0), Clause::<1>::EMPTY],
                 &mut out.write_zipper(),
             );
             // The empty clause contributes the empty set to the union, so the
