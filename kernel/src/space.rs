@@ -184,7 +184,9 @@ pub struct Space {
     sni_loop_firings: usize,
     pub btm: PathMap<()>,
     pub sm: SharedMappingHandle,
-    pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
+    /// Locked like `z3s`: ArenaCompactTree carries a Cell-based cursor, and the
+    /// ACT table is touched only at the same transform boundaries.
+    pub mmaps: std::sync::Mutex<HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>>,
     /// Locked so `Space` is `Sync`-capable: `Popen` carries interior mutability,
     /// and the z3 table is touched only at transform boundaries, which lock once.
     pub z3s: std::sync::Mutex<HashMap<OwnedSourceItem, Box<Popen>>>,
@@ -832,7 +834,7 @@ impl Space {
             sni_semi_firings: 0,
             #[cfg(feature = "semi_naive_ic")]
             sni_loop_firings: 0,
-            btm: PathMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: std::sync::Mutex::new(HashMap::new()), last_merkleize: Instant::now(), timing: false }
+            btm: PathMap::new(), sm: SharedMapping::new(), mmaps: std::sync::Mutex::new(HashMap::new()), z3s: std::sync::Mutex::new(HashMap::new()), last_merkleize: Instant::now(), timing: false }
     }
 
     pub fn fork_empty(&self) -> Self {
@@ -849,7 +851,7 @@ impl Space {
             sni_loop_firings: 0,
             btm: PathMap::new(),
             sm: self.sm.clone(),
-            mmaps: HashMap::new(),
+            mmaps: std::sync::Mutex::new(HashMap::new()),
             z3s: std::sync::Mutex::new(HashMap::new()),
             last_merkleize: Instant::now(),
             timing: false,
@@ -2399,7 +2401,8 @@ impl Space {
 
         let mut any_new = false;
         let z3s_guard = self.z3s.get_mut().unwrap();
-        let touched = Self::query_multi_i(false, &mut self.mmaps, z3s_guard, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
+        let mmaps_guard = self.mmaps.get_mut().unwrap();
+        let touched = Self::query_multi_i(false, mmaps_guard, z3s_guard, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
             // trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             unsafe { writes += template_prefixes.len(); }
             match refs_bindings {
@@ -2466,7 +2469,8 @@ impl Space {
         let mut template_resources: Vec<_> = Vec::with_capacity(64);
         let mut outstanding_wzs = Vec::with_capacity(64);
         let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<()>>).cast_mut();
-        let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
+        let mut mmaps_guard = self.mmaps.lock().unwrap();
+        let acts_ptr = (&mut *mmaps_guard) as *mut HashMap<OwnedSourceItem, _>;
         let mut z3s_guard = self.z3s.lock().unwrap();
         let z3s_ptr = (&mut *z3s_guard) as *mut HashMap<OwnedSourceItem, Box<Popen>>;
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
@@ -2590,7 +2594,8 @@ impl Space {
         let mut template_resources: Vec<_> = Vec::with_capacity(64);
         let mut outstanding_wzs = Vec::with_capacity(64);
         let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<()>>).cast_mut();
-        let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
+        let mut mmaps_guard = self.mmaps.lock().unwrap();
+        let acts_ptr = (&mut *mmaps_guard) as *mut HashMap<OwnedSourceItem, _>;
         let mut z3s_guard = self.z3s.lock().unwrap();
         let z3s_ptr = (&mut *z3s_guard) as *mut HashMap<OwnedSourceItem, Box<Popen>>;
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
@@ -2613,7 +2618,7 @@ impl Space {
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
-        let touched = Self::query_multi_i(no_source, &mut self.mmaps, &mut *z3s_guard, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
+        let touched = Self::query_multi_i(no_source, &mut *mmaps_guard, &mut *z3s_guard, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             unsafe { writes += template_prefixes.len(); }
             match refs_bindings {
