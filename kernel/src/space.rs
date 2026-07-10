@@ -185,7 +185,9 @@ pub struct Space {
     pub btm: PathMap<()>,
     pub sm: SharedMappingHandle,
     pub mmaps: HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
-    pub z3s: HashMap<OwnedSourceItem, Box<Popen>>,
+    /// Locked so `Space` is `Sync`-capable: `Popen` carries interior mutability,
+    /// and the z3 table is touched only at transform boundaries, which lock once.
+    pub z3s: std::sync::Mutex<HashMap<OwnedSourceItem, Box<Popen>>>,
     pub last_merkleize: Instant,
     pub timing: bool
 }
@@ -830,7 +832,7 @@ impl Space {
             sni_semi_firings: 0,
             #[cfg(feature = "semi_naive_ic")]
             sni_loop_firings: 0,
-            btm: PathMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: HashMap::new(), last_merkleize: Instant::now(), timing: false }
+            btm: PathMap::new(), sm: SharedMapping::new(), mmaps: HashMap::new(), z3s: std::sync::Mutex::new(HashMap::new()), last_merkleize: Instant::now(), timing: false }
     }
 
     pub fn fork_empty(&self) -> Self {
@@ -848,7 +850,7 @@ impl Space {
             btm: PathMap::new(),
             sm: self.sm.clone(),
             mmaps: HashMap::new(),
-            z3s: HashMap::new(),
+            z3s: std::sync::Mutex::new(HashMap::new()),
             last_merkleize: Instant::now(),
             timing: false,
         }
@@ -2396,7 +2398,8 @@ impl Space {
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
-        let touched = Self::query_multi_i(false, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
+        let z3s_guard = self.z3s.get_mut().unwrap();
+        let touched = Self::query_multi_i(false, &mut self.mmaps, z3s_guard, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
             // trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             unsafe { writes += template_prefixes.len(); }
             match refs_bindings {
@@ -2464,7 +2467,8 @@ impl Space {
         let mut outstanding_wzs = Vec::with_capacity(64);
         let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<()>>).cast_mut();
         let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
-        let z3s_ptr = ((&self.z3s) as *const HashMap<OwnedSourceItem, Box<Popen>>).cast_mut();
+        let mut z3s_guard = self.z3s.lock().unwrap();
+        let z3s_ptr = (&mut *z3s_guard) as *mut HashMap<OwnedSourceItem, Box<Popen>>;
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
             if subsumption[i] == i {
                 placements[i] = template_resources.len();
@@ -2587,7 +2591,8 @@ impl Space {
         let mut outstanding_wzs = Vec::with_capacity(64);
         let outstanding_wzs_ptr = ((&outstanding_wzs) as *const Vec<WriteZipperTracked<()>>).cast_mut();
         let acts_ptr = ((&self.mmaps) as *const HashMap<OwnedSourceItem, _>).cast_mut();
-        let z3s_ptr = ((&self.z3s) as *const HashMap<OwnedSourceItem, Box<Popen>>).cast_mut();
+        let mut z3s_guard = self.z3s.lock().unwrap();
+        let z3s_ptr = (&mut *z3s_guard) as *mut HashMap<OwnedSourceItem, Box<Popen>>;
         template_prefixes.iter().enumerate().for_each(|(i, request)| {
             if subsumption[i] == i {
                 placements[i] = template_resources.len();
@@ -2608,7 +2613,7 @@ impl Space {
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
-        let touched = Self::query_multi_i(no_source, &mut self.mmaps, &mut self.z3s, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
+        let touched = Self::query_multi_i(no_source, &mut self.mmaps, &mut *z3s_guard, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             unsafe { writes += template_prefixes.len(); }
             match refs_bindings {
@@ -2801,7 +2806,7 @@ impl Space {
 
 impl Drop for Space {
     fn drop(&mut self) {
-        for (_, z3) in self.z3s.iter_mut() {
+        for (_, z3) in self.z3s.get_mut().unwrap().iter_mut() {
             // z3.terminate();
             drop(z3.stdin.take())
         }
