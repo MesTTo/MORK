@@ -4,11 +4,10 @@
 #![feature(stmt_expr_attributes)]
 #![feature(more_float_constants)]
 
+#[cfg(feature = "experimental_dnf")]
+pub mod path_dnf;
 pub mod space;
 pub mod json_path_query;
 mod sources;
 mod sinks;
 mod pure;
-
-pub use sinks::WriteResourceRequest;
-pub use sources::ResourceRequest;
