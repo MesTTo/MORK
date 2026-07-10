@@ -23,3 +23,4 @@ pub mod term_identity;
 
 #[doc(hidden)]
 pub use mork_expr as __mork_expr;
+pub mod weighted_paths;
