@@ -1110,7 +1110,7 @@ fn run_unify_join<'a>(
 
 /// Run the join streaming each accepted assignment's per-factor original fact bytes to `on_tuple`
 /// instead of collecting rows; a `false` return stops the search early.
-fn run_unify_join_stream(
+pub fn run_unify_join_stream(
     map: &PathMap<()>,
     factors: &[Factor],
     var_order: &[usize],
@@ -1374,6 +1374,74 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
     .flatten()
 }
 
+/// GHD drop-in for [`query_multi_leapfrog`]: for a *cyclic* body with a low-width hypertree
+/// decomposition, materialize each bag with the WCO join and natural-join the bags (an acyclic
+/// bag-query), streaming the SAME `(bindings, loc)` per full match as the global join, so the
+/// answer set is byte-identical. Returns `None` (fall back to the global join) for an acyclic body
+/// (already output-optimal), a body with a nonground compound column (a shared variable the bag
+/// key would miss), or when no width `<= 3` decomposition exists.
+pub fn query_multi_ghd<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
+    map: &PathMap<()>,
+    pat_expr: Expr,
+    mut effect: F,
+) -> Option<usize> {
+    let body = unsafe { pat_expr.span().as_ref().unwrap() };
+    let (factors, nvars) = parse_body_factors(body)?;
+    if !body_factors_routable_to_zipper_join(&factors) {
+        return None;
+    }
+    // Every variable must be a top-level column: `extract_var_values` reads top-level columns, so a
+    // nonground compound column could hide a shared variable the bag-join key misses.
+    if factors
+        .iter()
+        .any(|f| f.cols.iter().any(|c| c.is_nonground_compound()))
+    {
+        return None;
+    }
+    let edges = crate::ghd::hypergraph(&factors);
+    let ghd = crate::ghd::decompose(&edges, 3)?;
+    if ghd.width < 2 {
+        return None; // acyclic bodies are already output-optimal under the global WCO join.
+    }
+    let bags_mat: Vec<(crate::ghd::Bag, Vec<crate::ghd::BagMatch>)> = ghd
+        .bags
+        .iter()
+        .map(|b| (b.clone(), crate::ghd::materialize_bag(map, &factors, b, nvars)))
+        .collect();
+    let full_tuples = crate::ghd::join_bags(&bags_mat, factors.len());
+
+    let mut pat_args = Vec::new();
+    ExprEnv::new(0, pat_expr).args(&mut pat_args);
+    let sources = &pat_args[1..];
+    debug_assert_eq!(sources.len(), factors.len());
+    let mut candidate = 0usize;
+    for tuple in &full_tuples {
+        unsafe { crate::space::unifications += 1 };
+        let e = Expr {
+            ptr: tuple[0].as_ptr().cast_mut(),
+        };
+        let mut pairs = vec![(sources[0], ExprEnv::new(1, e))];
+        for (j, fact) in tuple.iter().enumerate().skip(1) {
+            pairs.push((
+                sources[j],
+                ExprEnv::new(
+                    (j + 1) as u8,
+                    Expr {
+                        ptr: fact.as_ptr().cast_mut(),
+                    },
+                ),
+            ));
+        }
+        if let Ok(bs) = unify(&mut pairs) {
+            candidate += 1;
+            if !effect(Err(bs), e) {
+                break;
+            }
+        }
+    }
+    Some(candidate)
+}
+
 /// The join owns every nonempty relation-prefixed conjunction: each column carries full
 /// `mork_expr::unify` with data-side capture, and an assignment that closes a cycle is rejected at
 /// emit, so no query or fact shape needs a decline. The check is parse-level and reads nothing
@@ -1386,7 +1454,7 @@ fn body_factors_routable_to_zipper_join(factors: &[Factor]) -> bool {
 /// Collect the query variables of one factor into `out`: the top-level `Var` columns and every
 /// variable nested in a `Term` column. A NewVar takes the next id after the ones introduced before
 /// this term (`term.intro`), a VarRef names its id, matching the body's global numbering.
-fn collect_factor_vars(factor: &Factor, out: &mut std::collections::BTreeSet<usize>) {
+pub fn collect_factor_vars(factor: &Factor, out: &mut std::collections::BTreeSet<usize>) {
     for col in &factor.cols {
         match col {
             FactorColumn::Var(v) => {
@@ -4019,6 +4087,578 @@ mod tests {
             let ((p0, s0), (p1, s1)) = engine_both_ways(prog, steps);
             assert_eq!(p0, p1, "performed step counts differ on\n{prog}");
             assert_eq!(s0, s1, "spaces differ on\n{prog}");
+        }
+    }
+
+    /// Model 14 in the running engine: for a cyclic body the GHD's full tuples (a matched fact per
+    /// factor, joined across the bags) equal the global WCO join's full tuples as a set. This is
+    /// the correctness gate for `query_multi_ghd`: identical tuples feed the identical unify+effect.
+    #[test]
+    fn ghd_full_tuples_match_global_join_on_cycles() {
+        let mut s = crate::space::Space::new();
+        s.add_all_sexpr(
+            "(e a b)\n(e b c)\n(e c a)\n(e a c)\n(e c b)\n(e b a)\n\
+             (e a d)\n(e d c)\n(e c d)\n(e d a)\n(e b d)\n(e d b)\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        for body_str in [
+            "(, (e $x $y) (e $y $z) (e $z $x))",           // triangle, ghw 2
+            "(, (e $a $b) (e $b $c) (e $c $d) (e $d $a))", // 4-cycle, ghw 2
+        ] {
+            let body = enc(body_str);
+            let (factors, nvars) = parse_body_factors(&body).unwrap();
+
+            let var_order: Vec<usize> = (0..nvars).collect();
+            let mut global: BTreeSet<Vec<Vec<u8>>> = BTreeSet::new();
+            run_unify_join_stream(&s.btm, &factors, &var_order, nvars, &mut |t| {
+                global.insert(t.to_vec());
+                true
+            });
+
+            let edges = crate::ghd::hypergraph(&factors);
+            let ghd = crate::ghd::decompose(&edges, 3).expect("cyclic body decomposes");
+            assert_eq!(ghd.width, 2, "{body_str}: cyclic body has width 2");
+            let bags_mat: Vec<_> = ghd
+                .bags
+                .iter()
+                .map(|b| (b.clone(), crate::ghd::materialize_bag(&s.btm, &factors, b, nvars)))
+                .collect();
+            let ghd_tuples: BTreeSet<Vec<Vec<u8>>> =
+                crate::ghd::join_bags(&bags_mat, factors.len()).into_iter().collect();
+
+            assert_eq!(global, ghd_tuples, "{body_str}: GHD tuples must equal the global join");
+            assert!(!global.is_empty(), "{body_str}: the test must exercise non-empty results");
+        }
+    }
+
+    /// Factorized aggregation (Model 17): the factorized COUNT equals enumerate-and-count, while
+    /// touching only the input rows. The 2-path has O(N^2) output but O(N) input, so the factorized
+    /// count does asymptotically less work for the same answer.
+    #[test]
+    fn ghd_count_matches_enumerate_count() {
+        let mut s = crate::space::Space::new();
+        let mut prog = String::new();
+        for a in 0..5 {
+            for h in 0..4 {
+                prog.push_str(&format!("(r a{a} h{h})\n"));
+            }
+        }
+        for h in 0..4 {
+            for z in 0..5 {
+                prog.push_str(&format!("(s h{h} z{z})\n"));
+            }
+        }
+        s.add_all_sexpr(prog.as_bytes()).unwrap();
+        for body_str in [
+            "(, (r $x $y) (s $y $z))", // 2-path: output 100, inputs 40
+            "(, (r $x $y))",           // single relation
+        ] {
+            let body = enc(body_str);
+            let (factors, nvars) = parse_body_factors(&body).unwrap();
+            let var_order: Vec<usize> = (0..nvars).collect();
+            let mut enum_count = 0u64;
+            run_unify_join_stream(&s.btm, &factors, &var_order, nvars, &mut |_t| {
+                enum_count += 1;
+                true
+            });
+            let fact_count = crate::ghd::ghd_count(&s.btm, &factors, nvars, &var_order);
+            assert_eq!(fact_count, enum_count, "{body_str}: factorized != enumerate count");
+            assert!(enum_count > 0, "{body_str}: the test must exercise non-empty results");
+        }
+    }
+
+    /// A disconnected body is a Cartesian product and still factorizes: `(foo $x)(bar $y)(baz $z)`
+    /// -- the `sink_count_literal` shape -- has no shared variable, so its count is |foo|*|bar|*|baz|
+    /// computed in O(sum) not O(product) (Yan-Larson "double eager"). Before the connected-components
+    /// split, gyo rejected the disconnected hypergraph and ghd_aggregate_auto returned None; now each
+    /// component decomposes on its own and ghd_aggregate multiplies the per-component scalars.
+    #[test]
+    fn ghd_count_cartesian_product_factorizes() {
+        let mut s = crate::space::Space::new();
+        s.add_all_sexpr(b"(foo 1) (foo 2) (foo 3) (bar x) (bar y) (baz P) (baz Q) (baz R)")
+            .unwrap();
+        let body = enc("(, (foo $x) (bar $y) (baz $z))");
+        let (factors, nvars) = parse_body_factors(&body).unwrap();
+        let var_order: Vec<usize> = (0..nvars).collect();
+        let mut enum_count = 0u64;
+        run_unify_join_stream(&s.btm, &factors, &var_order, nvars, &mut |_t| {
+            enum_count += 1;
+            true
+        });
+        let fact_count = crate::ghd::ghd_aggregate_auto::<u64>(&s.btm, &factors, nvars, |_| 1)
+            .expect("the disconnected body factorizes per connected component");
+        assert_eq!(enum_count, 18, "3*2*3 Cartesian product");
+        assert_eq!(fact_count, enum_count, "factorized Cartesian count != enumerate");
+    }
+
+    /// Factorized SUM(DISTINCT x) over a join equals enumerate-collect-distinct-sum. The body
+    /// `(gene $g)(rel1 $g $x)(rel2 $g $y)` sums the distinct $x that survive the join (connect
+    /// through $g to some $y). `ghd_sum_distinct` sums $x's semi-join-reduced domain in O(N).
+    #[test]
+    fn ghd_sum_distinct_matches_enumerate() {
+        let mut s = crate::space::Space::new();
+        // g=g1 reaches x in {10,20,30} and y in {1,2}; g=g2 reaches x in {20,40} but NO y (dangling).
+        s.add_all_sexpr(
+            b"(gene g1) (rel1 g1 10) (rel1 g1 20) (rel1 g1 30) (rel2 g1 1) (rel2 g1 2)
+              (rel1 g2 20) (rel1 g2 40)",
+        )
+        .unwrap();
+        let body = enc("(, (gene $g) (rel1 $g $x) (rel2 $g $y))");
+        let (factors, nvars) = parse_body_factors(&body).unwrap();
+        // g1 has a rel2 partner so its x {10,20,30} survive the join; g2 has no rel2 partner, so its
+        // x=40 dangles and is excluded (20 still survives via g1). Distinct surviving x = {10,20,30}.
+        let free = 1usize; // gene $g -> var 0, rel1 $g $x introduces $x -> var 1
+        let domain = crate::ghd::ghd_surviving_domain(
+            &s.btm,
+            &factors,
+            nvars,
+            free,
+            &(0..nvars).collect::<Vec<_>>(),
+        );
+        let surviving: std::collections::BTreeSet<u32> = domain
+            .iter()
+            .map(|v| u32::from_str_radix(std::str::from_utf8(&v[1..]).unwrap(), 10).unwrap())
+            .collect();
+        assert_eq!(
+            surviving,
+            [10, 20, 30].into_iter().collect(),
+            "semi-join reduction must drop dangling x=40"
+        );
+        let fact_sum = crate::ghd::ghd_sum_distinct(&s.btm, &factors, nvars, free).unwrap();
+        assert_eq!(fact_sum, 60, "factorized SUM(DISTINCT x) = 10+20+30");
+    }
+
+    /// Property-based differential: over random data and several join shapes (chain, star, cyclic
+    /// triangle) with count and sum sinks -- plus grouped and partially-projected sinks the gate must
+    /// DECLINE -- the whole space must be byte-identical with the factorized fast path on vs off. Any
+    /// divergence is a gate-soundness or factorization bug. Deterministic LCG per seed (no Date/rand).
+    #[test]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_aggregate_fuzz_differential() {
+        let step = |st: &mut u64| -> u64 {
+            *st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *st >> 33
+        };
+        let mut diverged = Vec::new();
+        for seed in 0u64..600 {
+            let mut st = seed
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
+            let d = 3 + step(&mut st) % 8; // domain 3..10
+            let mut prog = String::new();
+            for r in ["r1", "r2", "r3", "r4"] {
+                let n = 1 + step(&mut st) % 14; // 1..14 tuples each
+                for _ in 0..n {
+                    let a = step(&mut st) % d;
+                    let b = step(&mut st) % d;
+                    prog.push_str(&format!("({r} {a} {b})\n"));
+                }
+            }
+            // Routable across chain, star, cyclic triangle, 4-cycle, self-join, and longer chain; SUM
+            // over chain/star; and grouped + partial-projection which the gate must DECLINE. Random
+            // data exercises empty joins, single matches, dangling tuples, and high fan-out per seed.
+            prog.push_str(
+                r#"
+(exec 0 (, (r1 $a $b) (r2 $b $c)) (O (count (chain-cnt $n) $n (t $a $b $c))))
+(exec 0 (, (r1 $a $b) (r2 $a $c) (r3 $a $d)) (O (count (star-cnt $n) $n (t $a $b $c $d))))
+(exec 0 (, (r1 $a $b) (r2 $b $c) (r3 $c $a)) (O (count (tri-cnt $n) $n (t $a $b $c))))
+(exec 0 (, (r1 $a $b) (r2 $b $c) (r3 $c $d) (r4 $d $a)) (O (count (cyc4-cnt $n) $n (t $a $b $c $d))))
+(exec 0 (, (r1 $a $b) (r1 $b $c)) (O (count (self-cnt $n) $n (t $a $b $c))))
+(exec 0 (, (r1 $a $b) (r2 $b $c) (r3 $c $d)) (O (count (chain3-cnt $n) $n (t $a $b $c $d))))
+(exec 0 (, (r1 $a $b) (r2 $b $c)) (O (sum (chain-sum $n) $n $a)))
+(exec 0 (, (r1 $a $b) (r2 $a $c) (r3 $a $d)) (O (sum (star-sum $n) $n $b)))
+(exec 0 (, (r1 $a $b) (r2 $b $c) (r3 $c $d) (r4 $d $a)) (O (sum (cyc4-sum $n) $n $c)))
+(exec 0 (, (r1 $a $b) (r2 $b $c)) (O (fmin (chain-min $m) $m $a)))
+(exec 0 (, (r1 $a $b) (r2 $a $c) (r3 $a $d)) (O (fmax (star-max $m) $m $b)))
+(exec 0 (, (r1 $a $b) (r2 $b $c)) (O (and (chain-and $m) $m $a)))
+(exec 0 (, (r1 $a $b) (r2 $b $c)) (O (count (grouped $a $n) $n $c)))
+(exec 0 (, (r1 $a $b) (r2 $b $c)) (O (count (partial $n) $n (t $a))))
+"#,
+            );
+            if count_diff_run(&prog, false) != count_diff_run(&prog, true) {
+                diverged.push(seed);
+            }
+        }
+        assert!(
+            diverged.is_empty(),
+            "factorized aggregate diverged from enumerate on seeds {diverged:?}"
+        );
+    }
+
+    /// Run a count-sink program to fixpoint with the factorized fast path forced on/off and return
+    /// the whole-space dump, for the differential oracles below.
+    fn count_diff_run(prog: &str, factorized: bool) -> String {
+        crate::space::set_factorized_aggregate_override(Some(factorized));
+        let mut s = crate::space::Space::new();
+        s.add_all_sexpr(prog.as_bytes()).unwrap();
+        s.metta_calculus(1_000_000);
+        let mut v = vec![];
+        s.dump_all_sexpr(&mut v).unwrap();
+        crate::space::set_factorized_aggregate_override(None);
+        String::from_utf8(v).unwrap()
+    }
+
+    /// A CONNECTED multi-factor join routed through the count sink: the flybase P1 star
+    /// `(gene $x)(rel1 $x $y)(rel2 $x $z)`, full projection, no grouping. Unlike the Cartesian case
+    /// this exercises the connected GHD decomposition end to end. 1 gene * 2 rel1 * 3 rel2 = 6.
+    #[test]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_count_sink_routes_connected_star() {
+        const PROG: &str = r#"
+(gene x)
+(rel1 x a) (rel1 x b)
+(rel2 x p) (rel2 x q) (rel2 x r)
+(exec 0 (, (gene $x) (rel1 $x $y) (rel2 $x $z)) (O (count (star $c) $c (out $x $y $z))))
+"#;
+        let enumerated = count_diff_run(PROG, false);
+        let factorized = count_diff_run(PROG, true);
+        assert!(enumerated.contains("(star 6)"), "1*2*3 star count:\n{enumerated}");
+        assert_eq!(factorized, enumerated, "connected-star factorized diverged from enumerate");
+    }
+
+    /// Differential oracle for the wired SUM sink: SUM(DISTINCT x) over a join, factorized vs
+    /// enumerate, byte-identical. g1's x {10,20,30} survive (they reach a rel2 partner); g2's x=40
+    /// dangles (no rel2 partner) so the semi-join reduction drops it -- distinct surviving x sums to
+    /// 60. `(total $c)` emits the value; the literal guards check emit-iff-sum-equals both ways.
+    #[test]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_sum_sink_matches_enumerate() {
+        const PROG: &str = r#"
+(gene g1) (rel1 g1 10) (rel1 g1 20) (rel1 g1 30) (rel2 g1 1) (rel2 g1 2)
+(rel1 g2 20) (rel1 g2 40)
+(exec 0 (, (gene $g) (rel1 $g $x) (rel2 $g $y)) (O (sum (total $c) $c $x)))
+(exec 0 (, (gene $g) (rel1 $g $x) (rel2 $g $y)) (O (sum (is-sixty) 60 $x)))
+(exec 0 (, (gene $g) (rel1 $g $x) (rel2 $g $y)) (O (sum (is-fifty) 50 $x)))
+"#;
+        let enumerated = count_diff_run(PROG, false);
+        let factorized = count_diff_run(PROG, true);
+        assert!(enumerated.contains("(total 60)"), "distinct surviving x sum = 60:\n{enumerated}");
+        assert!(enumerated.contains("is-sixty"), "60==60 emits:\n{enumerated}");
+        assert!(!enumerated.contains("is-fifty"), "60!=50 does not emit:\n{enumerated}");
+        assert_eq!(factorized, enumerated, "factorized SUM diverged from the enumerate SumSink");
+    }
+
+    /// Differential for the wired MIN/MAX sinks: MIN/MAX(DISTINCT x) over a join, factorized vs
+    /// enumerate. g1's x {10,20,30} survive; g2's {5,40} dangle (no rel2 partner). So MIN=10 (not the
+    /// dangling 5) and MAX=30 (not the dangling 40) -- the semi-join reduction must exclude the
+    /// dangling values, which a wrong routing would include. MIN/MAX are idempotent so distinct vs
+    /// multiplicity does not matter, and exact so the f64 to_string is byte-identical.
+    #[test]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_minmax_sink_matches_enumerate() {
+        const PROG: &str = r#"
+(gene g1) (rel1 g1 10) (rel1 g1 20) (rel1 g1 30) (rel2 g1 1) (rel2 g1 2)
+(rel1 g2 5) (rel1 g2 40)
+(exec 0 (, (gene $g) (rel1 $g $x) (rel2 $g $y)) (O (fmin (mn $m) $m $x)))
+(exec 0 (, (gene $g) (rel1 $g $x) (rel2 $g $y)) (O (fmax (mx $m) $m $x)))
+"#;
+        let enumerated = count_diff_run(PROG, false);
+        let factorized = count_diff_run(PROG, true);
+        assert!(enumerated.contains("(mn 10)"), "MIN excludes the dangling 5:\n{enumerated}");
+        assert!(enumerated.contains("(mx 30)"), "MAX excludes the dangling 40:\n{enumerated}");
+        assert_eq!(factorized, enumerated, "factorized MIN/MAX diverged from the enumerate sink");
+    }
+
+    /// Differential for the wired AndSink (bitwise-AND of the distinct values' first byte). g1's x
+    /// {6,7,2} survive; g2's x=9 dangles (no rel2 partner), so a wrong routing that folded 9 into the
+    /// AND would diverge. AND is associative+commutative+idempotent, so factorized == enumerate.
+    #[test]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_and_sink_matches_enumerate() {
+        const PROG: &str = r#"
+(gene g1) (rel1 g1 6) (rel1 g1 7) (rel1 g1 2) (rel2 g1 1)
+(gene g2) (rel1 g2 9)
+(exec 0 (, (gene $g) (rel1 $g $x) (rel2 $g $y)) (O (and (r $a) $a $x)))
+"#;
+        let enumerated = count_diff_run(PROG, false);
+        let factorized = count_diff_run(PROG, true);
+        assert_eq!(factorized, enumerated, "factorized AND diverged from the enumerate AndSink");
+    }
+
+    /// Proof the wired SUM fast path is taken and wins: SUM(DISTINCT x) over a star with k distinct x
+    /// but k*k matches. The enumerate SumSink materializes k*k rows then dedups; the factorized path
+    /// semi-join-reduces to the k-value domain in O(k). Byte-identical each k; the growing speedup is
+    /// the proof it routes. Distinct x = {0..k-1}, sum = k*(k-1)/2.
+    #[test]
+    #[ignore = "timing: the wired SUM sink, factorized vs enumerate through the exec"]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_sum_sink_win_scales() {
+        for k in [50usize, 100, 200, 400, 800] {
+            let mut prog = String::from("(gene g)\n");
+            for i in 0..k {
+                prog.push_str(&format!("(rel1 g {i})\n"));
+            }
+            for j in 0..k {
+                prog.push_str(&format!("(rel2 g y{j})\n"));
+            }
+            prog.push_str(
+                "(exec 0 (, (gene $g) (rel1 $g $x) (rel2 $g $y)) (O (sum (total $c) $c $x)))\n",
+            );
+            let t = std::time::Instant::now();
+            let enumerated = count_diff_run(&prog, false);
+            let enum_us = t.elapsed().as_micros().max(1);
+            let t = std::time::Instant::now();
+            let factorized = count_diff_run(&prog, true);
+            let fact_us = t.elapsed().as_micros().max(1);
+            assert_eq!(factorized, enumerated, "diverged at k={k}");
+            let expected: u32 = (0..k as u32).sum();
+            assert!(enumerated.contains(&format!("(total {expected})")), "sum k*(k-1)/2 at k={k}");
+            eprintln!(
+                "k={k:4} distinct_x={k:4} matches={:8}  enumerate {enum_us:9}us  factorized {fact_us:7}us  speedup {:.1}x",
+                k * k,
+                enum_us as f64 / fact_us as f64
+            );
+        }
+    }
+
+    /// Proof the wired fast path is actually taken and wins through the exec, not silently falling
+    /// back: the same count exec at growing scale, factorized vs enumerate. The star has k*k output
+    /// but O(k) inputs, so a routed factorized count grows its lead (a dropped exponent); if it did
+    /// not route, both would be O(k^2) and the speedup would stay ~1x. Byte-identical each k.
+    #[test]
+    #[ignore = "timing: the wired count sink, factorized vs enumerate through the exec"]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_count_sink_win_scales() {
+        for k in [50usize, 100, 200, 400, 800] {
+            let mut prog = String::from("(gene x)\n");
+            for y in 0..k {
+                prog.push_str(&format!("(rel1 x a{y})\n"));
+            }
+            for z in 0..k {
+                prog.push_str(&format!("(rel2 x b{z})\n"));
+            }
+            prog.push_str(
+                "(exec 0 (, (gene $x) (rel1 $x $y) (rel2 $x $z)) (O (count (star $c) $c (out $x $y $z))))\n",
+            );
+            let t = std::time::Instant::now();
+            let enumerated = count_diff_run(&prog, false);
+            let enum_us = t.elapsed().as_micros().max(1);
+            let t = std::time::Instant::now();
+            let factorized = count_diff_run(&prog, true);
+            let fact_us = t.elapsed().as_micros().max(1);
+            assert_eq!(factorized, enumerated, "diverged at k={k}");
+            assert!(enumerated.contains(&format!("(star {})", k * k)), "count k*k at k={k}");
+            eprintln!(
+                "k={k:4} count={:8}  enumerate {enum_us:9}us  factorized {fact_us:7}us  speedup {:.1}x",
+                k * k,
+                enum_us as f64 / fact_us as f64
+            );
+        }
+    }
+
+    /// Differential oracle for the wired count sink: the same count exec, run with the factorized
+    /// fast path off (enumerate) and on, must leave a byte-identical space. The body
+    /// `(foo $x)(bar $y)(baz $z)` is a 3-way Cartesian counted with full projection and no grouping
+    /// -- the routable case (Alloy fac18). `(total $c)` emits the actual count so the value is
+    /// compared, not just presence; the `(all eighteen)`/`(all sixteen)` literal guards check the
+    /// count-equals-literal emit both ways. This is the gate that must be green before any default
+    /// flip of `MORK_FACTORIZED_AGGREGATE`.
+    #[test]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_count_sink_matches_enumerate() {
+        const PROG: &str = r#"
+(foo 1) (foo 2) (foo 3)
+(bar x) (bar y)
+(baz P) (baz Q) (baz R)
+(exec 0 (, (foo $x) (bar $y) (baz $z)) (O (count (total $c) $c (cux $z $y $x))))
+(exec 0 (, (foo $x) (bar $y) (baz $z)) (O (count (all eighteen) 18 (cux $z $y $x))))
+(exec 0 (, (foo $x) (bar $y) (baz $z)) (O (count (all sixteen) 16 (cux $z $y $x))))
+"#;
+        let enumerated = count_diff_run(PROG, false);
+        let factorized = count_diff_run(PROG, true);
+        assert!(
+            enumerated.contains("(total 18)"),
+            "enumerate must emit the actual count:\n{enumerated}"
+        );
+        assert_eq!(
+            factorized, enumerated,
+            "factorized COUNT diverged from the enumerate CountSink"
+        );
+    }
+
+    /// Adversarial half of the corpus: the gate must DECLINE counts where match-count != distinct
+    /// output and fall back to enumerate, so the space stays byte-identical with the fast path on.
+    /// A grouped count `(grouped $g $c)` (a pattern variable in the template) is per-group, not a
+    /// scalar; a projected count `(only $x)` drops join variables so distinct-output < matches. If
+    /// the gate wrongly routed either, the factorized match-count (18) would replace the true
+    /// grouped/distinct counts and this differential would fail.
+    #[test]
+    #[cfg(feature = "factorized_aggregate")]
+    fn factorized_count_gate_declines_grouped_and_projected() {
+        const PROG: &str = r#"
+(foo 1) (foo 2) (foo 3)
+(bar x) (bar y)
+(baz P) (baz Q) (baz R)
+(rel a m) (rel a n) (rel b m)
+(rel2 m p) (rel2 n q) (rel2 m r)
+(exec 0 (, (foo $x) (bar $y) (baz $z)) (O (count (sound-total $c) $c (cux $z $y $x))))
+(exec 0 (, (rel $g $h) (rel2 $h $k)) (O (count (grouped $g $c) $c ($h $k))))
+(exec 0 (, (foo $x) (bar $y) (baz $z)) (O (count (projected $c) $c (only $x))))
+"#;
+        let enumerated = count_diff_run(PROG, false);
+        let factorized = count_diff_run(PROG, true);
+        // the sound one routes; distinct x is 3 not 18 (projection drops y,z); grouping is per g.
+        assert!(enumerated.contains("(sound-total 18)"), "sound count:\n{enumerated}");
+        assert!(enumerated.contains("(projected 3)"), "distinct x is 3:\n{enumerated}");
+        assert_eq!(
+            factorized, enumerated,
+            "the gate must decline grouped/projected counts and stay byte-identical"
+        );
+    }
+
+    /// One sum-product engine, many semirings: COUNT (naturals), EXISTS (booleans), and a weighted
+    /// SUM all run through `ghd_aggregate` with only the element type and per-fact weight changing.
+    /// This is the FAQ generalization -- weighted joins and existence share the factorization.
+    #[test]
+    fn ghd_aggregate_over_semirings() {
+        let mut s = crate::space::Space::new();
+        let mut prog = String::new();
+        for a in 0..5 {
+            for h in 0..3 {
+                prog.push_str(&format!("(r a{a} h{h})\n"));
+            }
+        }
+        for h in 0..3 {
+            for z in 0..4 {
+                prog.push_str(&format!("(s h{h} z{z})\n"));
+            }
+        }
+        s.add_all_sexpr(prog.as_bytes()).unwrap();
+        let body = enc("(, (r $x $y) (s $y $z))");
+        let (factors, nvars) = parse_body_factors(&body).unwrap();
+        let order: Vec<usize> = (0..nvars).collect();
+
+        let count = crate::ghd::ghd_aggregate::<u64>(&s.btm, &factors, nvars, &order, |_| 1);
+        let exists = crate::ghd::ghd_aggregate::<bool>(&s.btm, &factors, nvars, &order, |_| true);
+        let wsum = crate::ghd::ghd_aggregate::<u64>(&s.btm, &factors, nvars, &order, |_| 2);
+
+        assert!(count > 0, "the test must exercise matches");
+        assert!(exists, "EXISTS holds when there is a match");
+        assert_eq!(wsum, count * (1u64 << factors.len()), "weight 2 per fact gives 2^m * count");
+    }
+
+    /// The elimination order comes from the join tree, not the caller: a 3-chain r-s-t decomposes
+    /// to a width-1 GHD, `ghd_aggregate_auto` derives a leaf-first order, and the factorized count
+    /// equals enumerate-and-count.
+    #[test]
+    fn ghd_aggregate_auto_derives_order_on_a_chain() {
+        let mut s = crate::space::Space::new();
+        let mut prog = String::new();
+        for x in 0..3 {
+            for y in 0..3 {
+                prog.push_str(&format!("(r x{x} y{y})\n"));
+            }
+        }
+        for y in 0..3 {
+            for z in 0..3 {
+                prog.push_str(&format!("(s y{y} z{z})\n"));
+            }
+        }
+        for z in 0..3 {
+            for w in 0..3 {
+                prog.push_str(&format!("(t z{z} w{w})\n"));
+            }
+        }
+        s.add_all_sexpr(prog.as_bytes()).unwrap();
+        let body = enc("(, (r $x $y) (s $y $z) (t $z $w))");
+        let (factors, nvars) = parse_body_factors(&body).unwrap();
+        let var_order: Vec<usize> = (0..nvars).collect();
+        let mut ec = 0u64;
+        run_unify_join_stream(&s.btm, &factors, &var_order, nvars, &mut |_t| {
+            ec += 1;
+            true
+        });
+        let fc = crate::ghd::ghd_aggregate_auto::<u64>(&s.btm, &factors, nvars, |_| 1)
+            .expect("the chain decomposes");
+        assert_eq!(fc, ec, "auto factorized count must equal enumerate");
+        assert!(ec > 0, "the test must exercise matches");
+    }
+
+    /// The asymptotic separation: on a hub 2-path (k inputs, k^2 output) enumerate-and-count is
+    /// O(k^2) while the factorized count is O(k), so the speedup grows with k. This is the win the
+    /// WCO join cannot match: the same COUNT, without touching the output.
+    #[test]
+    #[ignore = "timing: run explicitly for the factorized-count separation"]
+    fn ghd_count_win_scales() {
+        for k in [50usize, 100, 200, 400, 800] {
+            let mut s = crate::space::Space::new();
+            let mut prog = String::new();
+            for a in 0..k {
+                prog.push_str(&format!("(r a{a} hub)\n"));
+            }
+            for z in 0..k {
+                prog.push_str(&format!("(s hub z{z})\n"));
+            }
+            s.add_all_sexpr(prog.as_bytes()).unwrap();
+            let body = enc("(, (r $x $y) (s $y $z))");
+            let (factors, nvars) = parse_body_factors(&body).unwrap();
+            let var_order: Vec<usize> = (0..nvars).collect();
+
+            let t = std::time::Instant::now();
+            let mut ec = 0u64;
+            run_unify_join_stream(&s.btm, &factors, &var_order, nvars, &mut |_t| {
+                ec += 1;
+                true
+            });
+            let enum_us = t.elapsed().as_micros().max(1);
+
+            let t = std::time::Instant::now();
+            let fc = crate::ghd::ghd_count(&s.btm, &factors, nvars, &var_order);
+            let fact_us = t.elapsed().as_micros().max(1);
+
+            assert_eq!(fc, ec, "factorized count must equal enumerate count");
+            eprintln!(
+                "k={k:4} output={ec:9}  enumerate {enum_us:8}us  factorized {fact_us:6}us  speedup {:.1}x",
+                enum_us as f64 / fact_us as f64
+            );
+        }
+    }
+
+    /// The flybase query shape (main.rs `bench_flybase` P1): a star join
+    /// `(gene_name_of TP g $x)(SPO $x includes $y)(SPO $x transcribed_from $z)` whose COUNT the
+    /// CountSink computes today by enumerating the O(k^2) product into a PathMap. `$y` and `$z` are
+    /// independent given `$x`, so `ghd_aggregate_auto` counts it in O(k) via Sum_x deg_y(x)*deg_z(x).
+    #[test]
+    #[ignore = "timing: the flybase star-join COUNT win vs the enumerate CountSink"]
+    fn ghd_count_flybase_star_shape() {
+        for k in [50usize, 100, 200, 400, 800] {
+            let mut s = crate::space::Space::new();
+            let mut prog = String::from("(gene_name_of TP g x)\n");
+            for y in 0..k {
+                prog.push_str(&format!("(SPO x includes y{y})\n"));
+            }
+            for z in 0..k {
+                prog.push_str(&format!("(SPO x transcribed_from z{z})\n"));
+            }
+            s.add_all_sexpr(prog.as_bytes()).unwrap();
+            let body =
+                enc("(, (gene_name_of TP g $x) (SPO $x includes $y) (SPO $x transcribed_from $z))");
+            let (factors, nvars) = parse_body_factors(&body).unwrap();
+            let order: Vec<usize> = (0..nvars).collect();
+
+            // enumerate the join (what the CountSink dedups today)
+            let t = std::time::Instant::now();
+            let mut ec = 0u64;
+            run_unify_join_stream(&s.btm, &factors, &order, nvars, &mut |_t| {
+                ec += 1;
+                true
+            });
+            let enum_us = t.elapsed().as_micros().max(1);
+
+            // factorized count via the auto-derived elimination order
+            let t = std::time::Instant::now();
+            let fc = crate::ghd::ghd_aggregate_auto::<u64>(&s.btm, &factors, nvars, |_| 1)
+                .expect("the star decomposes");
+            let fact_us = t.elapsed().as_micros().max(1);
+
+            assert_eq!(fc, ec, "factorized star count must equal the enumerated count");
+            eprintln!(
+                "k={k:4} output={ec:9}  enumerate {enum_us:8}us  factorized {fact_us:6}us  speedup {:.1}x",
+                enum_us as f64 / fact_us as f64
+            );
         }
     }
 

@@ -39,6 +39,7 @@ wasm = ["dep:wasmtime"]
 z3 = []
 egraph = []
 weighted_select = []
+factorized_aggregate = [] # experimental: route COUNT/SUM/MIN/MAX/AND sinks to the factorized aggregation engine
 leapfrog = [] # experimental: route flat conjunctive exec bodies to the WCO leapfrog join
 no_search = []
 grounding = []
