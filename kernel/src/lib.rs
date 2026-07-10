@@ -24,3 +24,7 @@ pub mod term_identity;
 #[doc(hidden)]
 pub use mork_expr as __mork_expr;
 pub mod weighted_paths;
+pub use sinks::{
+    wasm_linear_memory_policy, WasmLinearMemoryPolicy, WASM_LINEAR_MEMORY_GUARD_BYTES,
+    WASM_LINEAR_MEMORY_RESERVATION_BYTES,
+};
