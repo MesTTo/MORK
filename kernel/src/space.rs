@@ -1738,7 +1738,8 @@ impl Space {
                 // unified factors (the query_multi_raw wrapper passes the same
                 // slice twice); a semi-naive delta call passes distinct
                 // unify_sources and must stay on the interpreted matcher.
-                let plain_shape = std::ptr::eq(search_sources.as_ptr(), unify_sources.as_ptr())
+                let plain_shape = cfg!(feature = "compiled_matcher")
+                    && std::ptr::eq(search_sources.as_ptr(), unify_sources.as_ptr())
                     && search_sources.len() == unify_sources.len();
                 match if plain_shape { compile_match_program(search_sources) } else { None } {
                     Some(ops) => execute_match_program(
