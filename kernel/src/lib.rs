@@ -10,6 +10,7 @@ pub mod path_dnf;
 pub mod path_space_ops;
 pub mod space;
 pub mod json_path_query;
+pub mod zipper_join;
 mod sources;
 mod sinks;
 mod pure;
