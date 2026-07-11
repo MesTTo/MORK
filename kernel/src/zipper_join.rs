@@ -1490,8 +1490,10 @@ pub fn collect_factor_vars(factor: &Factor, out: &mut std::collections::BTreeSet
 /// relation to decide would cost more than it saves (following the fork's 200k threshold).
 const FD_PROBE_ROW_CAP: usize = 200_000;
 
-/// The engine dispatch's performance policy, distinct from routability: dispatch a body only when
-/// it has a cycle the leapfrog can seek and win on. Three conjuncts, each with a measured
+/// The engine dispatch's performance policy, distinct from routability: dispatch a body when it
+/// has a cycle the leapfrog can seek and win on, or when it is an acyclic multiway body whose
+/// large factor a small factor guards through a shared whole column (see
+/// [`acyclic_guarded_join_profits`]). Three conjuncts for the cyclic class, each with a measured
 /// counterexample behind it, cheapest first.
 ///
 /// The cycle must be seekable: cyclic over the variables that occur as whole columns, because a
@@ -1504,8 +1506,13 @@ const FD_PROBE_ROW_CAP: usize = 200_000;
 /// because alpha-acyclic queries are where a relation-at-a-time plan already meets the optimal
 /// bound, O(input + output), and the seek beats the product asymptotically only where every such
 /// plan builds a super-linear intermediate the AGM bound forbids the answer from having (Ngo et
-/// al. 2012). This declines paths, semijoins, enumeration-and-filter, and pure products without
-/// reading data (a 10^6-tuple product measured 1.8x slower dispatched).
+/// al. 2012). This declines two-factor paths, enumeration-and-filter, and pure products without
+/// reading data (a 10^6-tuple product measured 1.8x slower dispatched). Acyclic multiway bodies
+/// fall through to the guarded-join arm, because "a relation-at-a-time plan meets the bound"
+/// assumes the plan binds selectively, and the ProductZipper enumerates in written body order: a
+/// large factor written before its guards walks its whole relation per candidate however small
+/// the output (chaining's bfc-xp bodies measured 220,380,293 transitions against the join's
+/// 29,969 on identical answers).
 ///
 /// And the cycle must not be functionally degenerate: `(a /\ b = c)(a \/ b = d)(c - d = e)` is a
 /// real hyperedge diamond, but each relation is a function, so its AGM bound collapses to O(N)
@@ -1533,7 +1540,7 @@ const FD_PROBE_ROW_CAP: usize = 200_000;
 /// with bounded reads.
 fn body_factors_profit_from_leapfrog(map: &PathMap<()>, factors: &[Factor], nvars: usize) -> bool {
     if !(hypergraph_is_cyclic(column_var_edges(factors), nvars) && body_is_cyclic(factors, nvars)) {
-        return false;
+        return acyclic_guarded_join_profits(map, factors);
     }
     let counts: Vec<usize> = factors
         .iter()
@@ -1552,6 +1559,51 @@ fn body_factors_profit_from_leapfrog(map: &PathMap<()>, factors: &[Factor], nvar
         }
     }
     !body_is_acyclic_modulo_fds(map, factors, nvars)
+}
+
+/// The acyclic arm of the dispatch policy: a multiway body profits when a bounded-small factor
+/// guards a large factor's enumeration through a variable both hold as a whole column. The
+/// leapfrog then binds the guarded column from the small side in a handful of seeks, where the
+/// written-order product walks the large relation per candidate: the chaining repo's
+/// backward-via-forward bodies (`sol x decFn x lte`, a pure variable path) measured 17.1 s on
+/// the product and 145 ms dispatched, identical space dumps. The whole-column requirement on
+/// both sides is what separates a selective guard from a schematic one: pc-fc's single-fact
+/// rule base shares its variables only inside a nonground compound, seekable by neither side,
+/// and enumeration-shaped bodies of that kind measured a 1.4x loss dispatched. Two-factor
+/// bodies stay declined without reading data (the transitive bench's closure step), and a body
+/// whose factors are all small or all large has no guard relationship to exploit.
+fn acyclic_guarded_join_profits(map: &PathMap<()>, factors: &[Factor]) -> bool {
+    if factors.len() < 3 {
+        return false;
+    }
+    let whole_column_vars: Vec<std::collections::BTreeSet<usize>> = factors
+        .iter()
+        .map(|f| {
+            f.cols
+                .iter()
+                .filter_map(|col| match col {
+                    FactorColumn::Var(v) => Some(*v),
+                    FactorColumn::Term(_) => None,
+                })
+                .collect()
+        })
+        .collect();
+    let counts: Vec<usize> = factors
+        .iter()
+        .map(|f| bounded_fact_count(map, f, DISPATCH_MIN_FACTS))
+        .collect();
+    let large: Vec<usize> = (0..factors.len())
+        .filter(|&i| counts[i] >= DISPATCH_MIN_FACTS)
+        .collect();
+    if large.is_empty() {
+        return false;
+    }
+    (0..factors.len()).any(|i| {
+        counts[i] < DISPATCH_MIN_FACTS
+            && large
+                .iter()
+                .any(|&j| j != i && !whole_column_vars[i].is_disjoint(&whole_column_vars[j]))
+    })
 }
 
 /// Below this many facts in every factor's relation the query is small either way and the
