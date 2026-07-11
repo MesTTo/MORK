@@ -157,6 +157,41 @@ pub static mut transitions: usize = 0;
 pub static mut unifications: usize = 0;
 pub static mut writes: usize = 0;
 
+const EXEC_PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c'] };
+
+#[cfg(feature = "stratified_quiescence")]
+thread_local! {
+    static STRATIFIED_NON_EXEC_COUNT_DELTA: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn stratified_note_btm_insert(path: &[u8], inserted: bool) {
+    #[cfg(not(feature = "stratified_quiescence"))]
+    let _ = (path, inserted);
+    #[cfg(feature = "stratified_quiescence")]
+    if inserted && !path.starts_with(&EXEC_PREFIX) {
+        STRATIFIED_NON_EXEC_COUNT_DELTA.with(|count| count.set(count.get() + 1));
+    }
+}
+
+pub(crate) fn stratified_note_btm_remove(path: &[u8], removed: bool) {
+    #[cfg(not(feature = "stratified_quiescence"))]
+    let _ = (path, removed);
+    #[cfg(feature = "stratified_quiescence")]
+    if removed && !path.starts_with(&EXEC_PREFIX) {
+        STRATIFIED_NON_EXEC_COUNT_DELTA.with(|count| count.set(count.get() - 1));
+    }
+}
+
+#[cfg(feature = "stratified_quiescence")]
+fn reset_stratified_non_exec_count_delta() {
+    STRATIFIED_NON_EXEC_COUNT_DELTA.with(|count| count.set(0));
+}
+
+#[cfg(feature = "stratified_quiescence")]
+fn stratified_non_exec_count_delta() -> isize {
+    STRATIFIED_NON_EXEC_COUNT_DELTA.with(|count| count.get())
+}
+
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
@@ -182,6 +217,14 @@ pub struct Space {
     /// give-up disarm below.
     #[cfg(feature = "semi_naive_ic")]
     sni_loop_firings: usize,
+    /// Lower-stratum work generation for stratified barriers. It advances only
+    /// when a non-barrier exec below an eligible barrier changes the byte space.
+    #[cfg(feature = "stratified_quiescence")]
+    stratified_generation: u64,
+    /// Last lower-work generation at which a raw barrier exec fired. This keeps a
+    /// self-reemitted no-op barrier from spinning before lower work happens again.
+    #[cfg(feature = "stratified_quiescence")]
+    stratified_barriers: HashMap<Vec<u8>, u64>,
     pub btm: PathMap<()>,
     pub sm: SharedMappingHandle,
     /// Locked like `z3s`: ArenaCompactTree carries a Cell-based cursor, and the
@@ -834,6 +877,10 @@ impl Space {
             sni_semi_firings: 0,
             #[cfg(feature = "semi_naive_ic")]
             sni_loop_firings: 0,
+            #[cfg(feature = "stratified_quiescence")]
+            stratified_generation: 0,
+            #[cfg(feature = "stratified_quiescence")]
+            stratified_barriers: HashMap::new(),
             btm: PathMap::new(), sm: SharedMapping::new(), mmaps: std::sync::Mutex::new(HashMap::new()), z3s: std::sync::Mutex::new(HashMap::new()), last_merkleize: Instant::now(), timing: false }
     }
 
@@ -849,6 +896,10 @@ impl Space {
             sni_semi_firings: 0,
             #[cfg(feature = "semi_naive_ic")]
             sni_loop_firings: 0,
+            #[cfg(feature = "stratified_quiescence")]
+            stratified_generation: 0,
+            #[cfg(feature = "stratified_quiescence")]
+            stratified_barriers: HashMap::new(),
             btm: PathMap::new(),
             sm: self.sm.clone(),
             mmaps: std::sync::Mutex::new(HashMap::new()),
@@ -2054,7 +2105,9 @@ impl Space {
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        any_new |= wz.set_val(()).is_none();
+                        let inserted = wz.set_val(()).is_none();
+                        stratified_note_btm_insert(&buffer[..], inserted);
+                        any_new |= inserted;
                     }
                     true
                 }
@@ -2351,7 +2404,9 @@ impl Space {
                                 let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
                                 oi = toi;
                                 wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                                any_new |= wz.set_val(()).is_none();
+                                let inserted = wz.set_val(()).is_none();
+                                stratified_note_btm_insert(&buffer[..], inserted);
+                                any_new |= inserted;
                             }
                             true
                         }
@@ -2430,7 +2485,9 @@ impl Space {
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        any_new |= wz.set_val(()).is_none();
+                        let inserted = wz.set_val(()).is_none();
+                        stratified_note_btm_insert(&buffer[..], inserted);
+                        any_new |= inserted;
                     }
                     true
                 }
@@ -2702,9 +2759,154 @@ impl Space {
         }, _err => return Err("exec shape (exec <loc> <patterns> <templates>)"))
     }
 
+    fn interpret_taken_exec(&mut self, mut x: Vec<u8>, done: usize) {
+        let xe = Expr { ptr: x.as_mut_ptr() };
+        let start = Instant::now();
+        if let Err(e) = self.interpret(xe) {
+            debug!(target: "interpret", "not interpreting: {}", e);
+        }
+        if self.timing {
+            let start_string = start.elapsed().as_nanos().to_string();
+            let start_str = start_string.as_str();
+            let done_string = done.to_string();
+            let done_str = done_string.as_str();
+            let buf = mork_expr::construct!("timing" xe done_str start_str).unwrap();
+            let inserted = self.btm.insert(&buf[..], ()).is_none();
+            stratified_note_btm_insert(&buf[..], inserted);
+            trace!(target: "interpret", "interpret took {} ns", start_str);
+        }
+    }
+
+    fn take_first_exec_path(&mut self) -> Option<Vec<u8>> {
+        let path = {
+            let mut rz = self.btm.read_zipper_at_borrowed_path(&EXEC_PREFIX[..]);
+            rz.to_next_val().then(|| rz.into_path())
+        };
+        if let Some(path) = path {
+            self.btm.remove(&path[..]);
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "stratified_quiescence")]
+    fn is_quiesce_exec_path(path: &[u8]) -> bool {
+        if !path.starts_with(&EXEC_PREFIX) {
+            return false;
+        }
+        let loc = unsafe {
+            Expr {
+                ptr: path.as_ptr().add(EXEC_PREFIX.len()).cast_mut(),
+            }
+            .span()
+            .as_ref()
+            .unwrap()
+        };
+        if !matches!(loc.first().map(|b| byte_item(*b)), Some(Tag::Arity(n)) if n > 0) {
+            return false;
+        }
+        loc.get(1) == Some(&item_byte(Tag::SymbolSize(7))) && loc.get(2..9) == Some(b"quiesce")
+    }
+
+    #[cfg(feature = "stratified_quiescence")]
+    fn first_quiesce_exec_path(&self) -> Option<Vec<u8>> {
+        let mut rz = self.btm.read_zipper_at_borrowed_path(&EXEC_PREFIX[..]);
+        while rz.to_next_val() {
+            let path = rz.origin_path();
+            if Self::is_quiesce_exec_path(path) {
+                return Some(path.to_vec());
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "stratified_quiescence")]
+    fn non_barrier_exec_paths_before(&self, barrier: &[u8]) -> Vec<Vec<u8>> {
+        let mut paths = Vec::new();
+        let mut rz = self.btm.read_zipper_at_borrowed_path(&EXEC_PREFIX[..]);
+        while rz.to_next_val() {
+            let path = rz.origin_path();
+            if path >= barrier {
+                break;
+            }
+            if !Self::is_quiesce_exec_path(path) {
+                paths.push(path.to_vec());
+            }
+        }
+        paths
+    }
+
+    #[cfg(feature = "stratified_quiescence")]
+    fn exec_region_snapshot(&self) -> PathMap<()> {
+        self.btm
+            .read_zipper_at_borrowed_path(&EXEC_PREFIX[..])
+            .make_map()
+    }
+
+    #[cfg(feature = "stratified_quiescence")]
+    fn restore_exec_region(&mut self, exec_snapshot: PathMap<()>) {
+        self.btm
+            .write_zipper_at_path(&EXEC_PREFIX[..])
+            .graft_map(exec_snapshot);
+    }
+
+    #[cfg(feature = "stratified_quiescence")]
+    fn fire_lower_exec_for_barrier(&mut self, path: Vec<u8>, done: usize) -> Option<bool> {
+        let exec_snapshot = self.exec_region_snapshot();
+        reset_stratified_non_exec_count_delta();
+        self.btm.remove(&path[..])?;
+        self.interpret_taken_exec(path.clone(), done);
+
+        if stratified_non_exec_count_delta() != 0 {
+            Some(true)
+        } else {
+            // Equal non-exec cardinality is treated as quiescent, so a remove
+            // and re-add of the same fact nets out just as it did under the
+            // previous set-subtract signal. Restore the exec subtree snapshot to
+            // discard exec-only churn, then park the fired control until a later
+            // barrier re-arms it from stable rule bytes.
+            self.restore_exec_region(exec_snapshot);
+            self.btm.remove(&path[..]);
+            Some(false)
+        }
+    }
+
+    #[cfg(feature = "stratified_quiescence")]
+    fn metta_calculus_stratified_step(&mut self, barrier: Vec<u8>, done: &mut usize, steps: usize) {
+        for lower in self.non_barrier_exec_paths_before(&barrier) {
+            if *done >= steps {
+                return;
+            }
+            let Some(changed) = self.fire_lower_exec_for_barrier(lower, *done) else {
+                continue;
+            };
+            *done += 1;
+            if changed {
+                self.stratified_generation = self.stratified_generation.wrapping_add(1);
+                return;
+            }
+        }
+
+        if *done >= steps {
+            return;
+        }
+        if self.stratified_barriers.get(&barrier).copied() == Some(self.stratified_generation) {
+            if self.btm.remove(&barrier[..]).is_some() {
+                *done += 1;
+            }
+            return;
+        }
+        if self.btm.remove(&barrier[..]).is_none() {
+            return;
+        }
+        self.stratified_barriers.insert(barrier.clone(), self.stratified_generation);
+        self.interpret_taken_exec(barrier, *done);
+        *done += 1;
+    }
+
     pub fn metta_calculus(&mut self, steps: usize) -> usize {
         let mut done: usize = 0;
-        const PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c' ] };
 
         // Arm the semi-naive immediate-consequence delta for the duration of this
         // loop; every `,`->`,` rule then matches only what changed since IT last
@@ -2723,25 +2925,14 @@ impl Space {
         }
 
         while done < steps {
-            let mut rz = self.btm.read_zipper_at_borrowed_path(&PREFIX[..]);
-            if rz.to_next_val() {
-                // cannot be here `rz` conflicts potentially with zippers(rz.path())
-                let mut x: Vec<u8> = rz.into_path(); // should use local buffer
-                self.btm.remove(&x[..]);
-                let mut xe = Expr{ ptr: x.as_mut_ptr() };
-                let start = Instant::now();
-                if let Err(e) = self.interpret(xe) {
-                    debug!(target: "interpret", "not interpreting: {}", e);
-                }
-                if self.timing {
-                    let start_string = start.elapsed().as_nanos().to_string();
-                    let start_str = start_string.as_str();
-                    let done_string = done.to_string();
-                    let done_str = done_string.as_str();
-                    let buf = mork_expr::construct!("timing" xe done_str start_str).unwrap();
-                    self.btm.insert(&buf[..], ());
-                    trace!(target: "interpret", "interpret took {} ns", start_str);
-                }
+            #[cfg(feature = "stratified_quiescence")]
+            if let Some(barrier) = self.first_quiesce_exec_path() {
+                self.metta_calculus_stratified_step(barrier, &mut done, steps);
+                continue;
+            }
+
+            if let Some(x) = self.take_first_exec_path() {
+                self.interpret_taken_exec(x, done);
             } else {
                 break;
             }
@@ -2865,6 +3056,334 @@ mod tests {
         );
 
         assert_eq!(count, 2);
+    }
+}
+
+#[cfg(all(test, feature = "stratified_quiescence"))]
+mod stratified_quiescence_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn build(program: &str) -> Space {
+        let mut s = Space::new();
+        s.add_all_sexpr(program.as_bytes()).unwrap();
+        s
+    }
+
+    fn dump(space: &Space) -> Vec<u8> {
+        let mut out = Vec::new();
+        space.dump_all_sexpr(&mut out).unwrap();
+        out
+    }
+
+    fn paths(space: &Space) -> BTreeSet<Vec<u8>> {
+        let mut out = BTreeSet::new();
+        let mut rz = space.btm.read_zipper();
+        while rz.to_next_val() {
+            out.insert(rz.path().to_vec());
+        }
+        out
+    }
+
+    fn all_non_barrier_exec_paths(space: &Space) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rz = space.btm.read_zipper_at_borrowed_path(&EXEC_PREFIX[..]);
+        while rz.to_next_val() {
+            let path = rz.origin_path();
+            if !Space::is_quiesce_exec_path(path) {
+                out.push(path.to_vec());
+            }
+        }
+        out
+    }
+
+    fn all_exec_paths(space: &Space) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rz = space.btm.read_zipper_at_borrowed_path(&EXEC_PREFIX[..]);
+        while rz.to_next_val() {
+            out.push(rz.origin_path().to_vec());
+        }
+        out
+    }
+
+    fn run_stage_to_quiescence(space: &mut Space) {
+        for step in 0..10_000 {
+            let mut changed = false;
+            let mut fired = false;
+            for path in all_non_barrier_exec_paths(space) {
+                let Some(did_change) = space.fire_lower_exec_for_barrier(path, step) else {
+                    continue;
+                };
+                fired = true;
+                if did_change {
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                return;
+            }
+            assert!(fired, "stage reported a change without firing an exec");
+        }
+        panic!("stage did not quiesce within the test step cap");
+    }
+
+    fn run_reference_loop(program: &str, steps: usize) -> (usize, BTreeSet<Vec<u8>>) {
+        let mut s = build(program);
+        let mut done = 0usize;
+        while done < steps {
+            let Some(path) = s.take_first_exec_path() else {
+                break;
+            };
+            s.interpret_taken_exec(path, done);
+            done += 1;
+        }
+        (done, paths(&s))
+    }
+
+    fn run_stratified(program: &str, steps: usize) -> (usize, BTreeSet<Vec<u8>>) {
+        let mut s = build(program);
+        let done = s.metta_calculus(steps);
+        (done, paths(&s))
+    }
+
+    const TC_BASE: &str = r#"
+(edge a b)
+(edge b c)
+(edge c d)
+((tc base)
+  (, ((tc base) $p $t)
+     (edge $x $y))
+  (, (path $x $y)
+     (exec (stage base) $p $t)))
+((tc step)
+  (, ((tc step) $p $t)
+     (path $x $y)
+     (edge $y $z))
+  (, (path $x $z)
+     (exec (stage step) $p $t)))
+(exec (stage base)
+      (, ((tc base) $p $t)
+         (edge $x $y))
+      (, (path $x $y)
+         (exec (stage base) $p $t)))
+(exec (stage step)
+      (, ((tc step) $p $t)
+         (path $x $y)
+         (edge $y $z))
+      (, (path $x $z)
+         (exec (stage step) $p $t)))
+"#;
+
+    #[test]
+    fn barrier_matches_staged_transitive_closure_then_count() {
+        let barrier_program = format!(
+            r#"{TC_BASE}
+(exec (quiesce count paths)
+      (, (path $x $y))
+      (O (count (path-count $n) $n (path $x $y))))
+"#
+        );
+        let mut barrier = build(&barrier_program);
+        barrier.metta_calculus(1_000);
+
+        let mut staged = build(TC_BASE);
+        run_stage_to_quiescence(&mut staged);
+        staged
+            .add_all_sexpr(
+                br#"
+(exec (stage count paths)
+      (, (path $x $y))
+      (O (count (path-count $n) $n (path $x $y))))
+"#,
+            )
+            .unwrap();
+        run_stage_to_quiescence(&mut staged);
+
+        assert_eq!(dump(&barrier), dump(&staged));
+        assert!(
+            String::from_utf8_lossy(&dump(&barrier)).contains("(path-count 6)"),
+            "closure count did not materialize:\n{}",
+            String::from_utf8_lossy(&dump(&barrier))
+        );
+    }
+
+    const THREE_STRATA_BASE: &str = r#"
+(seed a)
+((rule one)
+  (, ((rule one) $p $t)
+     (seed $x))
+  (, (mid $x)
+     (exec (stage one) $p $t)))
+((rule second)
+  (, ((rule second) $p $t)
+     (mid $x))
+  (, (late $x)
+     (exec (stage second pass) $p $t)))
+((barrier finish)
+  (, (late $x))
+  (, (done $x)))
+(exec (stage one)
+      (, ((rule one) $p $t)
+         (seed $x))
+      (, (mid $x)
+         (exec (stage one) $p $t)))
+"#;
+
+    #[test]
+    fn barrier_can_arm_the_next_stratum_rules() {
+        let barrier_program = format!(
+            r#"{THREE_STRATA_BASE}
+(exec (quiesce arm second)
+      (, ((rule second) $p $t)
+         ((barrier finish) $bp $bt))
+      (, (exec (stage second pass) $p $t)
+         (exec (quiesce finish second now) $bp $bt)))
+"#
+        );
+        let mut barrier = build(&barrier_program);
+        barrier.metta_calculus(1_000);
+
+        let mut staged = build(THREE_STRATA_BASE);
+        run_stage_to_quiescence(&mut staged);
+        staged.add_all_sexpr(br#"(exec (stage second pass) (, ((rule second) $p $t) (mid $x)) (, (late $x) (exec (stage second pass) $p $t)))"#).unwrap();
+        run_stage_to_quiescence(&mut staged);
+        staged
+            .add_all_sexpr(br#"(exec (stage finish second now) (, (late $x)) (, (done $x)))"#)
+            .unwrap();
+        staged.metta_calculus(10);
+
+        assert_eq!(dump(&barrier), dump(&staged));
+        assert!(
+            String::from_utf8_lossy(&dump(&barrier)).contains("(done a)"),
+            "armed stratum did not finish:\n{}",
+            String::from_utf8_lossy(&dump(&barrier))
+        );
+    }
+
+    const PHASE_BASE_PREFIX: &str = r#"
+(todo Z)
+(next Z (S Z))
+(next (S Z) (S (S Z)))
+((phase-rule)
+  (, ((phase-rule) $p $t)
+     (todo $n))
+  (, (seen $n)
+     (exec (phase rule) $p $t)))
+"#;
+
+    const PHASE_RULE_EXEC: &str = r#"
+(exec (phase rule)
+      (, ((phase-rule) $p $t)
+         (todo $n))
+      (, (seen $n)
+         (exec (phase rule) $p $t)))
+"#;
+
+    const PHASE_BARRIER_PATTERNS: &str = r#"(, ((phase-barrier) $bp $bt)
+         ((phase-rule) $rp $rt)
+         (todo $n)
+         (next $n $m))"#;
+
+    const PHASE_BARRIER_TEMPLATES: &str = r#"(O (- (todo $n))
+         (+ (todo $m))
+         (+ (exec (phase rule) $rp $rt))
+         (+ (exec (quiesce phase advance) $bp $bt)))"#;
+
+    fn phase_barrier_rule_fact() -> String {
+        format!("((phase-barrier)\n  {PHASE_BARRIER_PATTERNS}\n  {PHASE_BARRIER_TEMPLATES})\n")
+    }
+
+    fn phase_barrier_exec() -> String {
+        format!(
+            "(exec (quiesce phase advance)\n      {PHASE_BARRIER_PATTERNS}\n      {PHASE_BARRIER_TEMPLATES})\n"
+        )
+    }
+
+    fn phase_base() -> String {
+        let mut s = String::from(PHASE_BASE_PREFIX);
+        s.push_str(&phase_barrier_rule_fact());
+        s.push_str(PHASE_RULE_EXEC);
+        s
+    }
+
+    fn add_phase_barrier(space: &mut Space) {
+        let exec = phase_barrier_exec();
+        space.add_all_sexpr(exec.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn self_reemitted_barrier_advances_only_after_lower_work() {
+        let barrier_program = {
+            let mut s = phase_base();
+            s.push_str(&phase_barrier_exec());
+            s
+        };
+        let mut barrier = build(&barrier_program);
+        barrier.metta_calculus(1_000);
+
+        let phase_base = phase_base();
+        let mut staged = build(&phase_base);
+        run_stage_to_quiescence(&mut staged);
+        staged.remove_all_sexpr(b"(todo Z)").unwrap();
+        staged.add_all_sexpr(b"(todo (S Z))\n").unwrap();
+        staged.add_all_sexpr(PHASE_RULE_EXEC.as_bytes()).unwrap();
+        run_stage_to_quiescence(&mut staged);
+        staged.remove_all_sexpr(b"(todo (S Z))").unwrap();
+        staged.add_all_sexpr(b"(todo (S (S Z)))\n").unwrap();
+        staged.add_all_sexpr(PHASE_RULE_EXEC.as_bytes()).unwrap();
+        run_stage_to_quiescence(&mut staged);
+        add_phase_barrier(&mut staged);
+        staged.metta_calculus(10);
+
+        assert_eq!(dump(&barrier), dump(&staged));
+        let barrier_dump = dump(&barrier);
+        let shown = String::from_utf8_lossy(&barrier_dump);
+        assert!(shown.contains("(seen Z)"), "missing first phase:\n{shown}");
+        assert!(shown.contains("(seen (S Z))"), "missing second phase:\n{shown}");
+        assert!(shown.contains("(seen (S (S Z)))"), "missing final phase:\n{shown}");
+        assert!(
+            all_exec_paths(&barrier).is_empty(),
+            "phase program left live exec facts:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn no_barrier_resource_programs_match_the_reference_scheduler() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/resources");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(dir).expect("resources dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mm2") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            if (name == "weighted_select" && !cfg!(feature = "weighted_select"))
+                || (name == "egraph_saturation" && !cfg!(feature = "egraph"))
+            {
+                continue;
+            }
+            let program = std::fs::read_to_string(&path).expect("readable resource");
+            assert!(
+                !program.contains("(quiesce"),
+                "resource corpus unexpectedly contains a barrier: {name}"
+            );
+            let steps_list: &[usize] = if name.starts_with("decision_tree") || name == "ip_sudoku" {
+                &[1, 7]
+            } else {
+                &[1, 7, 40]
+            };
+            for &steps in steps_list {
+                let reference = run_reference_loop(&program, steps);
+                let stratified = run_stratified(&program, steps);
+                assert_eq!(
+                    reference, stratified,
+                    "{name} steps={steps}: stratified feature changed a no-barrier program"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 8, "expected the resource corpus, found {checked}");
     }
 }
 

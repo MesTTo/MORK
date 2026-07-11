@@ -165,6 +165,12 @@ pub(crate) trait Sink {
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w;
 }
 
+fn set_btm_val_and_note<W: ZipperWriting<()>>(wz: &mut W, full_path: &[u8]) -> bool {
+    let inserted = wz.set_val(()).is_none();
+    crate::space::stratified_note_btm_insert(full_path, inserted);
+    inserted
+}
+
 pub struct CompatSink { e: Expr, changed: bool }
 
 impl Sink for CompatSink {
@@ -180,7 +186,7 @@ impl Sink for CompatSink {
         trace!(target: "sink", "+ (compat) at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "+ (compat) sinking '{}'", serialize(mpath));
         wz.move_to_path(mpath);
-        self.changed |= wz.set_val(()).is_none();
+        self.changed |= set_btm_val_and_note(wz, path);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "+ (compat) finalizing");
@@ -202,7 +208,7 @@ impl Sink for AddSink {
         trace!(target: "sink", "+ at '{}' sinking raw '{}'", serialize(wz.root_prefix_path()), serialize(path));
         trace!(target: "sink", "+ sinking '{}'", serialize(mpath));
         wz.move_to_path(mpath);
-        self.changed |= wz.set_val(()).is_none();
+        self.changed |= set_btm_val_and_note(wz, &path[3..]);
     }
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "+ finalizing");
@@ -292,7 +298,7 @@ impl Sink for USink {
                 trace!(target: "sink", "U unified expression '{}'", serialize(buf_slice));
                 let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
                 wz.move_to_path(&buf_slice[wz.root_prefix_path().len()..]);
-                wz.set_val(());
+                set_btm_val_and_note(wz, buf_slice);
                 true
             }
         }
@@ -337,7 +343,7 @@ impl Sink for AUSink {
                 trace!(target: "sink", "AU anti-unified expression '{}'", serialize(&buf[..self.last]));
                 let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
                 wz.move_to_path(&buf[wz.root_prefix_path().len()..self.last]);
-                wz.set_val(());
+                set_btm_val_and_note(wz, &buf[..self.last]);
                 true
             }
         }
@@ -397,7 +403,27 @@ impl Sink for RemoveSink {
         //         println!("val not removed");
         //     }
         // }
-        match wz.subtract_into(&self.remove.read_zipper(), true) {
+        #[cfg(feature = "stratified_quiescence")]
+        let removed_non_exec_paths = {
+            let root = wz.root_prefix_path().to_vec();
+            let mut paths = Vec::new();
+            let mut rz = self.remove.read_zipper();
+            while rz.to_next_val() {
+                if wz.val_at(rz.path()).is_some() {
+                    let mut full_path = Vec::with_capacity(root.len() + rz.path().len());
+                    full_path.extend_from_slice(&root);
+                    full_path.extend_from_slice(rz.path());
+                    paths.push(full_path);
+                }
+            }
+            paths
+        };
+        let status = wz.subtract_into(&self.remove.read_zipper(), true);
+        #[cfg(feature = "stratified_quiescence")]
+        for path in removed_non_exec_paths {
+            crate::space::stratified_note_btm_remove(&path, true);
+        }
+        match status {
             AlgebraicStatus::Element => { true }
             AlgebraicStatus::Identity => { false }
             AlgebraicStatus::None => { true } // GOAT maybe not?
@@ -455,10 +481,37 @@ impl <const head: bool> Sink for HeadTailSink<head> {
         wz.reset();
         trace!(target: "sink", "head/tail finalizing by joining {} at '{}'", self.count, serialize(wz.origin_path()));
 
+        #[cfg(feature = "stratified_quiescence")]
+        let inserted_paths = {
+            let root = wz.root_prefix_path().to_vec();
+            let mut paths = Vec::new();
+            let mut rz = self.extrema.read_zipper();
+            while rz.to_next_val() {
+                if wz.val_at(rz.path()).is_none() {
+                    let mut full_path = Vec::with_capacity(root.len() + rz.path().len());
+                    full_path.extend_from_slice(&root);
+                    full_path.extend_from_slice(rz.path());
+                    paths.push(full_path);
+                }
+            }
+            paths
+        };
         match wz.join_into(&self.extrema.read_zipper()) {
-            AlgebraicStatus::Element => { true }
+            AlgebraicStatus::Element => {
+                #[cfg(feature = "stratified_quiescence")]
+                for path in inserted_paths {
+                    crate::space::stratified_note_btm_insert(&path, true);
+                }
+                true
+            }
             AlgebraicStatus::Identity => { false }
-            AlgebraicStatus::None => { true } // GOAT maybe not?
+            AlgebraicStatus::None => {
+                #[cfg(feature = "stratified_quiescence")]
+                for path in inserted_paths {
+                    crate::space::stratified_note_btm_insert(&path, true);
+                }
+                true
+            } // GOAT maybe not?
         }
     }
 }
@@ -561,7 +614,7 @@ impl Sink for WASMSink {
                 let ospan = unsafe { Expr{ ptr: omem.as_ptr().cast_mut() }.span().as_ref().unwrap() };
                 trace!(target: "sink", "wasm output '{}'", serialize(ospan));
                 wz.move_to_path(ospan);
-                self.changed |= wz.set_val(()).is_none();
+                self.changed |= set_btm_val_and_note(wz, ospan);
             }
             Err(e) => {
                 trace!(target: "sink", "wasm error {:?}", e);
@@ -631,7 +684,7 @@ impl Sink for CountSink {
                     let fixed = &prz.path()[..prz.path().len()-(1+cnt_str.len())];
                     trace!(target: "sink", "fixed guard {}", serialize(fixed));
                     wz.move_to_path(fixed);
-                    wz.set_val(());
+                    set_btm_val_and_note(wz, fixed);
                     changed |= true;
                 }
                 prz.ascend(descended + 1);
@@ -640,7 +693,7 @@ impl Sink for CountSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                set_btm_val_and_note(wz, ignored);
                 changed |= true;
                 prz.ascend_byte();
             } 
@@ -656,7 +709,7 @@ impl Sink for CountSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    set_btm_val_and_note(wz, &buffer[..oz.loc]);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -720,7 +773,7 @@ impl Sink for HashSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        set_btm_val_and_note(wz, fixed);
                         changed |= true;
                     }
 
@@ -733,7 +786,7 @@ impl Sink for HashSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                set_btm_val_and_note(wz, ignored);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -752,7 +805,7 @@ impl Sink for HashSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "hash ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    set_btm_val_and_note(wz, &buffer[..oz.loc]);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -834,7 +887,7 @@ impl Sink for AndSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        set_btm_val_and_note(wz, fixed);
                         changed |= true;
                     }
 
@@ -847,7 +900,7 @@ impl Sink for AndSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                set_btm_val_and_note(wz, ignored);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -878,7 +931,7 @@ impl Sink for AndSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "and ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    set_btm_val_and_note(wz, &buffer[..oz.loc]);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -959,7 +1012,7 @@ impl Sink for SumSink {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        set_btm_val_and_note(wz, fixed);
                         changed |= true;
                     }
 
@@ -972,7 +1025,7 @@ impl Sink for SumSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                set_btm_val_and_note(wz, ignored);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -1003,7 +1056,7 @@ impl Sink for SumSink {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    set_btm_val_and_note(wz, &buffer[..oz.loc]);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -1116,7 +1169,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                         let fixed = &prz.origin_path()[..prz.origin_path().len()-(1+size as usize)];
                         trace!(target: "sink", "fixed payload {}", serialize(fixed));
                         wz.move_to_path(fixed);
-                        wz.set_val(());
+                        set_btm_val_and_note(wz, fixed);
                         changed |= true;
                     }
 
@@ -1129,7 +1182,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                set_btm_val_and_note(wz, ignored);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -1160,7 +1213,7 @@ impl<Reduction : FloatReduction> Sink for FloatReductionSink<Reduction> {
                     unsafe { buffer.set_len(oz.loc) }
                     trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                     wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                    wz.set_val(());
+                    set_btm_val_and_note(wz, &buffer[..oz.loc]);
                     changed |= true
                 }
                 prz.ascend_byte();
@@ -1239,7 +1292,7 @@ impl Sink for PureSink {
                 let ignored = &prz.path()[..prz.path().len()-1];
                 trace!(target: "sink", "ignored guard {}", serialize(ignored));
                 wz.move_to_path(ignored);
-                wz.set_val(());
+                set_btm_val_and_note(wz, ignored);
                 changed |= true;
                 prz.ascend_byte();
             }
@@ -1267,7 +1320,7 @@ impl Sink for PureSink {
                         unsafe { buffer.set_len(oz.loc) }
                         trace!(target: "sink", "ref guard subs '{:?}'", serialize(&buffer[..oz.loc]));
                         wz.move_to_path(&buffer[wz.root_prefix_path().len()..oz.loc]);
-                        wz.set_val(());
+                        set_btm_val_and_note(wz, &buffer[..oz.loc]);
                         changed |= true;
                         self.scope.return_alloc(res);
                     }
@@ -1402,7 +1455,7 @@ impl Sink for EGraphSink {
             if !written.insert(args.clone()) { continue; }
             wz.reset();
             wz.move_to_path(&args);
-            changed |= wz.set_val(()).is_none();
+            changed |= set_btm_val_and_note(wz, &args);
         }
         wz.reset();
         changed
@@ -1459,7 +1512,7 @@ impl Sink for WeightedSelectSink {
         let mut changed = false;
         if let Some(item) = self.index.select_by_offset(self.offset) {
             wz.move_to_path(&item);
-            changed |= wz.set_val(()).is_none();
+            changed |= set_btm_val_and_note(wz, &item);
         }
         wz.reset();
         changed
