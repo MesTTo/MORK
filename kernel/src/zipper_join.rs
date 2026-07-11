@@ -96,9 +96,7 @@ fn step_parse(b: u8, subterms: &mut usize, payload: &mut usize) {
     }
 }
 
-/// Whether `bytes` (from the column-start focus) spell exactly one complete subterm. Recomputed
-/// per descent step; subterms are short, so the O(len) replay is cheap and keeps the navigation
-/// free of incremental-state bugs.
+/// Whether `bytes` (from the column-start focus) spell exactly one complete subterm.
 #[inline]
 fn is_complete(bytes: &[u8]) -> bool {
     let (mut subterms, mut payload) = (1usize, 0usize);
@@ -113,6 +111,34 @@ fn has_bit(mask: &ByteMask, b: u8) -> bool {
     (mask.0[(b >> 6) as usize] >> (b & 63)) & 1 == 1
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParseState {
+    subterms_owed: usize,
+    payload_owed: usize,
+}
+
+impl ParseState {
+    #[inline]
+    const fn initial() -> Self {
+        ParseState {
+            subterms_owed: 1,
+            payload_owed: 0,
+        }
+    }
+
+    #[inline]
+    const fn is_complete(self) -> bool {
+        self.subterms_owed == 0 && self.payload_owed == 0
+    }
+}
+
+struct FloorFrame {
+    key: Vec<u8>,
+    parse_stack: Vec<ParseState>,
+    subterms_owed: usize,
+    payload_owed: usize,
+}
+
 /// A cursor over the complete variable-width subterms branching from a PathMap zipper's focus, in
 /// ascending lexicographic order, with a leapfrog `seek`. This is the zipper-native replacement for
 /// a materialized per-variable domain: it seeks on the live byte-trie instead of scanning a `Vec`.
@@ -121,9 +147,14 @@ fn has_bit(mask: &ByteMask, b: u8) -> bool {
 /// (its "floor"). The cursor descends with `descend_to_byte` and ascends with `ascend_byte`, never
 /// above the floor (it stops when `key` is empty), so the zipper is left at the floor between
 /// re-seeks and at the subterm boundary while positioned.
+/// `subterms_owed`/`payload_owed` are the folded `step_parse` state for `key`; `parse_stack`
+/// stores the state after each byte so backtracking restores it without replaying the key.
 pub struct SubtermCursor<Z> {
     z: Z,
     key: Vec<u8>,
+    parse_stack: Vec<ParseState>,
+    subterms_owed: usize,
+    payload_owed: usize,
     at_end: bool,
     /// Values of the columns already descended past, below the zipper's creation
     /// focus. `descend_floor` locks the current subterm as a column value and
@@ -131,7 +162,7 @@ pub struct SubtermCursor<Z> {
     /// column); `ascend_floor` restores it. This lets one cursor walk a factor's
     /// successive columns with the zipper HELD -- descended and ascended in place,
     /// never re-opened from the trie root (which is the join's dominant cost).
-    floor_stack: Vec<Vec<u8>>,
+    floor_stack: Vec<FloorFrame>,
 }
 
 impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
@@ -140,15 +171,96 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         SubtermCursor {
             z,
             key: Vec::new(),
+            parse_stack: Vec::new(),
+            subterms_owed: 1,
+            payload_owed: 0,
             at_end: true,
             floor_stack: Vec::new(),
         }
     }
 
+    #[inline]
+    fn parse_state(&self) -> ParseState {
+        ParseState {
+            subterms_owed: self.subterms_owed,
+            payload_owed: self.payload_owed,
+        }
+    }
+
+    #[inline]
+    fn reset_parse_state(&mut self) {
+        let state = ParseState::initial();
+        self.subterms_owed = state.subterms_owed;
+        self.payload_owed = state.payload_owed;
+        self.parse_stack.clear();
+    }
+
+    #[inline]
+    fn restore_parse_state_from_stack(&mut self) {
+        let state = self
+            .parse_stack
+            .last()
+            .copied()
+            .unwrap_or_else(ParseState::initial);
+        self.subterms_owed = state.subterms_owed;
+        self.payload_owed = state.payload_owed;
+    }
+
+    #[inline]
+    fn key_complete(&self) -> bool {
+        self.parse_state().is_complete()
+    }
+
+    #[inline]
+    fn push_key_byte(&mut self, b: u8) {
+        step_parse(b, &mut self.subterms_owed, &mut self.payload_owed);
+        self.key.push(b);
+        self.parse_stack.push(self.parse_state());
+    }
+
+    #[inline]
+    fn pop_key_byte(&mut self) -> Option<u8> {
+        let b = self.key.pop()?;
+        self.parse_stack.pop();
+        self.restore_parse_state_from_stack();
+        Some(b)
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_parse_state(&self) {
+        debug_assert_eq!(
+            self.key.len(),
+            self.parse_stack.len(),
+            "parse snapshots must track key bytes"
+        );
+        let (mut subterms, mut payload) = (1usize, 0usize);
+        for &b in &self.key {
+            step_parse(b, &mut subterms, &mut payload);
+        }
+        debug_assert_eq!(
+            (self.subterms_owed, self.payload_owed),
+            (subterms, payload),
+            "incremental parse state must match replay"
+        );
+        debug_assert_eq!(
+            self.key_complete(),
+            is_complete(&self.key),
+            "incremental completion must match replay"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn debug_assert_parse_state(&self) {}
+
     /// Ascend back to the floor (column start), clearing the key.
     fn reset_to_floor(&mut self) {
-        while self.key.pop().is_some() {
-            self.z.ascend_byte();
+        let depth = self.key.len();
+        if depth > 0 {
+            let ascended = self.z.ascend(depth);
+            debug_assert!(ascended, "cursor key must never rise above its floor");
+            self.key.clear();
+            self.reset_parse_state();
         }
         self.at_end = false;
     }
@@ -158,7 +270,13 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// column. The zipper stays put (it is already descended into `key`); only the
     /// floor bookkeeping moves. Pairs with `ascend_floor`.
     pub fn descend_floor(&mut self) {
-        self.floor_stack.push(std::mem::take(&mut self.key));
+        self.floor_stack.push(FloorFrame {
+            key: std::mem::take(&mut self.key),
+            parse_stack: std::mem::take(&mut self.parse_stack),
+            subterms_owed: self.subterms_owed,
+            payload_owed: self.payload_owed,
+        });
+        self.reset_parse_state();
         self.at_end = false;
     }
 
@@ -168,11 +286,16 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// plus that value, which holds because a fully-exhausted deeper column
     /// leaves its cursor at its own floor (== this value's end).
     pub fn ascend_floor(&mut self) {
-        self.key = self
+        let frame = self
             .floor_stack
             .pop()
             .expect("ascend_floor without a matching descend_floor");
+        self.key = frame.key;
+        self.parse_stack = frame.parse_stack;
+        self.subterms_owed = frame.subterms_owed;
+        self.payload_owed = frame.payload_owed;
         self.at_end = false;
+        self.debug_assert_parse_state();
     }
 
     /// Whether the current focus (after consuming every column) carries a stored
@@ -184,18 +307,35 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         self.z.value().is_some()
     }
 
-    /// Descend the least child at each step until the key forms a complete subterm. Returns false
+    /// Descend the least child path until the key forms a complete subterm. Returns false
     /// if a node runs out of children before completion (malformed/empty branch).
     fn complete_leftmost(&mut self) -> bool {
-        while !is_complete(&self.key) {
-            let mask = self.z.child_mask();
-            match least_ge(&mask, 0) {
-                Some(b) => {
-                    self.z.descend_to_byte(b);
-                    self.key.push(b);
+        while !self.key_complete() {
+            let before = self.z.path().len();
+            if self.z.descend_until() {
+                let after = self.z.path().len();
+                debug_assert!(after >= before);
+                for idx in before..after {
+                    let b = self.z.path()[idx];
+                    self.push_key_byte(b);
+                    if self.key_complete() {
+                        let excess = after - idx - 1;
+                        if excess > 0 {
+                            let ascended = self.z.ascend(excess);
+                            debug_assert!(ascended, "descend_until excess must be inside the key");
+                        }
+                        return true;
+                    }
                 }
-                None => return false,
+                continue;
             }
+
+            let before = self.z.path().len();
+            if !self.z.descend_first_byte() {
+                return false;
+            }
+            let b = self.z.path()[before];
+            self.push_key_byte(b);
         }
         true
     }
@@ -204,14 +344,14 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
     /// level offers a larger sibling, take the least such, then complete leftmost. False = exhausted.
     fn backtrack_then_leftmost(&mut self) -> bool {
         loop {
-            let Some(last) = self.key.pop() else {
+            let Some(last) = self.pop_key_byte() else {
                 return false;
             };
             self.z.ascend_byte();
             let mask = self.z.child_mask();
             if let Some(b) = mask.next_bit(last) {
                 self.z.descend_to_byte(b);
-                self.key.push(b);
+                self.push_key_byte(b);
                 return self.complete_leftmost();
             }
         }
@@ -223,6 +363,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         if !self.complete_leftmost() {
             self.at_end = true;
         }
+        self.debug_assert_parse_state();
     }
 
     /// Advance to the next subterm.
@@ -233,6 +374,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         if !self.backtrack_then_leftmost() {
             self.at_end = true;
         }
+        self.debug_assert_parse_state();
     }
 
     /// The current subterm bytes, or `None` when exhausted.
@@ -257,8 +399,9 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
         self.reset_to_floor();
         let mut ti = 0usize;
         loop {
-            if is_complete(&self.key) {
+            if self.key_complete() {
                 self.at_end = false;
+                self.debug_assert_parse_state();
                 return;
             }
             let mask = self.z.child_mask();
@@ -266,23 +409,25 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
                 let t = target[ti];
                 if has_bit(&mask, t) {
                     self.z.descend_to_byte(t);
-                    self.key.push(t);
+                    self.push_key_byte(t);
                     ti += 1;
                     continue;
                 }
                 match mask.next_bit(t) {
                     Some(b) => {
                         self.z.descend_to_byte(b);
-                        self.key.push(b);
+                        self.push_key_byte(b);
                         if !self.complete_leftmost() {
                             self.at_end = true;
                         }
+                        self.debug_assert_parse_state();
                         return;
                     }
                     None => {
                         if !self.backtrack_then_leftmost() {
                             self.at_end = true;
                         }
+                        self.debug_assert_parse_state();
                         return;
                     }
                 }
@@ -290,6 +435,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
                 if !self.complete_leftmost() {
                     self.at_end = true;
                 }
+                self.debug_assert_parse_state();
                 return;
             }
         }
@@ -2870,6 +3016,352 @@ mod tests {
             }
             v
         }
+    }
+
+    struct ReferenceSubtermCursor<Z> {
+        z: Z,
+        key: Vec<u8>,
+        at_end: bool,
+        floor_stack: Vec<Vec<u8>>,
+    }
+
+    impl<Z: Zipper + ZipperMoving> ReferenceSubtermCursor<Z> {
+        fn new(z: Z) -> Self {
+            ReferenceSubtermCursor {
+                z,
+                key: Vec::new(),
+                at_end: true,
+                floor_stack: Vec::new(),
+            }
+        }
+
+        fn reset_to_floor(&mut self) {
+            while self.key.pop().is_some() {
+                self.z.ascend_byte();
+            }
+            self.at_end = false;
+        }
+
+        fn complete_leftmost(&mut self) -> bool {
+            while !is_complete(&self.key) {
+                let mask = self.z.child_mask();
+                match least_ge(&mask, 0) {
+                    Some(b) => {
+                        self.z.descend_to_byte(b);
+                        self.key.push(b);
+                    }
+                    None => return false,
+                }
+            }
+            true
+        }
+
+        fn backtrack_then_leftmost(&mut self) -> bool {
+            loop {
+                let Some(last) = self.key.pop() else {
+                    return false;
+                };
+                self.z.ascend_byte();
+                let mask = self.z.child_mask();
+                if let Some(b) = mask.next_bit(last) {
+                    self.z.descend_to_byte(b);
+                    self.key.push(b);
+                    return self.complete_leftmost();
+                }
+            }
+        }
+
+        fn first(&mut self) {
+            self.reset_to_floor();
+            if !self.complete_leftmost() {
+                self.at_end = true;
+            }
+        }
+
+        fn next(&mut self) {
+            if self.at_end {
+                return;
+            }
+            if !self.backtrack_then_leftmost() {
+                self.at_end = true;
+            }
+        }
+
+        fn key(&self) -> Option<&[u8]> {
+            if self.at_end {
+                None
+            } else {
+                Some(&self.key)
+            }
+        }
+
+        fn seek(&mut self, target: &[u8]) {
+            self.reset_to_floor();
+            let mut ti = 0usize;
+            loop {
+                if is_complete(&self.key) {
+                    self.at_end = false;
+                    return;
+                }
+                let mask = self.z.child_mask();
+                if ti < target.len() {
+                    let t = target[ti];
+                    if has_bit(&mask, t) {
+                        self.z.descend_to_byte(t);
+                        self.key.push(t);
+                        ti += 1;
+                        continue;
+                    }
+                    match mask.next_bit(t) {
+                        Some(b) => {
+                            self.z.descend_to_byte(b);
+                            self.key.push(b);
+                            if !self.complete_leftmost() {
+                                self.at_end = true;
+                            }
+                            return;
+                        }
+                        None => {
+                            if !self.backtrack_then_leftmost() {
+                                self.at_end = true;
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    if !self.complete_leftmost() {
+                        self.at_end = true;
+                    }
+                    return;
+                }
+            }
+        }
+
+        fn descend_floor(&mut self) {
+            self.floor_stack.push(std::mem::take(&mut self.key));
+            self.at_end = false;
+        }
+
+        fn ascend_floor(&mut self) {
+            self.key = self
+                .floor_stack
+                .pop()
+                .expect("ascend_floor without a matching descend_floor");
+            self.at_end = false;
+        }
+    }
+
+    trait CursorUnderTest {
+        fn first(&mut self);
+        fn next(&mut self);
+        fn seek(&mut self, target: &[u8]);
+        fn key(&self) -> Option<&[u8]>;
+        fn descend_floor(&mut self);
+        fn ascend_floor(&mut self);
+    }
+
+    impl<Z: Zipper + ZipperMoving> CursorUnderTest for SubtermCursor<Z> {
+        fn first(&mut self) {
+            SubtermCursor::first(self);
+        }
+
+        fn next(&mut self) {
+            SubtermCursor::next(self);
+        }
+
+        fn seek(&mut self, target: &[u8]) {
+            SubtermCursor::seek(self, target);
+        }
+
+        fn key(&self) -> Option<&[u8]> {
+            SubtermCursor::key(self)
+        }
+
+        fn descend_floor(&mut self) {
+            SubtermCursor::descend_floor(self);
+        }
+
+        fn ascend_floor(&mut self) {
+            SubtermCursor::ascend_floor(self);
+        }
+    }
+
+    impl<Z: Zipper + ZipperMoving> CursorUnderTest for ReferenceSubtermCursor<Z> {
+        fn first(&mut self) {
+            ReferenceSubtermCursor::first(self);
+        }
+
+        fn next(&mut self) {
+            ReferenceSubtermCursor::next(self);
+        }
+
+        fn seek(&mut self, target: &[u8]) {
+            ReferenceSubtermCursor::seek(self, target);
+        }
+
+        fn key(&self) -> Option<&[u8]> {
+            ReferenceSubtermCursor::key(self)
+        }
+
+        fn descend_floor(&mut self) {
+            ReferenceSubtermCursor::descend_floor(self);
+        }
+
+        fn ascend_floor(&mut self) {
+            ReferenceSubtermCursor::ascend_floor(self);
+        }
+    }
+
+    fn collect_from_current<C: CursorUnderTest>(cur: &mut C) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(k) = cur.key() {
+            out.push(k.to_vec());
+            cur.next();
+        }
+        out
+    }
+
+    fn collect_from_first<C: CursorUnderTest>(cur: &mut C) -> Vec<Vec<u8>> {
+        cur.first();
+        collect_from_current(cur)
+    }
+
+    fn floor_trace<C: CursorUnderTest>(cur: &mut C) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+        let mut out = Vec::new();
+        cur.first();
+        while let Some(k) = cur.key() {
+            let first_col = k.to_vec();
+            cur.descend_floor();
+            cur.first();
+            let second_col = collect_from_current(cur);
+            cur.ascend_floor();
+            out.push((first_col, second_col));
+            cur.next();
+        }
+        out
+    }
+
+    fn deep_unary_term(depth: usize, mut term: Vec<u8>) -> Vec<u8> {
+        for _ in 0..depth {
+            term = nest("u", &[term]);
+        }
+        term
+    }
+
+    fn long_shared_symbol(rng: &mut Lcg, salt: usize) -> Vec<u8> {
+        let len = 48 + rng.below(16);
+        let mut v = vec![item_byte(Tag::SymbolSize(len as u8))];
+        for i in 0..len {
+            let b = if i + 4 < len {
+                b'a'
+            } else {
+                b'a' + ((salt + i + rng.below(26)) % 26) as u8
+            };
+            v.push(b);
+        }
+        v
+    }
+
+    fn max_symbol_term() -> Vec<u8> {
+        let mut v = vec![item_byte(Tag::SymbolSize(63))];
+        v.resize(64, 0xFF);
+        v
+    }
+
+    fn cursor_stress_term(rng: &mut Lcg, i: usize) -> Vec<u8> {
+        match i % 6 {
+            0 => deep_unary_term(52 + rng.below(16), sym(&format!("d{}", i % 19))),
+            1 => deep_unary_term(50 + rng.below(20), long_shared_symbol(rng, i)),
+            2 => nest(
+                "g",
+                &[
+                    deep_unary_term(12 + rng.below(12), rand_term(rng, 3)),
+                    long_shared_symbol(rng, i),
+                ],
+            ),
+            3 => long_shared_symbol(rng, i),
+            4 => rand_term(rng, 5),
+            _ => {
+                let v = if rng.below(2) == 0 {
+                    new_var()
+                } else {
+                    var_ref((rng.below(63)) as u8)
+                };
+                deep_unary_term(8 + rng.below(16), v)
+            }
+        }
+    }
+
+    #[test]
+    fn subterm_cursor_randomized_differential_deep_spines() {
+        for seed in 0..24u64 {
+            let mut rng = Lcg::new(seed ^ 0x5eed_51a7_c0de);
+            let mut map = PathMap::<()>::new();
+            let mut targets = Vec::new();
+            for i in 0..320usize {
+                let first = cursor_stress_term(&mut rng, i);
+                let second = cursor_stress_term(&mut rng, i + 10_000);
+                if i % 37 == 0 {
+                    targets.push(first.clone());
+                }
+                map.insert(&nest("e", &[first, second]), ());
+            }
+            for i in 0..32usize {
+                targets.push(cursor_stress_term(&mut rng, i + 20_000));
+            }
+            targets.push(max_symbol_term());
+
+            let pfx = relation_prefix("e", 3);
+            let mut cur = SubtermCursor::new(map.read_zipper_at_path(&pfx));
+            let mut reference = ReferenceSubtermCursor::new(map.read_zipper_at_path(&pfx));
+            assert_eq!(
+                collect_from_first(&mut cur),
+                collect_from_first(&mut reference),
+                "seed {seed}: full enumeration must match the reference cursor"
+            );
+
+            for target in &targets {
+                let mut cur = SubtermCursor::new(map.read_zipper_at_path(&pfx));
+                let mut reference = ReferenceSubtermCursor::new(map.read_zipper_at_path(&pfx));
+                cur.seek(target);
+                reference.seek(target);
+                assert_eq!(
+                    collect_from_current(&mut cur),
+                    collect_from_current(&mut reference),
+                    "seed {seed}: seek({target:?}) tail must match the reference cursor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subterm_cursor_floor_stack_matches_reference_after_deep_column() {
+        let mut map = PathMap::<()>::new();
+        let rows = vec![
+            (
+                deep_unary_term(58, sym("a")),
+                deep_unary_term(18, long_shared_symbol(&mut Lcg::new(1), 1)),
+            ),
+            (deep_unary_term(58, sym("a")), sym("tail-a")),
+            (
+                deep_unary_term(55, long_shared_symbol(&mut Lcg::new(2), 2)),
+                deep_unary_term(22, sym("tail-b")),
+            ),
+            (sym("plain"), deep_unary_term(24, sym("tail-c"))),
+            (sym("plain"), long_shared_symbol(&mut Lcg::new(3), 3)),
+        ];
+        for (first, second) in rows {
+            map.insert(&nest("e", &[first, second]), ());
+        }
+        let pfx = relation_prefix("e", 3);
+
+        let mut cur = SubtermCursor::new(map.read_zipper_at_path(&pfx));
+        let mut reference = ReferenceSubtermCursor::new(map.read_zipper_at_path(&pfx));
+        assert_eq!(
+            floor_trace(&mut cur),
+            floor_trace(&mut reference),
+            "floor descent, nested enumeration, ascent, and outer next must match"
+        );
     }
 
     #[test]
