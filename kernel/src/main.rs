@@ -1,7 +1,7 @@
 #![feature(string_from_utf8_lossy_owned)]
 
 use mork::{expr, prefix, sexpr, space};
-use mork::space::{transitions, unifications, writes, Space, ACT_PATH};
+use mork::space::{counters, Space, ACT_PATH};
 use mork_frontend::bytestring_parser::Parser;
 use mork_expr::{item_byte, serialize, SourceItem, Tag};
 use pathmap::PathMap;
@@ -302,7 +302,8 @@ fn process_calculus_bench(steps: usize, x: usize, y: usize) {
 
     println!("{x}+{y} ({} steps) in {} µs result: {res}", steps, elapsed.as_micros());
     assert_eq!(res, format!("{}\n", peano(x+y)));
-    println!("unifications {}, instructions {}", unsafe { unifications }, unsafe { transitions });
+    let (t9, u9, _) = counters();
+    println!("unifications {u9}, instructions {t9}");
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
@@ -349,7 +350,8 @@ fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
 
     println!("{x}+{y} ({} steps) in {} µs result: {res}", steps, elapsed.as_micros());
     assert_eq!(res, format!("{}\n", peano(x+y)));
-    println!("unifications {}, instructions {}", unsafe { unifications }, unsafe { transitions });
+    let (t9, u9, _) = counters();
+    println!("unifications {u9}, instructions {t9}");
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
@@ -5546,7 +5548,7 @@ fn mm1_forward() {
         ticks += 1;
         let t1 = Instant::now();
         let n = s.metta_calculus(1);
-        println!("executing step {} took {} ms (unifications {}, writes {}, transitions {})", ticks, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+        println!("executing step {} took {} ms (unifications {}, writes {}, transitions {})", ticks, t1.elapsed().as_millis(), mork::space::counters().1, mork::space::counters().2, mork::space::counters().0);
 
         if n == 1 { continue } // comment out if you want the analysis at every step
 
@@ -5712,7 +5714,7 @@ fn mm2_bc() {
         ticks += 1;
         let t1 = Instant::now();
         let n = s.metta_calculus(1);
-        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})", ticks, n, t1.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+        println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})", ticks, n, t1.elapsed().as_millis(), mork::space::counters().1, mork::space::counters().2, mork::space::counters().0);
 
         // if n == 1 { continue } // comment out if you want the analysis at every step
 
@@ -5880,7 +5882,7 @@ fn mm2_bc_v3() {
         let n = s.metta_calculus(multiplier);
         println!("executing step {} ({}) took {} ms (unifications {}, writes {}, transitions {})",
                  ticks, n, t1.elapsed().as_millis(),
-                 unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+                 mork::space::counters().1, mork::space::counters().2, mork::space::counters().0);
 
         println!("space size {}", s.btm.val_count());
 
@@ -6319,7 +6321,7 @@ fn main() {
             println!("loaded {:?} ; running and outputing to {:?}", &input_path, output_path.as_ref().or(Some(&"stdout".to_string())));
             let t0 = Instant::now();
             let mut performed = s.metta_calculus(steps);
-            println!("executing {performed} steps took {} ms (unifications {}, writes {}, transitions {})", t0.elapsed().as_millis(), unsafe { unifications }, unsafe { writes }, unsafe { transitions });
+            println!("executing {performed} steps took {} ms (unifications {}, writes {}, transitions {})", t0.elapsed().as_millis(), mork::space::counters().1, mork::space::counters().2, mork::space::counters().0);
             if instrumentation > 0 { println!("dumping {} expressions", s.btm.val_count()) }
             if output_path.is_none() {
                 let mut v = vec![];

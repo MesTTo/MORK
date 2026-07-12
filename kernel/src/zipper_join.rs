@@ -1540,7 +1540,7 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
         #[cfg(feature = "retrieval_join")]
         let mut memo: RetrievalMemo = Default::default();
         let mut on_tuple = |tuple: &[Vec<u8>]| -> bool {
-            unsafe { crate::space::unifications += 1 };
+            crate::space::count_unifications(1);
             let e = Expr {
                 ptr: tuple[0].as_ptr().cast_mut(),
             };
@@ -1840,7 +1840,7 @@ pub fn query_multi_ghd<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Exp
     debug_assert_eq!(sources.len(), factors.len());
     let mut candidate = 0usize;
     for tuple in &full_tuples {
-        unsafe { crate::space::unifications += 1 };
+        crate::space::count_unifications(1);
         let e = Expr {
             ptr: tuple[0].as_ptr().cast_mut(),
         };

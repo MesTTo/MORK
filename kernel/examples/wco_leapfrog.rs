@@ -109,13 +109,13 @@ fn mork_engine(
         ans.join(" ")
     );
     space.add_all_sexpr(exec.as_bytes()).unwrap();
-    unsafe { mork::space::transitions = 0 };
+    mork::space::reset_counters();
     set_leapfrog_dispatch(leapfrog);
     let t0 = std::time::Instant::now();
     space.metta_calculus(1);
     let us = t0.elapsed().as_micros();
     set_leapfrog_dispatch(true);
-    let transitions = unsafe { mork::space::transitions };
+    let (transitions, _, _) = mork::space::counters();
     let mut out = BTreeSet::new();
     let mut rz = space.btm.read_zipper();
     while rz.to_next_val() {

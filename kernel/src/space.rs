@@ -153,9 +153,45 @@ fn factorized_aggregate_gate(
 }
 use crate::sources::{AFactor, Resource, ResourceRequest};
 
-pub static mut transitions: usize = 0;
-pub static mut unifications: usize = 0;
-pub static mut writes: usize = 0;
+// Diagnostic counters (descent steps, join answers, template writes).
+// Thread-local so parallel matchers neither race (the old static muts were
+// UB under sharing) nor ping-pong cachelines; single-threaded readers see
+// exactly the totals they always did. Initial-exec TLS keeps the increment
+// at static-mut cost.
+thread_local! {
+    static TRANSITIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UNIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+pub(crate) fn count_transitions(n: usize) {
+    TRANSITIONS.with(|c| c.set(c.get() + n));
+}
+#[inline(always)]
+pub(crate) fn count_unifications(n: usize) {
+    UNIFICATIONS.with(|c| c.set(c.get() + n));
+}
+#[inline(always)]
+pub(crate) fn count_writes(n: usize) {
+    WRITES.with(|c| c.set(c.get() + n));
+}
+
+/// This thread's (transitions, unifications, writes) totals.
+pub fn counters() -> (usize, usize, usize) {
+    (
+        TRANSITIONS.with(|c| c.get()),
+        UNIFICATIONS.with(|c| c.get()),
+        WRITES.with(|c| c.get()),
+    )
+}
+
+/// Zero this thread's counters.
+pub fn reset_counters() {
+    TRANSITIONS.with(|c| c.set(0));
+    UNIFICATIONS.with(|c| c.set(0));
+    WRITES.with(|c| c.set(0));
+}
 
 const EXEC_PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c'] };
 
@@ -437,7 +473,7 @@ fn coreferential_transition<Z : ZipperMoving + Zipper + ZipperAbsolutePath + Zip
     trace!(target: "coref trans", "loc {}    len {}", serialize(loc.path()), loc.path().len());
     // trace!(target: "coref trans", "loc {} ({:?})    len {}    ops {:?} ({:?})", serialize(loc.path()), loc.path(), loc.path().len(), loc.child_mask(), loc.child_mask().iter().map(byte_item).collect::<Vec<_>>());
     trace!(target: "coref trans", "top {}", stack.last().map(|x| x.show()).unwrap_or_else(|| "empty".into()));
-    unsafe { transitions += 1 };
+    count_transitions(1);
     match stack.pop() {
         None => { f(loc) }
         Some(e) => {
@@ -1767,7 +1803,7 @@ impl Space {
                 trace!(target: "query_multi_ref", "at {:?}",
                     Expr { ptr: unsafe { prz.origin_path().as_ptr().cast_mut().add(other_i) } });
             }
-            unsafe { unifications += 1; }
+            count_unifications(1);
             // if e.variables() != 0 {
 
             let mut pairs = vec![(unify_sources[0], ExprEnv::new(1, e))];
@@ -1831,7 +1867,7 @@ impl Space {
                         trace!(target: "query_multi", "at {:?}",
                             Expr { ptr: unsafe { loc.origin_path().as_ptr().cast_mut().add(other_i) } });
                     }
-                    unsafe { unifications += 1; }
+                    count_unifications(1);
                     // if e.variables() != 0 {
                     if true {
                         let mut pairs = vec![(unify_sources[0], ExprEnv::new(1, e))];
@@ -2168,7 +2204,7 @@ impl Space {
         let mut bulk = BulkEmit::new(template_wzs.len());
         let touched = Self::query_multi_dispatch(&read_copy, pat_expr, |refs_bindings, loc| 'query:{
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            unsafe { writes += template_prefixes.len(); }
+            count_writes(template_prefixes.len());
             match refs_bindings {
                 Ok(refs) => {
                     unreachable!()
@@ -2479,7 +2515,7 @@ impl Space {
                 &unify_sources,
                 |refs_bindings, loc| 'query: {
                     trace!(target: "transform", "delta data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-                    unsafe { writes += template_prefixes.len(); }
+                    count_writes(template_prefixes.len());
                     match refs_bindings {
                         Ok(_refs) => {
                             unreachable!()
@@ -2566,7 +2602,7 @@ impl Space {
         let mmaps_guard = self.mmaps.get_mut().unwrap();
         let touched = Self::query_multi_i(false, mmaps_guard, z3s_guard, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
             // trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            unsafe { writes += template_prefixes.len(); }
+            count_writes(template_prefixes.len());
             match refs_bindings {
                 Ok(refs) => {
                     unreachable!()
@@ -2672,7 +2708,7 @@ impl Space {
         let fast = factorized_aggregate_gate(&read_copy, pat_expr, &sinks, &templates);
         let touched = Self::query_multi(&read_copy, pat_expr, |refs_bindings, loc| 'query : {
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            unsafe { writes += template_prefixes.len(); }
+            count_writes(template_prefixes.len());
             match refs_bindings {
                 Ok(refs) => {
                     unreachable!()
@@ -2790,7 +2826,7 @@ impl Space {
         let mut any_new = false;
         let touched = Self::query_multi_i(no_source, &mut *mmaps_guard, &mut *z3s_guard, &read_copy, pat_expr, |refs_bindings, loc| 'query : {
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
-            unsafe { writes += template_prefixes.len(); }
+            count_writes(template_prefixes.len());
             match refs_bindings {
                 Ok(refs) => {
                     unreachable!()
