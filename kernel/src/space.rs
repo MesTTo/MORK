@@ -2150,7 +2150,7 @@ impl Space {
                 // above serves the delta route's probes and decays away once the
                 // rule settles on naive, so it is not the naive route's cost.
                 let t1 = Instant::now();
-                let result = self.transform_multi_multi_naive(pat_expr, tpl_expr, add);
+                let result = self.transform_multi_multi_full(pat_expr, tpl_expr, add);
                 let cost = t1.elapsed().as_nanos() as u64;
                 if let Some(seen) = self.sni_rule_seen.as_mut() {
                     if let Some(e) = seen.get_mut(&key) {
@@ -2159,6 +2159,19 @@ impl Space {
                 }
                 return result;
             }
+        }
+        self.transform_multi_multi_full(pat_expr, tpl_expr, add)
+    }
+
+    /// The full-space match, routed by the template's functor: sinks for
+    /// `(O ...)`, plain template writes for `(, ...)`. Every naive path inside
+    /// the semi-naive wrapper goes through here -- writing an `(O ...)`
+    /// template as a plain fact silently turns a sink into an add.
+    #[inline]
+    fn transform_multi_multi_full(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
+        #[cfg(feature = "specialize_io")]
+        if unsafe { *tpl_expr.ptr.add(2) } == b'O' {
+            return self.transform_multi_multi_o(pat_expr, tpl_expr, add);
         }
         self.transform_multi_multi_naive(pat_expr, tpl_expr, add)
     }
@@ -2396,6 +2409,13 @@ impl Space {
 
         let result = delta_for_fire.map(|delta| {
             let rc = read_copy(&self.btm);
+            // The template's functor picks the emit route; both take the same
+            // delta. (The sink route declines the delta itself when any of its
+            // sinks folds over the firing's match set.)
+            #[cfg(feature = "specialize_io")]
+            if unsafe { *tpl_expr.ptr.add(2) } == b'O' {
+                return self.transform_multi_multi_o_delta(pat_expr, tpl_expr, add, &delta);
+            }
             self.transform_multi_multi_delta(&rc, &delta, pat_expr, tpl_expr)
         });
         (result, key)
@@ -2452,68 +2472,13 @@ impl Space {
         let mut any_new = false;
         #[cfg(feature = "bulk_emit")]
         let mut bulk = BulkEmit::new(template_wzs.len());
-        let mut total_candidates = 0usize;
 
-        for j in 0..n_factors {
-            // Pass j only finds matches whose factor-j fact lies in the delta; when
-            // the delta holds nothing under that factor's constant prefix the pass
-            // is empty, so skip it (the delta is small: the probe is O(delta)). A
-            // prefixless factor (variable-headed) never skips.
-            {
-                let sub = sources[j].subsexpr();
-                let pfx = unsafe { sub.prefix().unwrap_or_else(|x| x).as_ref().unwrap() };
-                if !pfx.is_empty() && delta.read_zipper_at_path(pfx).val_count() == 0 {
-                    continue;
-                }
-            }
-
-            // Plan: factor j first, the rest in identity order. For j == 0 that IS
-            // the identity plan, so skip the re-encode entirely.
-            let plan_j: Vec<usize> =
-                std::iter::once(j).chain((0..n_factors).filter(|&i| i != j)).collect();
-
-            // (map per PZ position, search sources, unify sources) for this pass.
-            let (maps, _search_buffers, search_sources, unify_sources): (
-                Vec<&PathMap<()>>,
-                Vec<Vec<u8>>,
-                Vec<ExprEnv>,
-                Vec<ExprEnv>,
-            ) = if j == 0 {
-                (
-                    (0..n_factors).map(|i| if i == j { delta } else { read_copy }).collect(),
-                    Vec::new(),
-                    sources.clone(),
-                    sources.clone(),
-                )
-            } else {
-                match Self::renormalize_query_factors(&sources, &plan_j) {
-                    Some((buffers, planned)) => (
-                        plan_j.iter().map(|&i| if i == j { delta } else { read_copy }).collect(),
-                        buffers,
-                        planned,
-                        plan_j.iter().map(|&i| sources[i]).collect(),
-                    ),
-                    None => (
-                        // Identity fallback: the delta zipper sits at PZ position j.
-                        (0..n_factors).map(|i| if i == j { delta } else { read_copy }).collect(),
-                        Vec::new(),
-                        sources.clone(),
-                        sources.clone(),
-                    ),
-                }
-            };
-
-            let mut prz = ProductZipper::new(
-                maps[0].read_zipper(),
-                (1..n_factors).map(|k| maps[k].read_zipper()),
-            );
-            prz.reserve_buffers(1 << 32, 32);
-
-            total_candidates += Self::query_multi_raw_with_unification_sources(
-                &mut prz,
-                &search_sources,
-                &unify_sources,
-                |refs_bindings, loc| 'query: {
+        let total_candidates = Self::delta_passes(
+            read_copy,
+            delta,
+            pat_expr,
+            &sources,
+            |refs_bindings, loc| 'query: {
                     trace!(target: "transform", "delta data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
                     count_writes(template_prefixes.len());
                     match refs_bindings {
@@ -2550,9 +2515,8 @@ impl Space {
                             true
                         }
                     }
-                },
-            );
-        }
+            },
+        );
 
         #[cfg(feature = "bulk_emit")]
         bulk.flush(&mut template_wzs, &mut any_new);
@@ -2560,6 +2524,128 @@ impl Space {
             zh.cleanup_write_zipper(wz);
         }
         (total_candidates, any_new)
+    }
+
+    /// The m-delta pass plan, shared by every route that can use it: one pass
+    /// per body factor j with factor j bound to this rule's delta and the rest
+    /// to the full space, streaming each match to `effect`. The union of the
+    /// passes is the naive answer set (the idempotent insert dedups the
+    /// overlap), which is what makes the delta recurrence byte-identical for
+    /// add-only evaluation.
+    #[cfg(feature = "semi_naive_ic")]
+    fn delta_passes<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
+        read_copy: &PathMap<()>,
+        delta: &PathMap<()>,
+        pat_expr: Expr,
+        sources: &[ExprEnv],
+        mut effect: F,
+    ) -> usize {
+        let n_factors = sources.len();
+        let mut total_candidates = 0usize;
+        for j in 0..n_factors {
+            // Pass j only finds matches whose factor-j fact lies in the delta; when
+            // the delta holds nothing under that factor's constant prefix the pass
+            // is empty, so skip it (the delta is small: the probe is O(delta)). A
+            // prefixless factor (variable-headed) never skips.
+            {
+                let sub = sources[j].subsexpr();
+                let pfx = unsafe { sub.prefix().unwrap_or_else(|x| x).as_ref().unwrap() };
+                if !pfx.is_empty() && delta.read_zipper_at_path(pfx).val_count() == 0 {
+                    continue;
+                }
+            }
+
+            // Plan: factor j first, the rest in identity order. For j == 0 that IS
+            // the identity plan, so skip the re-encode entirely.
+            let plan_j: Vec<usize> =
+                std::iter::once(j).chain((0..n_factors).filter(|&i| i != j)).collect();
+
+            let (maps, _search_buffers, search_sources, unify_sources): (
+                Vec<&PathMap<()>>,
+                Vec<Vec<u8>>,
+                Vec<ExprEnv>,
+                Vec<ExprEnv>,
+            ) = if j == 0 {
+                (
+                    (0..n_factors).map(|i| if i == j { delta } else { read_copy }).collect(),
+                    Vec::new(),
+                    sources.to_vec(),
+                    sources.to_vec(),
+                )
+            } else {
+                match Self::renormalize_query_factors(sources, &plan_j) {
+                    Some((buffers, planned)) => (
+                        plan_j.iter().map(|&i| if i == j { delta } else { read_copy }).collect(),
+                        buffers,
+                        planned,
+                        plan_j.iter().map(|&i| sources[i]).collect(),
+                    ),
+                    None => (
+                        (0..n_factors).map(|i| if i == j { delta } else { read_copy }).collect(),
+                        Vec::new(),
+                        sources.to_vec(),
+                        sources.to_vec(),
+                    ),
+                }
+            };
+
+            // The delta pass is a join like any other -- factor j over the
+            // delta, the rest over the full space -- so it should run on the
+            // join engine, not the ProductZipper. The engine takes ONE map, so
+            // hand it one: a copy-on-write clone of the full space with the
+            // delta's subtrie grafted over factor j's relation. The clone and
+            // the graft are both O(1) pointer work on the trie.
+            //
+            // Sound exactly when factor j's relation appears once in the body:
+            // otherwise the graft would restrict its siblings to the delta too.
+            // (Bodies that repeat a relation -- transitive closure's two path
+            // factors -- keep the ProductZipper. Static guard tables never
+            // have a delta, so their passes are skipped above and never reach
+            // either route.)
+            #[cfg(feature = "leapfrog")]
+            {
+                let pfx_j = unsafe {
+                    sources[j].subsexpr().prefix().unwrap_or_else(|x| x).as_ref().unwrap()
+                };
+                let unique = !pfx_j.is_empty()
+                    && sources.iter().enumerate().all(|(i, src)| {
+                        if i == j { return true; }
+                        let p = unsafe {
+                            src.subsexpr().prefix().unwrap_or_else(|x| x).as_ref().unwrap()
+                        };
+                        !p.starts_with(pfx_j) && !pfx_j.starts_with(p)
+                    });
+                if unique && crate::zipper_join::leapfrog_dispatch_enabled() {
+                    let mut pass_map = read_copy.clone();
+                    {
+                        let mut wz = pass_map.write_zipper_at_path(pfx_j);
+                        wz.graft(&delta.read_zipper_at_path(pfx_j));
+                    }
+                    if let Some(touched) = crate::zipper_join::query_multi_leapfrog(
+                        &pass_map,
+                        pat_expr,
+                        &mut effect,
+                    ) {
+                        total_candidates += touched;
+                        continue;
+                    }
+                }
+            }
+
+            let mut prz = ProductZipper::new(
+                maps[0].read_zipper(),
+                (1..n_factors).map(|k| maps[k].read_zipper()),
+            );
+            prz.reserve_buffers(1 << 32, 32);
+
+            total_candidates += Self::query_multi_raw_with_unification_sources(
+                &mut prz,
+                &search_sources,
+                &unify_sources,
+                &mut effect,
+            );
+        }
+        total_candidates
     }
 
     #[cfg(feature="specialize_io")]
@@ -2650,6 +2736,18 @@ impl Space {
 
     #[cfg(feature="specialize_io")]
     pub fn transform_multi_multi_o(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
+        self.transform_multi_multi_o_inner(pat_expr, tpl_expr, add, None)
+    }
+
+    /// The sink route over this rule's delta: same sinks, same emit, the body
+    /// matched by the m-delta passes instead of the full space.
+    #[cfg(all(feature = "specialize_io", feature = "semi_naive_ic"))]
+    pub fn transform_multi_multi_o_delta(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, delta: &PathMap<()>) -> (usize, bool) {
+        self.transform_multi_multi_o_inner(pat_expr, tpl_expr, add, Some(delta))
+    }
+
+    #[cfg(feature="specialize_io")]
+    fn transform_multi_multi_o_inner(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr, delta: Option<&PathMap<()>>) -> (usize, bool) {
         use crate::sinks::*;
         let mut buffer = Vec::with_capacity(1 << 32);
         unsafe { buffer.set_len(1 << 32); }
@@ -2663,6 +2761,10 @@ impl Space {
         {
             self.sni_removal_seen |= sinks.iter().any(|s| matches!(s, crate::sinks::ASink::RemoveSink(_)));
         }
+        // Only a template whose sinks all emit once per match and only add can
+        // take the delta: the others fold over, or react to, the match set of
+        // one firing, which the delta deliberately shrinks.
+        let delta = delta.filter(|_| sinks.iter().all(|s| s.delta_safe()));
         let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
             sink.request().next().unwrap()
         ).collect();
@@ -2697,6 +2799,9 @@ impl Space {
         
         let mut ass = Vec::with_capacity(64);
         let mut astack = Vec::with_capacity(64);
+        let mut keybuf: Vec<u8> = Vec::with_capacity(1 << 16);
+        let mut kass = Vec::with_capacity(64);
+        let mut kstack = Vec::with_capacity(64);
 
         let mut any_new = false;
         // Fast path: an ungrouped, projection-free count over a decomposable multi-factor body is
@@ -2706,7 +2811,15 @@ impl Space {
         // real count. When the gate declines (grouped, projected, cyclic, single-factor, disabled)
         // this is None and the enumerate path runs unchanged.
         let fast = factorized_aggregate_gate(&read_copy, pat_expr, &sinks, &templates);
-        let touched = Self::query_multi(&read_copy, pat_expr, |refs_bindings, loc| 'query : {
+        // The sink route gets what the `,`->`,` route has always had: the join
+        // dispatch (WCO, acyclic guard, retrieval partition) when matching the
+        // full space, and the m-delta passes when the caller hands it a delta.
+        // Without either, every (O ...) rule -- guarded emit, witness
+        // selection, the arithmetic sinks -- enumerated its body on the
+        // ProductZipper, naively, every round. Both routes hand the effect the
+        // same (bindings, loc), so this is a drop-in; the corpus differential
+        // is the proof.
+        let mut effect = |refs_bindings: Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, loc: Expr| -> bool { 'query : {
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             count_writes(template_prefixes.len());
             match refs_bindings {
@@ -2727,6 +2840,22 @@ impl Space {
 
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
+                        // A sink that decides from a key gets the key alone
+                        // first: the payload -- a proof term, a plan, whatever
+                        // rides along -- is only instantiated for candidates it
+                        // keeps. The key is argument one of the template, so
+                        // applying it from the SAME (oi, ni) seed yields the
+                        // same bytes it would inside the full application; the
+                        // seed itself is not advanced, so a kept candidate's
+                        // emission is byte-identical to the unchecked path.
+                        if let Some(key_expr) = sinks[i].prekey() {
+                            keybuf.clear();
+                            let (_, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,key_expr,bindings,keybuf,kstack,kass) else { continue 'writes; };
+                            if !sinks[i].admits(&keybuf[..], &read_copy) {
+                                continue 'writes;
+                            }
+                        }
+
                         buffer.clear();
                         let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
                         oi = toi;
@@ -2739,7 +2868,19 @@ impl Space {
                     fast.is_none()
                 }
             }
-        });
+        }};
+
+        let touched = match delta {
+            #[cfg(feature = "semi_naive_ic")]
+            Some(d) => {
+                let mut pat_args = Vec::with_capacity(64);
+                ExprEnv::new(0, pat_expr).args(&mut pat_args);
+                let sources: Vec<ExprEnv> = pat_args[1..].to_vec();
+                Self::delta_passes(&read_copy, d, pat_expr, &sources, &mut effect)
+            }
+            _ => Self::query_multi_dispatch(&read_copy, pat_expr, &mut effect),
+        };
+        drop(effect);
 
         match fast {
             Some(FactorizedAgg::Count(n)) => {
@@ -2890,7 +3031,9 @@ impl Space {
             let res = match (*pat_expr.ptr.add(2), *tpl_expr.ptr.add(2)) {
                 (b',', b',') => { self.transform_multi_multi_(pat_expr, tpl_expr, rt) }
                 (b'I', b',') => { self.transform_multi_multi_i(pat_expr, tpl_expr, rt) }
-                (b',', b'O') => { self.transform_multi_multi_o(pat_expr, tpl_expr, rt) }
+                // Through the semi-naive wrapper, exactly like `,`->`,`: it hands
+                // the sink route this rule's delta when the rule recurs.
+                (b',', b'O') => { self.transform_multi_multi_(pat_expr, tpl_expr, rt) }
                 (b'I', b'O') => { self.transform_multi_multi_io(pat_expr, tpl_expr, rt, false, false) }
                 (_, _) => { return Err("pattern functor can only be , or I and template functor can only be , or O") }
             };
