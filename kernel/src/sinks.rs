@@ -385,6 +385,15 @@ fn guarded_emit_table_covers(read: &PathMap<()>, guard_row: Expr) -> bool {
     let mut args = Vec::with_capacity(3);
     ExprEnv::new(0, guard_row).args(&mut args);
     if args.len() != 2 && args.len() != 3 {
+        // A malformed guard spec silently never dropping reads as an engine
+        // bug downstream; say what happened, once per shape class.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "guarded_emit: guard spec must be (TABLE key) or (TABLE key bound);                  got {} args -- guard is a no-op (wrap multi-column keys in one compound)",
+                args.len()
+            );
+        });
         return false;
     }
 
