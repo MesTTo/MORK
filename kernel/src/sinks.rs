@@ -165,6 +165,22 @@ pub(crate) trait Sink {
     fn request(&self) ->  impl Iterator<Item=WriteResourceRequest>;
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It, path: &[u8], read: &PathMap<()>) where 'a : 'w, 'k : 'w;
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w;
+
+    /// A sink that decides from a KEY, not from the whole emission, names that
+    /// key here. The emit loop then instantiates only the key, asks `admits`,
+    /// and builds the payload solely for candidates that will be kept.
+    ///
+    /// This is where the cost of a state search lives: the same state is
+    /// reached along many derivations, and each one carries a payload (a proof
+    /// term, a plan) far larger than the state itself. Instantiating that
+    /// payload before dropping the candidate does the expensive work for every
+    /// derivation -- exactly the count the search was collapsing away.
+    fn prekey(&self) -> Option<Expr> { None }
+
+    /// Decide a candidate from its instantiated key. A sink returning
+    /// `Some` from `prekey` is guaranteed this is called first, and that
+    /// `sink` follows iff it returned true -- so the check is not repeated.
+    fn admits(&mut self, _key: &[u8], _read: &PathMap<()>) -> bool { true }
 }
 
 fn set_btm_val_and_note<W: ZipperWriting<()>>(wz: &mut W, full_path: &[u8]) -> bool {
@@ -735,7 +751,7 @@ impl Sink for RemoveSink {
 }
 
 #[cfg(feature = "guarded_emit")]
-pub struct GuardedEmitSink { out: Expr, changed: bool }
+pub struct GuardedEmitSink { table: Expr, out: Expr, covered: PathMap<()>, uncovered: PathMap<()>, changed: bool }
 
 #[cfg(feature = "guarded_emit")]
 impl Sink for GuardedEmitSink {
@@ -745,7 +761,7 @@ impl Sink for GuardedEmitSink {
         if args.len() != 3 {
             panic!("guard sink expects (guard <table-row> <out>)")
         }
-        GuardedEmitSink { out: args[2].subsexpr(), changed: false }
+        GuardedEmitSink { table: args[1].subsexpr(), out: args[2].subsexpr(), covered: PathMap::new(), uncovered: PathMap::new(), changed: false }
     }
     fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
         let p = unsafe { self.out.prefix().unwrap_or_else(|_| self.out.span()).as_ref().unwrap() };
@@ -753,7 +769,6 @@ impl Sink for GuardedEmitSink {
         std::iter::once(WriteResourceRequest::BTM(p))
     }
     fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8], read: &PathMap<()>) where 'a : 'w, 'k : 'w {
-        GUARDED_EMIT_CONSULTED.fetch_add(1, AtomicOrdering::Relaxed);
 
         let mut args = Vec::with_capacity(3);
         let e = Expr { ptr: path.as_ptr().cast_mut() };
@@ -767,11 +782,6 @@ impl Sink for GuardedEmitSink {
         //   (guard (TABLE key min-bound) out)
         // The three-column form is for nogoods: a stored decimal bound covers
         // a candidate when stored_bound >= min_bound.
-        if guarded_emit_table_covers(read, args[1].subsexpr()) {
-            GUARDED_EMIT_DROPPED.fetch_add(1, AtomicOrdering::Relaxed);
-            return;
-        }
-
         let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
         let out_raw = expr_bytes(args[2].subsexpr());
         let mut out_buf = Vec::with_capacity(out_raw.len());
@@ -783,10 +793,141 @@ impl Sink for GuardedEmitSink {
         wz.move_to_path(mpath);
         self.changed |= set_btm_val_and_note(wz, out);
     }
+    fn prekey(&self) -> Option<Expr> { Some(self.table) }
+
+    fn admits(&mut self, key: &[u8], read: &PathMap<()>) -> bool {
+        GUARDED_EMIT_CONSULTED.fetch_add(1, AtomicOrdering::Relaxed);
+        // The table walked here is the pre-step snapshot, so a key's verdict
+        // cannot change within a firing: walk each DISTINCT key once and
+        // memoize. Candidates repeat keys whenever the emission carries a
+        // payload the key does not, which is the common shape.
+        let covered = if self.covered.contains_path(key) {
+            true
+        } else if self.uncovered.contains_path(key) {
+            false
+        } else {
+            let row = Expr { ptr: key.as_ptr().cast_mut() };
+            let c = guarded_emit_table_covers(read, row);
+            if c { self.covered.insert(key, ()); } else { self.uncovered.insert(key, ()); }
+            c
+        };
+        if covered {
+            GUARDED_EMIT_DROPPED.fetch_add(1, AtomicOrdering::Relaxed);
+            return false;
+        }
+        true
+    }
+
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It) -> bool where 'a : 'w, 'k : 'w {
         trace!(target: "sink", "guard finalizing");
         self.changed
     }
+}
+
+#[cfg(feature = "witness_select")]
+static WITNESS_KEPT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "witness_select")]
+static WITNESS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Witness selection (Datalog's `choice`): `(choose (TABLE key) out)` emits
+/// `out` for each distinct instantiated `key` that no stored TABLE row
+/// already generalizes -- and, unlike `guard`, at most ONCE per key per
+/// firing.
+///
+/// `guard` consults the pre-step snapshot, so several matches producing the
+/// same key inside one firing all pass it. When the emitted fact carries a
+/// PASSIVE payload (a proof term, a plan, a witness: bytes no rule body ever
+/// reads), those same-key siblings differ only in payload and the trie keeps
+/// every one -- the search then enumerates DERIVATIONS instead of exploring
+/// STATES, and each round re-multiplies the last round's multiplicity.
+/// Measured on the metamath meet-in-the-middle space: 168,859 stored
+/// contexts at one (budget, height) cell over 3,588 distinct ones, a 47x
+/// payload multiplication that compounds per round.
+///
+/// `choose` keeps one witness per key, so the space is the state space. Which
+/// witness survives is emit order (deterministic: the join's trie walk), and
+/// the resulting answers are the same states with one representative payload
+/// each -- the search semantics every solver uses, and the exact dual of the
+/// counting DP, which counts derivations without enumerating them.
+#[cfg(feature = "witness_select")]
+pub struct WitnessSelectSink { table: Expr, out: Expr, seen: PathMap<()>, changed: bool }
+
+#[cfg(feature = "witness_select")]
+impl Sink for WitnessSelectSink {
+    fn new(e: Expr) -> Self {
+        let mut args = Vec::with_capacity(3);
+        ExprEnv::new(0, e).args(&mut args);
+        if args.len() != 3 {
+            panic!("choose sink expects (choose <table-row> <out>)")
+        }
+        WitnessSelectSink { table: args[1].subsexpr(), out: args[2].subsexpr(), seen: PathMap::new(), changed: false }
+    }
+    fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
+        let p = unsafe { self.out.prefix().unwrap_or_else(|_| self.out.span()).as_ref().unwrap() };
+        trace!(target: "sink", "choose requesting {}", serialize(p));
+        std::iter::once(WriteResourceRequest::BTM(p))
+    }
+    fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It, path: &[u8], read: &PathMap<()>) where 'a : 'w, 'k : 'w {
+        let mut args = Vec::with_capacity(3);
+        let e = Expr { ptr: path.as_ptr().cast_mut() };
+        ExprEnv::new(0, e).args(&mut args);
+        if args.len() != 3 {
+            return;
+        }
+
+        let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
+        let out_raw = expr_bytes(args[2].subsexpr());
+        let mut out_buf = Vec::with_capacity(out_raw.len());
+        standalone_expr(path, args[2].offset as usize, out_raw, &mut out_buf);
+        let out = &out_buf[..];
+        debug_assert!(out.starts_with(wz.root_prefix_path()));
+        let mpath = &out[wz.root_prefix_path().len()..];
+        trace!(target: "sink", "choose at '{}' emitting '{}'", serialize(wz.root_prefix_path()), serialize(out));
+        wz.move_to_path(mpath);
+        self.changed |= set_btm_val_and_note(wz, out);
+    }
+    fn prekey(&self) -> Option<Expr> { Some(self.table) }
+
+    fn admits(&mut self, key: &[u8], read: &PathMap<()>) -> bool {
+        // Both checks are EXACT trie probes, O(key). The key is a De Bruijn
+        // encoding, which is already alpha-canonical, so exact membership IS
+        // state identity. (A generalization walk would additionally subsume
+        // instances under stored schemas, but that was measured at 1.2x on
+        // the backward space against 47x for the payload collapse, and costs
+        // a branching descent over a table that grows with the search.)
+        //
+        // Intra-firing: the snapshot cannot see this firing's own emissions.
+        if self.seen.insert(key, ()).is_some() {
+            WITNESS_DROPPED.fetch_add(1, AtomicOrdering::Relaxed);
+            return false;
+        }
+        // Cross-firing: earlier rounds' states are in the snapshot.
+        if read.contains_path(key) {
+            WITNESS_DROPPED.fetch_add(1, AtomicOrdering::Relaxed);
+            return false;
+        }
+        WITNESS_KEPT.fetch_add(1, AtomicOrdering::Relaxed);
+        true
+    }
+
+    fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It) -> bool where 'a : 'w, 'k : 'w {
+        self.changed
+    }
+}
+
+/// (kept, dropped) witnesses since the last reset.
+#[cfg(feature = "witness_select")]
+pub fn witness_select_stats() -> (usize, usize) {
+    (
+        WITNESS_KEPT.load(AtomicOrdering::Relaxed),
+        WITNESS_DROPPED.load(AtomicOrdering::Relaxed),
+    )
+}
+
+#[cfg(feature = "witness_select")]
+pub fn reset_witness_select_stats() {
+    WITNESS_KEPT.store(0, AtomicOrdering::Relaxed);
+    WITNESS_DROPPED.store(0, AtomicOrdering::Relaxed);
 }
 
 pub struct HeadTailSink<const head: bool> { e: Expr, extrema: PathMap<()>, skip: usize, count: usize, max: usize, extremum: Vec<u8> }
@@ -1881,6 +2022,8 @@ impl Sink for WeightedSelectSink {
 pub enum ASink { AddSink(AddSink), RemoveSink(RemoveSink), HeadSink(HeadTailSink<true>), TailSink(HeadTailSink<false>), CountSink(CountSink), HashSink(HashSink), SumSink(SumSink), AndSink(AndSink), ACTSink(ACTSink),
     #[cfg(feature = "guarded_emit")]
     GuardedEmitSink(GuardedEmitSink),
+    #[cfg(feature = "witness_select")]
+    WitnessSelectSink(WitnessSelectSink),
     #[cfg(feature = "egraph")]
     EGraphSink(EGraphSink),
     #[cfg(feature = "weighted_select")]
@@ -1903,6 +2046,54 @@ pub enum ASink { AddSink(AddSink), RemoveSink(RemoveSink), HeadSink(HeadTailSink
 impl ASink {
     pub fn compat(e: Expr) -> Self {
         ASink::CompatSink(CompatSink::new(e))
+    }
+
+    /// Can this sink run over a rule's DELTA instead of the whole space and
+    /// still mean the same thing?
+    ///
+    /// Yes exactly when it emits once per match and only adds: then the union
+    /// over the m-delta passes is the naive answer set. No when it folds over
+    /// the match set of one firing (`count`, `sum`, `and`, the float
+    /// reductions, `head`/`tail` extrema, `hash`), when it removes
+    /// (non-monotone), or when it is effectful (`act`, `z3`, `wasm`, egraph,
+    /// weighted selection) and would simply fire a different number of times.
+    ///
+    /// The match is exhaustive on purpose: a new sink cannot be added without
+    /// deciding this.
+    pub fn delta_safe(&self) -> bool {
+        match self {
+            ASink::AddSink(_) => true,
+            ASink::USink(_) => true,
+            ASink::AUSink(_) => true,
+            ASink::CompatSink(_) => true,
+            #[cfg(feature = "guarded_emit")]
+            ASink::GuardedEmitSink(_) => true,
+            #[cfg(feature = "witness_select")]
+            ASink::WitnessSelectSink(_) => true,
+            #[cfg(feature = "grounding")]
+            ASink::PureSink(_) => true,
+
+            ASink::RemoveSink(_) => false,
+            ASink::HeadSink(_) => false,
+            ASink::TailSink(_) => false,
+            ASink::CountSink(_) => false,
+            ASink::HashSink(_) => false,
+            ASink::SumSink(_) => false,
+            ASink::AndSink(_) => false,
+            ASink::ACTSink(_) => false,
+            ASink::FSumSink(_) => false,
+            ASink::FMinSink(_) => false,
+            ASink::FMaxSink(_) => false,
+            ASink::FProdSink(_) => false,
+            #[cfg(feature = "egraph")]
+            ASink::EGraphSink(_) => false,
+            #[cfg(feature = "weighted_select")]
+            ASink::WeightedSelectSink(_) => false,
+            #[cfg(feature = "wasm")]
+            ASink::WASMSink(_) => false,
+            #[cfg(feature = "z3")]
+            ASink::Z3Sink(_) => false,
+        }
     }
 }
 
@@ -1949,6 +2140,12 @@ impl Sink for ASink {
         } else if unsafe { *e.ptr == item_byte(Tag::Arity(3)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(3)) &&
             *e.ptr.offset(2) == b'A' && *e.ptr.offset(3) == b'C' && *e.ptr.offset(4) == b'T' } {
             return ASink::ACTSink(ACTSink::new(e));
+        } else if unsafe { *e.ptr == item_byte(Tag::Arity(3)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(6)) &&
+            *e.ptr.offset(2) == b'c' && *e.ptr.offset(3) == b'h' && *e.ptr.offset(4) == b'o' && *e.ptr.offset(5) == b'o' && *e.ptr.offset(6) == b's' && *e.ptr.offset(7) == b'e' } {
+            #[cfg(feature = "witness_select")]
+            return ASink::WitnessSelectSink(WitnessSelectSink::new(e));
+            #[cfg(not(feature = "witness_select"))]
+            panic!("(choose ...) needs the witness_select feature");
         } else if unsafe { *e.ptr == item_byte(Tag::Arity(3)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(5)) &&
             *e.ptr.offset(2) == b'g' && *e.ptr.offset(3) == b'u' && *e.ptr.offset(4) == b'a' && *e.ptr.offset(5) == b'r' && *e.ptr.offset(6) == b'd' } {
             #[cfg(feature = "guarded_emit")]
@@ -2006,6 +2203,8 @@ impl Sink for ASink {
                 ASink::ACTSink(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "guarded_emit")]
                 ASink::GuardedEmitSink(s) => { for i in s.request().into_iter() { yield i } }
+                #[cfg(feature = "witness_select")]
+                ASink::WitnessSelectSink(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "wasm")]
                 ASink::WASMSink(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "grounding")]
@@ -2039,6 +2238,8 @@ impl Sink for ASink {
             ASink::ACTSink(s) => { s.sink(it, path, read) }
             #[cfg(feature = "guarded_emit")]
             ASink::GuardedEmitSink(s) => { s.sink(it, path, read) }
+            #[cfg(feature = "witness_select")]
+            ASink::WitnessSelectSink(s) => { s.sink(it, path, read) }
             #[cfg(feature = "wasm")]
             ASink::WASMSink(s) => { s.sink(it, path, read) }
             #[cfg(feature = "grounding")]
@@ -2057,6 +2258,26 @@ impl Sink for ASink {
         }
     }
 
+    fn prekey(&self) -> Option<Expr> {
+        match self {
+            #[cfg(feature = "guarded_emit")]
+            ASink::GuardedEmitSink(s) => s.prekey(),
+            #[cfg(feature = "witness_select")]
+            ASink::WitnessSelectSink(s) => s.prekey(),
+            _ => None,
+        }
+    }
+
+    fn admits(&mut self, key: &[u8], read: &PathMap<()>) -> bool {
+        match self {
+            #[cfg(feature = "guarded_emit")]
+            ASink::GuardedEmitSink(s) => s.admits(key, read),
+            #[cfg(feature = "witness_select")]
+            ASink::WitnessSelectSink(s) => s.admits(key, read),
+            _ => true,
+        }
+    }
+
     fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, it: It) -> bool where 'a : 'w, 'k : 'w {
         match self {
             ASink::AddSink(s) => { s.finalize(it) }
@@ -2072,6 +2293,8 @@ impl Sink for ASink {
             ASink::ACTSink(s) => { s.finalize(it) }
             #[cfg(feature = "guarded_emit")]
             ASink::GuardedEmitSink(s) => { s.finalize(it) }
+            #[cfg(feature = "witness_select")]
+            ASink::WitnessSelectSink(s) => { s.finalize(it) }
             #[cfg(feature = "wasm")]
             ASink::WASMSink(s) => { s.finalize(it) }
             #[cfg(feature = "grounding")]

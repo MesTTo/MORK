@@ -52,6 +52,10 @@ specialize_io = []
 # flush sorted (join order is random w.r.t. the trie; sorted insertion into a
 # large dish measured 2.65x faster). Per-path insert semantics unchanged.
 bulk_emit = []
+# Witness selection (Datalog's choice): (choose (TABLE key) out) keeps ONE
+# emission per distinct key per firing, so a search over states never
+# enumerates the derivations that reach them.
+witness_select = ["guarded_emit"]
 periodic_merkleize = []
 experimental_dnf = ["pathmap/zipper_alg"]
 [[example]]

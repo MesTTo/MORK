@@ -32,6 +32,8 @@ pub use mork_frontend as __mork_frontend;
 pub mod weighted_paths;
 #[cfg(feature = "guarded_emit")]
 pub use sinks::{guarded_emit_stats, reset_guarded_emit_stats, GuardedEmitStats};
+#[cfg(feature = "witness_select")]
+pub use sinks::{reset_witness_select_stats, witness_select_stats};
 pub use sinks::{
     wasm_linear_memory_policy, WasmLinearMemoryPolicy, WASM_LINEAR_MEMORY_GUARD_BYTES,
     WASM_LINEAR_MEMORY_RESERVATION_BYTES,
