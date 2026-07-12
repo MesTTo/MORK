@@ -14,6 +14,8 @@ pub mod json_path_query;
 pub mod zipper_join;
 mod sources;
 mod sinks;
+#[cfg(feature = "retrieval_join")]
+pub mod retrieval;
 mod pure;
 
 pub use sinks::WriteResourceRequest;
