@@ -173,6 +173,94 @@ pub(crate) fn stratified_note_btm_insert(path: &[u8], inserted: bool) {
     }
 }
 
+/// Probe note when the caller has already computed exec-ness (the bulk
+/// emitter stores a flag instead of the full path).
+#[cfg(feature = "bulk_emit")]
+pub(crate) fn stratified_note_insert_flagged(is_exec: bool, inserted: bool) {
+    #[cfg(not(feature = "stratified_quiescence"))]
+    let _ = (is_exec, inserted);
+    #[cfg(feature = "stratified_quiescence")]
+    if inserted && !is_exec {
+        STRATIFIED_NON_EXEC_COUNT_DELTA.with(|count| count.set(count.get() + 1));
+    }
+}
+
+/// Sorted-batch emission (feature bulk_emit): join answers arrive in join
+/// order, random with respect to the trie; the insert_probe finding measured
+/// sorted insertion into a large dish at 2.65x the random rate. Suffixes
+/// batch per write-zipper group and flush sorted. Per-path events (set_val
+/// inserted flags, probe notes, any_new) are exactly the unbatched ones --
+/// only their order changes, and trie content is a set, so dumps are
+/// byte-identical. Duplicates are NOT deduplicated: the second write hits
+/// the existing value precisely as it would unbatched.
+#[cfg(feature = "bulk_emit")]
+pub(crate) struct BulkEmit {
+    groups: Vec<Vec<(Vec<u8>, bool)>>,
+    pending: usize,
+}
+
+#[cfg(feature = "bulk_emit")]
+impl BulkEmit {
+    /// Flush threshold: bounds batch memory (~40MB at typical path sizes)
+    /// while keeping chunks large enough that sortedness pays.
+    const FLUSH_CAP: usize = 1_000_000;
+
+    pub(crate) fn new(ngroups: usize) -> Self {
+        Self {
+            groups: vec![Vec::new(); ngroups],
+            pending: 0,
+        }
+    }
+
+    /// Queue one instantiated output (suffix relative to the group's zipper
+    /// root; exec-ness precomputed from the full path). Returns true when
+    /// the batch should flush.
+    pub(crate) fn push(&mut self, group: usize, suffix: &[u8], is_exec: bool) -> bool {
+        self.groups[group].push((suffix.to_vec(), is_exec));
+        self.pending += 1;
+        self.pending >= Self::FLUSH_CAP
+    }
+
+    pub(crate) fn flush<WZ>(&mut self, wzs: &mut [WZ], any_new: &mut bool)
+    where
+        WZ: pathmap::zipper::ZipperWriting<()>,
+    {
+        use pathmap::zipper::ZipperMoving;
+        for (g, paths) in self.groups.iter_mut().enumerate() {
+            if paths.is_empty() {
+                continue;
+            }
+            paths.sort_unstable();
+            let wz = &mut wzs[g];
+            for (suffix, is_exec) in paths.drain(..) {
+                wz.move_to_path(&suffix[..]);
+                let inserted = wz.set_val(()).is_none();
+                stratified_note_insert_flagged(is_exec, inserted);
+                *any_new |= inserted;
+            }
+        }
+        self.pending = 0;
+    }
+}
+
+/// Queue one instantiated output through the bulk emitter, flushing at the
+/// cap -- the shared tail of every transform's write loop.
+#[cfg(feature = "bulk_emit")]
+fn bulk_queue_output<WZ>(
+    bulk: &mut BulkEmit,
+    wzs: &mut [WZ],
+    group: usize,
+    buffer: &[u8],
+    any_new: &mut bool,
+) where
+    WZ: pathmap::zipper::ZipperWriting<()> + pathmap::zipper::ZipperAbsolutePath,
+{
+    let off = wzs[group].root_prefix_path().len();
+    if bulk.push(group, &buffer[off..], buffer.starts_with(&EXEC_PREFIX)) {
+        bulk.flush(wzs, any_new);
+    }
+}
+
 pub(crate) fn stratified_note_btm_remove(path: &[u8], removed: bool) {
     #[cfg(not(feature = "stratified_quiescence"))]
     let _ = (path, removed);
@@ -2076,6 +2164,8 @@ impl Space {
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
+        #[cfg(feature = "bulk_emit")]
+        let mut bulk = BulkEmit::new(template_wzs.len());
         let touched = Self::query_multi_dispatch(&read_copy, pat_expr, |refs_bindings, loc| 'query:{
             trace!(target: "transform", "data {}", serialize(unsafe { loc.span().as_ref().unwrap()}));
             unsafe { writes += template_prefixes.len(); }
@@ -2093,8 +2183,6 @@ impl Space {
                     }) else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
-                        let wz = &mut template_wzs[subsumption[i]];
-
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
 
@@ -2104,15 +2192,23 @@ impl Space {
 
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        let inserted = wz.set_val(()).is_none();
-                        stratified_note_btm_insert(&buffer[..], inserted);
-                        any_new |= inserted;
+                        #[cfg(not(feature = "bulk_emit"))]
+                        {
+                            let wz = &mut template_wzs[subsumption[i]];
+                            wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
+                            let inserted = wz.set_val(()).is_none();
+                            stratified_note_btm_insert(&buffer[..], inserted);
+                            any_new |= inserted;
+                        }
+                        #[cfg(feature = "bulk_emit")]
+                        bulk_queue_output(&mut bulk, &mut template_wzs, subsumption[i], &buffer[..], &mut any_new);
                     }
                     true
                 }
             }
         });
+        #[cfg(feature = "bulk_emit")]
+        bulk.flush(&mut template_wzs, &mut any_new);
         for wz in template_wzs {
             zh.cleanup_write_zipper(wz);
         }
@@ -2318,6 +2414,8 @@ impl Space {
         let n_factors = sources.len();
 
         let mut any_new = false;
+        #[cfg(feature = "bulk_emit")]
+        let mut bulk = BulkEmit::new(template_wzs.len());
         let mut total_candidates = 0usize;
 
         for j in 0..n_factors {
@@ -2399,14 +2497,19 @@ impl Space {
                             }) else { break 'query true; };
 
                             'writes: for (i, template) in templates.iter().enumerate() {
-                                let wz = &mut template_wzs[subsumption[i]];
                                 buffer.clear();
                                 let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
                                 oi = toi;
-                                wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                                let inserted = wz.set_val(()).is_none();
-                                stratified_note_btm_insert(&buffer[..], inserted);
-                                any_new |= inserted;
+                                #[cfg(not(feature = "bulk_emit"))]
+                                {
+                                    let wz = &mut template_wzs[subsumption[i]];
+                                    wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
+                                    let inserted = wz.set_val(()).is_none();
+                                    stratified_note_btm_insert(&buffer[..], inserted);
+                                    any_new |= inserted;
+                                }
+                                #[cfg(feature = "bulk_emit")]
+                                bulk_queue_output(&mut bulk, &mut template_wzs, subsumption[i], &buffer[..], &mut any_new);
                             }
                             true
                         }
@@ -2415,6 +2518,8 @@ impl Space {
             );
         }
 
+        #[cfg(feature = "bulk_emit")]
+        bulk.flush(&mut template_wzs, &mut any_new);
         for wz in template_wzs {
             zh.cleanup_write_zipper(wz);
         }
@@ -2455,6 +2560,8 @@ impl Space {
         let mut astack = Vec::with_capacity(64);
 
         let mut any_new = false;
+        #[cfg(feature = "bulk_emit")]
+        let mut bulk = BulkEmit::new(template_wzs.len());
         let z3s_guard = self.z3s.get_mut().unwrap();
         let mmaps_guard = self.mmaps.get_mut().unwrap();
         let touched = Self::query_multi_i(false, mmaps_guard, z3s_guard, &read_copy, pat_expr, |refs_bindings, _loc| 'query : {
@@ -2474,8 +2581,6 @@ impl Space {
                     }) else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
-                        let wz = &mut template_wzs[subsumption[i]];
-
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
@@ -2484,15 +2589,23 @@ impl Space {
 
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
-                        let inserted = wz.set_val(()).is_none();
-                        stratified_note_btm_insert(&buffer[..], inserted);
-                        any_new |= inserted;
+                        #[cfg(not(feature = "bulk_emit"))]
+                        {
+                            let wz = &mut template_wzs[subsumption[i]];
+                            wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
+                            let inserted = wz.set_val(()).is_none();
+                            stratified_note_btm_insert(&buffer[..], inserted);
+                            any_new |= inserted;
+                        }
+                        #[cfg(feature = "bulk_emit")]
+                        bulk_queue_output(&mut bulk, &mut template_wzs, subsumption[i], &buffer[..], &mut any_new);
                     }
                     true
                 }
             }
         });
+        #[cfg(feature = "bulk_emit")]
+        bulk.flush(&mut template_wzs, &mut any_new);
         for wz in template_wzs {
             zh.cleanup_write_zipper(wz);
         }

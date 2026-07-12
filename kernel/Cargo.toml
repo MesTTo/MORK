@@ -48,6 +48,10 @@ retrieval_join = [] # experimental: unifiability retrieval into stored regions a
 no_search = []
 grounding = []
 specialize_io = []
+# Sorted-batch emission: batch template outputs per write-zipper group and
+# flush sorted (join order is random w.r.t. the trie; sorted insertion into a
+# large dish measured 2.65x faster). Per-path insert semantics unchanged.
+bulk_emit = []
 periodic_merkleize = []
 experimental_dnf = ["pathmap/zipper_alg"]
 [[example]]
