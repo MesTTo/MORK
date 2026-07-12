@@ -28,6 +28,8 @@ pub use mork_expr as __mork_expr;
 #[doc(hidden)]
 pub use mork_frontend as __mork_frontend;
 pub mod weighted_paths;
+#[cfg(feature = "guarded_emit")]
+pub use sinks::{guarded_emit_stats, reset_guarded_emit_stats, GuardedEmitStats};
 pub use sinks::{
     wasm_linear_memory_policy, WasmLinearMemoryPolicy, WASM_LINEAR_MEMORY_GUARD_BYTES,
     WASM_LINEAR_MEMORY_RESERVATION_BYTES,

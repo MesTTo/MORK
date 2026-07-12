@@ -2583,7 +2583,7 @@ impl Space {
                         oi = toi;
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        sinks[i].sink(std::iter::once(wz), &buffer[..]);
+                        sinks[i].sink(std::iter::once(wz), &buffer[..], &read_copy);
                     }
                     // Fast path stops after the first successful match: one representative seeds the
                     // single group, and set_precomputed (below) supplies the factorized aggregate.
@@ -2700,7 +2700,7 @@ impl Space {
                         let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        sinks[i].sink(std::iter::once(wz), &buffer[..]);
+                        sinks[i].sink(std::iter::once(wz), &buffer[..], &read_copy);
                     }
                     true
                 }
@@ -3056,6 +3056,84 @@ mod tests {
         );
 
         assert_eq!(count, 2);
+    }
+}
+
+#[cfg(all(test, feature = "guarded_emit"))]
+mod guarded_emit_no_guard_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn build(program: &str) -> Space {
+        let mut s = Space::new();
+        s.add_all_sexpr(program.as_bytes()).unwrap();
+        s
+    }
+
+    fn paths(space: &Space) -> BTreeSet<Vec<u8>> {
+        let mut out = BTreeSet::new();
+        let mut rz = space.btm.read_zipper();
+        while rz.to_next_val() {
+            out.insert(rz.path().to_vec());
+        }
+        out
+    }
+
+    fn run_reference_loop(program: &str, steps: usize) -> (usize, BTreeSet<Vec<u8>>) {
+        let mut s = build(program);
+        let mut done = 0usize;
+        while done < steps {
+            let Some(path) = s.take_first_exec_path() else {
+                break;
+            };
+            s.interpret_taken_exec(path, done);
+            done += 1;
+        }
+        (done, paths(&s))
+    }
+
+    fn run_guarded_feature_loop(program: &str, steps: usize) -> (usize, BTreeSet<Vec<u8>>) {
+        let mut s = build(program);
+        let done = s.metta_calculus(steps);
+        (done, paths(&s))
+    }
+
+    #[test]
+    fn no_guard_resource_programs_match_reference_scheduler() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/resources");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(dir).expect("resources dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mm2") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_str().unwrap().to_string();
+            if (name == "weighted_select" && !cfg!(feature = "weighted_select"))
+                || (name == "egraph_saturation" && !cfg!(feature = "egraph"))
+            {
+                continue;
+            }
+            let program = std::fs::read_to_string(&path).expect("readable resource");
+            assert!(
+                !program.contains("(guard"),
+                "resource corpus unexpectedly contains a guarded emit template: {name}"
+            );
+            let steps_list: &[usize] = if name.starts_with("decision_tree") || name == "ip_sudoku" {
+                &[1, 7]
+            } else {
+                &[1, 7, 40]
+            };
+            for &steps in steps_list {
+                let reference = run_reference_loop(&program, steps);
+                let guarded_feature = run_guarded_feature_loop(&program, steps);
+                assert_eq!(
+                    reference, guarded_feature,
+                    "{name} steps={steps}: guarded_emit changed a no-guard program"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 8, "expected the resource corpus, found {checked}");
     }
 }
 
