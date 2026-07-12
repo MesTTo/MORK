@@ -1971,7 +1971,9 @@ pub fn apply(n: u8, mut original_intros: u8, mut new_intros: u8, ez: &mut ExprZi
 pub fn unify(mut stack: &mut Vec<(ExprEnv, ExprEnv)>) -> Result<BTreeMap<ExprVar, ExprEnv>, UnificationFailure> {
     let mut bindings: BTreeMap<ExprVar, ExprEnv> = BTreeMap::new();
     let mut iterations = 0;
-    let mut encountered: gxhash::HashSet<(ExprEnv, ExprEnv)> = gxhash::HashSet::new();
+    // Default::default() works for both the real gxhash::HashSet (an alias
+    // over GxBuildHasher, no ::new) and the miri fallback's std HashSet.
+    let mut encountered: gxhash::HashSet<(ExprEnv, ExprEnv)> = Default::default();
 
     macro_rules! step {
         (occurs $x:expr, $e:expr) => {{
