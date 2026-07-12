@@ -40,6 +40,20 @@ fn subexpr_len_at(bytes: &[u8], pos: usize) -> Option<usize> {
     Some(i - pos)
 }
 
+/// Tag-aware scan: does this encoded span contain any variable occurrence?
+/// Payload bytes are skipped (raw symbol bytes alias the tag ranges).
+pub(crate) fn span_contains_vars(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match byte_item(bytes[i]) {
+            Tag::NewVar | Tag::VarRef(_) => return true,
+            Tag::SymbolSize(s) => i += 1 + s as usize,
+            Tag::Arity(_) => i += 1,
+        }
+    }
+    false
+}
+
 /// Rewrites every key variable occurrence to `VarRef(canonical index)` so
 /// binding comparisons see variable identity (the guard walk's discipline).
 fn resolve_key_vars(key: &[u8]) -> Vec<u8> {
@@ -68,7 +82,7 @@ fn resolve_key_vars(key: &[u8]) -> Vec<u8> {
 /// variable occurrence.
 pub struct RetrievedUnifier<'w> {
     pub stored_path: &'w [u8],
-    pub stored_bindings: &'w [(u8, Vec<u8>)],
+    pub stored_bindings: &'w [Option<Vec<u8>>],
     pub key_bindings: &'w [(u8, Vec<u8>)],
 }
 
@@ -80,8 +94,13 @@ struct Walk<'k, Z, F> {
     /// stored-variable arm and a key-variable arm (variable-variable meetings)
     /// is one CANDIDATE; consumers re-derive exact unifiers per fact.
     emitted: std::collections::HashSet<Vec<u8>>,
-    /// stored variable index -> bound key span (from `resolved`).
-    stored_bindings: Vec<(u8, Vec<u8>)>,
+    /// Stored NewVars in OCCURRENCE order (VarRef indices align with this):
+    /// `Some(span)` when the stored variable bound a key subterm exactly,
+    /// `None` (wildcard) when it was consumed inside a key-variable's swallowed
+    /// span -- its coreference constraints are enforced by the consumer's full
+    /// unification, so wildcard occurrences accept any key subterm here (the
+    /// walk is a COMPLETE overapproximation; it never misses a unifiable fact).
+    stored_bindings: Vec<Option<Vec<u8>>>,
     /// canonical key variable index -> bound stored span (trie bytes).
     key_bindings: Vec<(u8, Vec<u8>)>,
     emit: F,
@@ -142,12 +161,24 @@ where
                 if payload > 0 {
                     go(w, owed, payload - 1, span, cont);
                 } else {
+                    let mut pushed = false;
                     let (o, p) = match byte_item(b) {
                         Tag::Arity(k) => (owed - 1 + k as usize, 0),
                         Tag::SymbolSize(s) => (owed - 1, s as usize),
-                        Tag::NewVar | Tag::VarRef(_) => (owed - 1, 0),
+                        Tag::NewVar => {
+                            // A stored variable consumed inside a swallowed
+                            // span: keep the occurrence index aligned and mark
+                            // it wildcard for later VarRef re-occurrences.
+                            w.stored_bindings.push(None);
+                            pushed = true;
+                            (owed - 1, 0)
+                        }
+                        Tag::VarRef(_) => (owed - 1, 0),
                     };
                     go(w, o, p, span, cont);
+                    if pushed {
+                        w.stored_bindings.pop();
+                    }
                 }
                 span.pop();
                 w.rz.ascend_byte();
@@ -155,6 +186,101 @@ where
         }
         let mut span = Vec::new();
         go(self, 1, 0, &mut span, cont);
+    }
+
+    /// Stored VarRef(i) branches at the cursor: a re-occurrence may match
+    /// the subterm `sub` when the spans are byte-equal or either side still
+    /// holds variables (byte-equality is only complete for ground spans --
+    /// the WAM unify_value constraint); a wildcarded stored variable accepts
+    /// anything. The consumer's full unification is the final judge either
+    /// way, so acceptance here only needs to never reject a unifiable pair.
+    fn each_stored_varref(&mut self, sub: &[u8], cont: &mut dyn FnMut(&mut Self)) {
+        let mask = self.rz.child_mask();
+        let mut it = mask.iter();
+        while let Some(b) = it.next() {
+            if self.stopped {
+                return;
+            }
+            let Tag::VarRef(i) = byte_item(b) else { continue };
+            let ok = match self.stored_bindings.get(i as usize) {
+                Some(Some(bound)) => {
+                    sub == &bound[..]
+                        || span_contains_vars(bound)
+                        || span_contains_vars(sub)
+                }
+                Some(None) => true,
+                None => false,
+            };
+            if ok && self.rz.descend_to_existing_byte(b) {
+                cont(self);
+                self.rz.ascend_byte();
+            }
+        }
+    }
+
+    /// Walk the stored trie in lockstep with a GROUND resolved span (a
+    /// repeated key variable's earlier binding), honoring stored-variable
+    /// branches exactly as the main walk does: a stored NewVar binds the span
+    /// subterm at the cursor, a stored VarRef re-checks per the binding
+    /// rules. Exact byte descent alone is incomplete here -- the stored side
+    /// may hold variables below this position that unify with the ground
+    /// span. Resumes the main key walk at `resume_pos` once the span is
+    /// exhausted.
+    fn walk_span(&mut self, span: &[u8], spos: usize, resume_pos: usize) {
+        if self.stopped {
+            return;
+        }
+        if spos == span.len() {
+            self.step(resume_pos);
+            return;
+        }
+
+        // Stored NewVar: binds the whole span subterm at `spos`. The span is
+        // ground, so the binding it records is exact (no wildcard needed).
+        if self.rz.descend_to_existing_byte(item_byte(Tag::NewVar)) {
+            if let Some(len) = subexpr_len_at(span, spos) {
+                self.stored_bindings
+                    .push(Some(span[spos..spos + len].to_vec()));
+                self.walk_span(span, spos + len, resume_pos);
+                self.stored_bindings.pop();
+            }
+            self.rz.ascend_byte();
+        }
+
+        // Stored VarRef(i): shared binding rules; the span is ground, so the
+        // var-containing-sub disjunct is vacuously false here.
+        if let Some(len) = subexpr_len_at(span, spos) {
+            self.each_stored_varref(&span[spos..spos + len], &mut |w| {
+                w.walk_span(span, spos + len, resume_pos)
+            });
+        }
+
+        match byte_item(span[spos]) {
+            Tag::SymbolSize(size) => {
+                let next = spos + 1 + size as usize;
+                if next > span.len() {
+                    return;
+                }
+                if self.rz.descend_to_existing_byte(span[spos]) {
+                    // descend_to_check moves the full payload even on failure,
+                    // so the payload ascent is unconditional.
+                    if self.rz.descend_to_check(&span[spos + 1..next]) {
+                        self.walk_span(span, next, resume_pos);
+                    }
+                    self.rz.ascend(size as usize);
+                    self.rz.ascend_byte();
+                }
+            }
+            Tag::Arity(_) => {
+                if self.rz.descend_to_existing_byte(span[spos]) {
+                    self.walk_span(span, spos + 1, resume_pos);
+                    self.rz.ascend_byte();
+                }
+            }
+            Tag::NewVar | Tag::VarRef(_) => {
+                debug_assert!(false, "walk_span requires a ground span");
+            }
+        }
     }
 
     fn step(&mut self, pos: usize) {
@@ -171,37 +297,21 @@ where
         // Stored NewVar: binds the whole key subterm at `pos`.
         if self.rz.descend_to_existing_byte(item_byte(Tag::NewVar)) {
             if let Some(len) = subexpr_len_at(self.key, pos) {
-                let idx = self.stored_bindings.len() as u8;
                 self.stored_bindings
-                    .push((idx, self.resolved[pos..pos + len].to_vec()));
+                    .push(Some(self.resolved[pos..pos + len].to_vec()));
                 self.step(pos + len);
                 self.stored_bindings.pop();
             }
             self.rz.ascend_byte();
         }
 
-        // Stored VarRef(i): key subterm must equal binding i (resolved spans).
-        {
-            let mask = self.rz.child_mask();
-            let mut it = mask.iter();
-            while let Some(b) = it.next() {
-                if self.stopped {
-                    return;
-                }
-                let Tag::VarRef(i) = byte_item(b) else { continue };
-                let Some((_, bound)) =
-                    self.stored_bindings.iter().find(|(k, _)| *k == i)
-                else {
-                    continue;
-                };
-                let bound = bound.clone();
-                if self.resolved[pos..].starts_with(&bound)
-                    && self.rz.descend_to_existing_byte(b)
-                {
-                    self.step(pos + bound.len());
-                    self.rz.ascend_byte();
-                }
-            }
+        // Stored VarRef(i): key re-occurrence under the shared binding rules
+        // (resolved shadow carries key variable identity).
+        let resolved = self.resolved;
+        if let Some(len) = subexpr_len_at(resolved, pos) {
+            self.each_stored_varref(&resolved[pos..pos + len], &mut |w| {
+                w.step(pos + len)
+            });
         }
 
         match byte_item(self.key[pos]) {
@@ -217,11 +327,20 @@ where
                     .find(|(k, _)| *k == kidx)
                     .map(|(_, s)| s.clone());
                 match existing {
-                    Some(span) => {
-                        if self.rz.descend_to_check(&span) {
-                            self.step(pos + 1);
-                        }
-                        self.rz.ascend(span.len());
+                    Some(span) if !span_contains_vars(&span) => {
+                        // Exact descent alone would miss stored-variable
+                        // branches that unify with the ground span; the
+                        // sub-walk honors them (the completeness oracle
+                        // caught exactly this on the barrier corpus).
+                        self.walk_span(&span, 0, pos + 1);
+                    }
+                    Some(_) => {
+                        // The bound stored span contains stored variables whose
+                        // bytes are position-dependent; enumerate and let the
+                        // consumer's unification enforce equality.
+                        self.each_stored_subterm(&mut |w, _span| {
+                            w.step(pos + 1);
+                        });
                     }
                     None => {
                         self.each_stored_subterm(&mut |w, span| {
@@ -366,6 +485,37 @@ mod tests {
     }
 
     #[test]
+    fn repeated_key_variable_takes_stored_variable_branches() {
+        // The barrier-corpus miss: the re-occurrence's ground binding must
+        // still admit stored facts holding variables at or below that
+        // position -- (n $s) unifies with the bound (n a) by $s := a, and a
+        // bare stored $w swallows the whole span. Exact byte descent alone
+        // finds only the ground twin.
+        let m = region(&[
+            "(f (n a) (n a))",
+            "(f (n a) (n $s))",
+            "(f (n a) $w)",
+            "(f (n a) (n b))",
+            "(f (n a) (m $s))",
+        ]);
+        let got = hits(&m, "(f $k $k)");
+        assert_eq!(got.len(), 3, "ground twin, (n $s), and bare $w unify");
+        // Wildcard arm inside the span sub-walk: stored $y is swallowed by a
+        // DIFFERENT key variable ($m), so its VarRef under the re-occurrence
+        // span carries no binding and must accept the ground subterm.
+        let m2 = region(&[
+            "(g (n a) x (n a))",
+            "(g (n a) $y (n $y))",
+            "(g (n a) $y (n b))",
+        ]);
+        assert_eq!(
+            hits(&m2, "(g $k $m $k)").len(),
+            2,
+            "ground twin and the $y-linked fact; (n b) breaks the twin"
+        );
+    }
+
+    #[test]
     fn repeated_stored_variable_requires_equal_key_spans() {
         let m = region(&["(f $x $x)", "(f $x $y)"]);
         assert_eq!(hits(&m, "(f a b)").len(), 1, "only (f $x $y) covers (f a b)");
@@ -382,6 +532,91 @@ mod tests {
         // But a repeated KEY var against distinct stored structure must fail.
         let m2 = region(&["(f a b)"]);
         assert_eq!(hits(&m2, "(f $k $k)").len(), 0);
+    }
+
+    /// Randomized differential: over random (region, key) instances, every
+    /// stored fact the whole-pair unification accepts must appear in the
+    /// walk's candidate set (the walk may overapproximate, never miss).
+    /// Deterministic LCG seeds keep failures reproducible.
+    #[test]
+    fn randomized_walk_never_misses_a_unifiable_fact() {
+        use mork_expr::{unify as pair_unify, Expr, ExprEnv};
+
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0 >> 33
+            }
+            fn pick(&mut self, n: usize) -> usize {
+                (self.next() % n as u64) as usize
+            }
+        }
+
+        fn term(r: &mut Lcg, depth: usize, vars: &[&str]) -> String {
+            let syms = ["a", "b", "c", "f", "g", "n"];
+            let roll = r.pick(10);
+            if depth == 0 || roll < 4 {
+                if roll < 2 && !vars.is_empty() {
+                    format!("${}", vars[r.pick(vars.len())])
+                } else {
+                    syms[r.pick(syms.len())].to_string()
+                }
+            } else {
+                let n = 2 + r.pick(2);
+                let items: Vec<String> =
+                    (0..n).map(|_| term(r, depth - 1, vars)).collect();
+                format!("({})", items.join(" "))
+            }
+        }
+
+        for seed in 0..400u64 {
+            let mut r = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1));
+            let nfacts = 3 + r.pick(6);
+            let facts: Vec<String> = (0..nfacts)
+                .map(|_| term(&mut r, 3, &["x", "y", "z"]))
+                .collect();
+            let facts: Vec<String> =
+                facts.into_iter().filter(|f| f.starts_with('(')).collect();
+            if facts.is_empty() {
+                continue;
+            }
+            let key = loop {
+                let k = term(&mut r, 3, &["k", "m"]);
+                if k.starts_with('(') {
+                    break k;
+                }
+            };
+            let m = region(&facts.iter().map(String::as_str).collect::<Vec<_>>());
+            let got: std::collections::HashSet<Vec<u8>> =
+                hits(&m, &key).into_iter().collect();
+            let kb = enc(&key);
+            for f in &facts {
+                let fb = enc(f);
+                let mut ps = vec![(
+                    ExprEnv::new(
+                        0,
+                        Expr {
+                            ptr: kb.as_ptr().cast_mut(),
+                        },
+                    ),
+                    ExprEnv::new(
+                        1,
+                        Expr {
+                            ptr: fb.as_ptr().cast_mut(),
+                        },
+                    ),
+                )];
+                if pair_unify(&mut ps).is_ok() && !got.contains(&fb) {
+                    panic!(
+                        "seed {seed}: walk missed unifiable fact {f} for key {key}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
