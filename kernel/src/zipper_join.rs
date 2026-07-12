@@ -1482,42 +1482,320 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
         {
             return None;
         }
-        let var_order: Vec<usize> = (0..nvars).collect();
         let mut pat_args = Vec::new();
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
         let sources = &pat_args[1..];
         debug_assert_eq!(sources.len(), factors.len());
+
+        // Retrieval partition: small schema-table factors leave the cursor join
+        // and apply per tuple as unifiability retrievals -- the join enumerates
+        // the remainder, and each removed factor prunes by discrimination
+        // descent under the tuple's instantiation instead of cursoring
+        // schematic columns per context. Factor 0 always stays (the effect
+        // location comes from it), and at least one factor must remain.
+        #[cfg(feature = "retrieval_join")]
+        let (kept_idx, removed_idx): (Vec<usize>, Vec<usize>) = {
+            let mut kept = vec![0usize];
+            let mut removed: Vec<(usize, usize)> = Vec::new();
+            for f in 1..factors.len() {
+                let n = bounded_fact_count(map, &factors[f], RETRIEVAL_REGION_MAX + 1);
+                if n <= RETRIEVAL_REGION_MAX {
+                    removed.push((n, f));
+                } else {
+                    kept.push(f);
+                }
+            }
+            removed.sort();
+            // Debug bisection knob: cap how many factors leave the join.
+            let cap = std::env::var("MORK_RETRIEVAL_MAX_REMOVED")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(usize::MAX);
+            let mut removed: Vec<usize> =
+                removed.into_iter().map(|(_, f)| f).collect();
+            while removed.len() > cap {
+                kept.push(removed.pop().unwrap());
+            }
+            kept.sort();
+            (kept, removed)
+        };
+        #[cfg(not(feature = "retrieval_join"))]
+        let (kept_idx, removed_idx): (Vec<usize>, Vec<usize>) =
+            ((0..factors.len()).collect(), Vec::new());
+
+        let kept_storage: Vec<Factor>;
+        let joined: &[Factor] = if removed_idx.is_empty() {
+            &factors
+        } else {
+            kept_storage = kept_idx.iter().map(|&f| factors[f].clone()).collect();
+            &kept_storage
+        };
+        let var_order: Vec<usize> = (0..nvars).collect();
         let mut candidate = 0usize;
+        // Per-query retrieval memo: the region is immutable for the query's
+        // lifetime, so candidates are a pure function of (factor, key bytes).
+        // Guard-table keys repeat across most tuples; memoized walks collapse
+        // to hash lookups. Boxed facts never move, so pairs can hold raw
+        // pointers into the memo for the rest of the query.
+        #[cfg(feature = "retrieval_join")]
+        let mut memo: RetrievalMemo = Default::default();
         let mut on_tuple = |tuple: &[Vec<u8>]| -> bool {
             unsafe { crate::space::unifications += 1 };
             let e = Expr {
                 ptr: tuple[0].as_ptr().cast_mut(),
             };
-            let mut pairs = vec![(sources[0], ExprEnv::new(1, e))];
-            for (j, fact) in tuple.iter().enumerate().skip(1) {
+            let mut pairs = Vec::with_capacity(factors.len());
+            for (t, fact) in tuple.iter().enumerate() {
+                let orig = kept_idx[t];
                 pairs.push((
-                    sources[j],
+                    sources[orig],
                     ExprEnv::new(
-                        (j + 1) as u8,
+                        (orig + 1) as u8,
                         Expr {
                             ptr: fact.as_ptr().cast_mut(),
                         },
                     ),
                 ));
             }
-            match unify(&mut pairs) {
-                Ok(bs) => {
-                    candidate += 1;
-                    effect(Err(bs), e)
-                }
-                Err(_) => true,
+            if removed_idx.is_empty() {
+                let mut ps = pairs;
+                return match unify(&mut ps) {
+                    Ok(bs) => {
+                        candidate += 1;
+                        effect(Err(bs), e)
+                    }
+                    Err(_) => true,
+                };
             }
+            #[cfg(feature = "retrieval_join")]
+            {
+                retrieval_extend(
+                    map,
+                    &factors,
+                    sources,
+                    &removed_idx,
+                    0,
+                    &mut pairs,
+                    e,
+                    None,
+                    &mut memo,
+                    &mut candidate,
+                    &mut effect,
+                )
+            }
+            #[cfg(not(feature = "retrieval_join"))]
+            unreachable!("removed_idx is empty without retrieval_join")
         };
-        run_unify_join_stream(map, &factors, &var_order, nvars, &mut on_tuple);
+        run_unify_join_stream(map, joined, &var_order, nvars, &mut on_tuple);
         Some(candidate)
     }))
     .ok()
     .flatten()
+}
+
+/// Retrieval-region cap for the join-side partition: factors at or below this
+/// bounded count qualify to leave the cursor join and apply per tuple by
+/// unifiability retrieval (schema tables, arithmetic guard tables). Large
+/// relations stay in the join, whose cursors amortize across tuples.
+#[cfg(feature = "retrieval_join")]
+const RETRIEVAL_REGION_MAX: usize = 4096;
+
+/// Per-query memo: (removed factor index -> instantiated key bytes ->
+/// unifiable candidate facts, full bytes including the factor prefix).
+#[cfg(feature = "retrieval_join")]
+type RetrievalMemo =
+    std::collections::HashMap<usize, std::collections::HashMap<Vec<u8>, Vec<Box<[u8]>>>>;
+
+/// Applies the removed factors to one kept-join tuple: unify the accumulated
+/// pairs, instantiate the next removed factor's pattern under those bindings,
+/// retrieve unifiable candidates from its region by discrimination descent,
+/// and recurse with each candidate appended -- the whole-pair unify at the
+/// bottom is byte-for-byte the check the stock path performs, so answers are
+/// identical by construction.
+#[cfg(feature = "retrieval_join")]
+#[allow(clippy::too_many_arguments)]
+fn retrieval_extend<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
+    map: &PathMap<()>,
+    factors: &[Factor],
+    sources: &[ExprEnv],
+    removed: &[usize],
+    depth: usize,
+    pairs: &mut Vec<(ExprEnv, ExprEnv)>,
+    loc: Expr,
+    // Bindings carried over an unbroken chain of GROUND-key ancestors: a
+    // ground key's candidate pair binds nothing on the pattern side, so the
+    // parent's bindings still instantiate this level's key. The terminal
+    // unify below stays the sole answer decider either way.
+    inherited_bs: Option<&BTreeMap<(u8, u8), ExprEnv>>,
+    memo: &mut RetrievalMemo,
+    candidate: &mut usize,
+    effect: &mut F,
+) -> bool {
+    if depth == removed.len() {
+        let mut ps = pairs.clone();
+        return match unify(&mut ps) {
+            Ok(bs) => {
+                *candidate += 1;
+                effect(Err(bs), loc)
+            }
+            Err(_) => true,
+        };
+    }
+    let r = removed[depth];
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ORACLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var_os("MORK_RETRIEVAL_TRACE").is_some());
+    // Instantiate the removed factor's pattern under the tuple's bindings so
+    // the retrieval walk prunes by everything already known. Unbound query
+    // variables stay variables (a schematic key), which the walk handles.
+    let computed_bs: Option<BTreeMap<(u8, u8), ExprEnv>>;
+    let bs: &BTreeMap<(u8, u8), ExprEnv> = match inherited_bs {
+        Some(b) => b,
+        None => {
+            let mut ps = pairs.clone();
+            match unify(&mut ps) {
+                Ok(b) => {
+                    computed_bs = Some(b);
+                    computed_bs.as_ref().unwrap()
+                }
+                Err(_) => {
+                    if trace {
+                        eprintln!("[ret] depth={depth} factor={r} DROP key-unify");
+                    }
+                    return true;
+                }
+            }
+        }
+    };
+    let key_owned: Vec<u8> = {
+        let mut buffer = Vec::new();
+        let mut stack: Vec<(u8, u8)> = Vec::new();
+        let mut assignments: Vec<(u8, u8)> = Vec::new();
+        // The subexpr's variables live in PATTERN numbering: NewVars inside it
+        // continue from sources[r].v (the intros before this argument), and
+        // VarRefs reference pattern-global indices, so bindings resolve at the
+        // pattern's own keys. The fresh-variable base is immaterial here: the
+        // retrieval walk canonicalizes key variable identity itself.
+        let (_, _, clean) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
+            0,
+            sources[r].v,
+            sources[r].v,
+            sources[r].subsexpr(),
+            bs,
+            buffer,
+            stack,
+            assignments
+        );
+        if !clean {
+            if trace {
+                eprintln!("[ret] depth={depth} factor={r} DROP key-cycle");
+            }
+            return true;
+        }
+        buffer
+    };
+    let prefix = &factors[r].prefix;
+    if key_owned.len() < prefix.len() || !key_owned.starts_with(&prefix[..]) {
+        if trace {
+            eprintln!(
+                "[ret] depth={depth} factor={r} DROP prefix key={}",
+                mork_expr::serialize(&key_owned)
+            );
+        }
+        return true;
+    }
+    let key = &key_owned[prefix.len()..];
+    if !memo.get(&r).is_some_and(|m| m.contains_key(key)) {
+        let region = map.read_zipper_at_path(&prefix[..]);
+        let mut facts: Vec<Box<[u8]>> = Vec::new();
+        crate::retrieval::retrieve_unifiable(region, key, |u| {
+            let mut fact = prefix.clone();
+            fact.extend_from_slice(u.stored_path);
+            facts.push(fact.into_boxed_slice());
+            true
+        });
+        // Completeness oracle: every stored fact in the region that the
+        // terminal pair-unify would accept must be in the candidate set.
+        let oracle = *ORACLE
+            .get_or_init(|| std::env::var_os("MORK_RETRIEVAL_ORACLE").is_some());
+        if oracle {
+            use pathmap::zipper::ZipperIteration;
+            use pathmap::zipper::ZipperMoving;
+            let seen: std::collections::HashSet<&[u8]> =
+                facts.iter().map(|f| &f[prefix.len()..]).collect();
+            let mut rz = map.read_zipper_at_path(&prefix[..]);
+            while rz.to_next_val() {
+                if seen.contains(rz.path()) {
+                    continue;
+                }
+                let mut fact = prefix.clone();
+                fact.extend_from_slice(rz.path());
+                let mut ps = pairs.clone();
+                ps.push((
+                    sources[r],
+                    ExprEnv::new(
+                        (r + 1) as u8,
+                        Expr {
+                            ptr: fact.as_ptr().cast_mut(),
+                        },
+                    ),
+                ));
+                if unify(&mut ps).is_ok() {
+                    eprintln!(
+                        "[ret-oracle] MISSED depth={depth} factor={r} key={} fact={}",
+                        mork_expr::serialize(&key_owned),
+                        mork_expr::serialize(&fact)
+                    );
+                }
+            }
+        }
+        if trace {
+            eprintln!(
+                "[ret] depth={depth} factor={r} candidates={} key={}",
+                facts.len(),
+                mork_expr::serialize(&key_owned)
+            );
+        }
+        memo.entry(r)
+            .or_default()
+            .insert(key.to_vec(), facts);
+    }
+    // A ground key's candidate pair cannot bind pattern-side variables, so
+    // the child level may reuse this level's bindings and skip its unify;
+    // the terminal unify remains the sole answer decider, and a ground-key
+    // pair can never fail globally (fresh stored-side ns per factor), so no
+    // pruning is lost either.
+    let key_ground = !crate::retrieval::span_contains_vars(key);
+    // The memo owns every candidate's bytes for the rest of the query; boxed
+    // slices never move, so raw pointers into them stay valid. Indexed access
+    // keeps the map borrow out of the recursion.
+    let nfacts = memo[&r][key].len();
+    let key_vec = key.to_vec();
+    for i in 0..nfacts {
+        let fact_ptr = memo[&r][&key_vec][i].as_ptr().cast_mut();
+        pairs.push((
+            sources[r],
+            ExprEnv::new((r + 1) as u8, Expr { ptr: fact_ptr }),
+        ));
+        let go = retrieval_extend(
+            map,
+            factors,
+            sources,
+            removed,
+            depth + 1,
+            pairs,
+            loc,
+            if key_ground { Some(bs) } else { None },
+            memo,
+            candidate,
+            effect,
+        );
+        pairs.pop();
+        if !go {
+            return false;
+        }
+    }
+    true
 }
 
 /// GHD drop-in for [`query_multi_leapfrog`]: for a *cyclic* body with a low-width hypertree
