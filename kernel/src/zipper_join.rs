@@ -1497,10 +1497,24 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
         let (kept_idx, removed_idx): (Vec<usize>, Vec<usize>) = {
             let mut kept = vec![0usize];
             let mut removed: Vec<(usize, usize)> = Vec::new();
+            let counts: Vec<usize> = factors
+                .iter()
+                .map(|f| bounded_fact_count(map, f, RETRIEVAL_REGION_MAX + 1))
+                .collect();
+            // A factor leaves the join to be CONSULTED per tuple, which only
+            // makes sense when something is left to consult FROM. "Small in
+            // absolute terms" is not that test: the guarded forward closure's
+            // relations are all small, so this cap removed the two `fwd`
+            // factors that ARE the search and left a one-fact rule marker
+            // driving the join, turning each tuple into nested retrieval walks
+            // over both fwd tables. Require a factor above the cap to stay:
+            // that one is the driver, and the small ones are its lookup
+            // tables. (The meet-in-the-middle body is exactly that shape --
+            // `sol` is large and stays, `fwd` is small and leaves.)
+            let has_driver = counts.iter().any(|&n| n > RETRIEVAL_REGION_MAX);
             for f in 1..factors.len() {
-                let n = bounded_fact_count(map, &factors[f], RETRIEVAL_REGION_MAX + 1);
-                if n <= RETRIEVAL_REGION_MAX {
-                    removed.push((n, f));
+                if has_driver && counts[f] <= RETRIEVAL_REGION_MAX {
+                    removed.push((counts[f], f));
                 } else {
                     kept.push(f);
                 }
@@ -1522,6 +1536,14 @@ pub fn query_multi_leapfrog<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>
         #[cfg(not(feature = "retrieval_join"))]
         let (kept_idx, removed_idx): (Vec<usize>, Vec<usize>) =
             ((0..factors.len()).collect(), Vec::new());
+
+        // Decline the shape the cursors are worst at, AFTER the partition has
+        // had its chance to rescue it: a variable that no factor holds as a
+        // whole column, still carried by two kept factors, forces the join to
+        // enumerate structure on both sides at once.
+        if kept_factors_enumerate_a_schematic_column(&factors, &kept_idx) {
+            return None;
+        }
 
         let kept_storage: Vec<Factor>;
         let joined: &[Factor] = if removed_idx.is_empty() {
@@ -2102,6 +2124,76 @@ fn factor_has_sampled_heavy_hitter(map: &PathMap<()>, factor: &Factor) -> bool {
 
 /// The hyperedges of the variables the leapfrog can seek: per factor, its whole-column variables
 /// only, compound-nested occurrences excluded.
+/// A factor's query variables, split by how the join can reach them: as a WHOLE
+/// COLUMN (the cursor seeks it directly) or only NESTED inside a nonground
+/// compound (the cursor can only enumerate the compound's structure).
+fn factor_seekable_and_nested(f: &Factor) -> (std::collections::BTreeSet<usize>, std::collections::BTreeSet<usize>) {
+    let mut whole = std::collections::BTreeSet::new();
+    let mut nested = std::collections::BTreeSet::new();
+    for col in &f.cols {
+        match col {
+            FactorColumn::Var(v) => {
+                whole.insert(*v);
+            }
+            FactorColumn::Term(t) => {
+                let mut ez = ExprZipper::new(t.expr());
+                let mut intro = t.intro as usize;
+                loop {
+                    match ez.tag() {
+                        Tag::NewVar => {
+                            nested.insert(intro);
+                            intro += 1;
+                        }
+                        Tag::VarRef(i) => {
+                            nested.insert(i as usize);
+                        }
+                        Tag::SymbolSize(_) | Tag::Arity(_) => {}
+                    }
+                    if !ez.next() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    (whole, nested)
+}
+
+/// Would the cursor join have to resolve a SCHEMATIC column -- a variable that
+/// no factor holds as a whole column -- by enumerating structure on two sides
+/// at once?
+///
+/// That is the shape the cursors are worst at. A variable nested inside a
+/// nonground compound cannot be seeked: the cursor walks the compound's
+/// subterm branches, and when two joined factors both carry it that way, the
+/// walk becomes a product over theorem structure. Measured on the guarded
+/// forward closure, whose two `fwd` factors share their theorem variable only
+/// inside compounds: 0.36s on the ProductZipper, 26s dispatched to the join --
+/// a 70x loss, with the descent counter barely moving, because the cost is
+/// cursor enumeration rather than trie descent.
+///
+/// The retrieval partition is what rescues this shape when it applies: it
+/// takes the small schematic factor OUT of the cursor join and resolves it per
+/// tuple by unifiability retrieval, so only one kept factor still carries the
+/// variable. That is exactly why the meet-in-the-middle body profits (`sol` is
+/// large and stays, `fwd` is small and leaves) while the forward closure --
+/// two small `fwd` factors, nothing large to consult from -- does not.
+fn kept_factors_enumerate_a_schematic_column(factors: &[Factor], kept: &[usize]) -> bool {
+    let parts: Vec<_> = factors.iter().map(factor_seekable_and_nested).collect();
+    let seekable_anywhere: std::collections::BTreeSet<usize> =
+        parts.iter().flat_map(|(w, _)| w.iter().copied()).collect();
+    let mut nested_carriers: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    for &f in kept {
+        for v in &parts[f].1 {
+            if !seekable_anywhere.contains(v) {
+                *nested_carriers.entry(*v).or_insert(0) += 1;
+            }
+        }
+    }
+    nested_carriers.values().any(|&n| n >= 2)
+}
+
 fn column_var_edges(factors: &[Factor]) -> Vec<std::collections::BTreeSet<usize>> {
     factors
         .iter()

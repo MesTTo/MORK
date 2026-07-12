@@ -297,6 +297,16 @@ fn bulk_queue_output<WZ>(
     }
 }
 
+/// MORK_SNI_TRACE: per-firing route decisions and per-pass timings. The two
+/// pathologies this arc fixed -- a reordered pass driving a schematic column,
+/// and a join dispatched onto one -- were both invisible in the counters and
+/// obvious in this trace.
+#[cfg(feature = "semi_naive_ic")]
+fn sni_trace() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("MORK_SNI_TRACE").is_some())
+}
+
 pub(crate) fn stratified_note_btm_remove(path: &[u8], removed: bool) {
     #[cfg(not(feature = "stratified_quiescence"))]
     let _ = (path, removed);
@@ -2384,6 +2394,13 @@ impl Space {
             seen.clear();
         }
         let delta_for_fire = if go_semi { delta } else { None };
+        if sni_trace() {
+            eprintln!(
+                "[sni] firings={firings} route={} delta={:?} dish={:?} m={m} naive_ns={:?} semi_ns={:?}",
+                if go_semi { "SEMI" } else { "naive" },
+                delta_count, dish_count, naive_t, semi_t
+            );
+        }
         // Decay exploration once a rule SETTLES on naive (both routes measured,
         // naive cheaper): maintaining its frontier -- a clone plus two subtracts
         // and counts per firing -- buys nothing while it keeps losing. Drop the
@@ -2526,6 +2543,69 @@ impl Space {
         (total_candidates, any_new)
     }
 
+    /// A body factor's query variables, split by how a descent can reach them:
+    /// as a WHOLE COLUMN (a top-level argument, which the trie seeks directly)
+    /// or only NESTED inside a compound argument (which it can only walk).
+    #[cfg(feature = "semi_naive_ic")]
+    fn factor_var_roles(src: ExprEnv) -> (std::collections::BTreeSet<usize>, std::collections::BTreeSet<usize>) {
+        let mut whole = std::collections::BTreeSet::new();
+        let mut nested = std::collections::BTreeSet::new();
+        let mut args = Vec::with_capacity(8);
+        src.args(&mut args);
+        for a in args.iter().skip(1) {
+            if let Some(v) = a.var_opt() {
+                whole.insert(v.1 as usize);
+                continue;
+            }
+            let mut ez = ExprZipper::new(a.subsexpr());
+            let mut intro = a.v as usize;
+            loop {
+                match ez.tag() {
+                    Tag::NewVar => {
+                        nested.insert(intro);
+                        intro += 1;
+                    }
+                    Tag::VarRef(i) => {
+                        nested.insert(i as usize);
+                    }
+                    Tag::SymbolSize(_) | Tag::Arity(_) => {}
+                }
+                if !ez.next() {
+                    break;
+                }
+            }
+        }
+        (whole, nested)
+    }
+
+    /// Would driving the plan from factor `j` make a SCHEMATIC column the
+    /// join's leading variable -- one that no factor holds as a top-level
+    /// argument, so the descent must enumerate term structure instead of
+    /// seeking a value?
+    ///
+    /// Reordering the body so the delta factor comes first is what makes a
+    /// delta pass cheap, and it is right whenever the delta factor's shared
+    /// variables are seekable. When they are not, it is the worst thing the
+    /// planner can do: measured on the guarded forward closure, whose two
+    /// `fwd` factors share their theorem variable only inside compounds, the
+    /// reordered pass took 11.3s to produce 45 matches, against 0.6s for the
+    /// same pass left in identity order. Identity order is always correct here
+    /// (the delta simply prunes later instead of driving), so decline the
+    /// reorder and keep the cost bounded by the naive match.
+    #[cfg(feature = "semi_naive_ic")]
+    fn reorder_would_drive_a_schematic_column(sources: &[ExprEnv], j: usize) -> bool {
+        let roles: Vec<_> = sources.iter().map(|s| Self::factor_var_roles(*s)).collect();
+        let seekable: std::collections::BTreeSet<usize> =
+            roles.iter().flat_map(|(w, _)| w.iter().copied()).collect();
+        roles[j].1.iter().any(|v| {
+            !seekable.contains(v)
+                && roles
+                    .iter()
+                    .enumerate()
+                    .any(|(i, (_, nested))| i != j && nested.contains(v))
+        })
+    }
+
     /// The m-delta pass plan, shared by every route that can use it: one pass
     /// per body factor j with factor j bound to this rule's delta and the rest
     /// to the full space, streaming each match to `effect`. The union of the
@@ -2550,6 +2630,14 @@ impl Space {
             {
                 let sub = sources[j].subsexpr();
                 let pfx = unsafe { sub.prefix().unwrap_or_else(|x| x).as_ref().unwrap() };
+                if sni_trace() {
+                    eprintln!(
+                        "[sni-factor] j={j} prefix={} delta_here={} factor={}",
+                        serialize(pfx),
+                        delta.read_zipper_at_path(pfx).val_count(),
+                        serialize(unsafe { sub.span().as_ref().unwrap() })
+                    );
+                }
                 if !pfx.is_empty() && delta.read_zipper_at_path(pfx).val_count() == 0 {
                     continue;
                 }
@@ -2566,6 +2654,15 @@ impl Space {
                 Vec<ExprEnv>,
                 Vec<ExprEnv>,
             ) = if j == 0 {
+                (
+                    (0..n_factors).map(|i| if i == j { delta } else { read_copy }).collect(),
+                    Vec::new(),
+                    sources.to_vec(),
+                    sources.to_vec(),
+                )
+            } else if Self::reorder_would_drive_a_schematic_column(sources, j) {
+                // Keep identity order: the delta prunes at its own position
+                // instead of driving. Correct either way, and bounded.
                 (
                     (0..n_factors).map(|i| if i == j { delta } else { read_copy }).collect(),
                     Vec::new(),
@@ -2621,16 +2718,24 @@ impl Space {
                         let mut wz = pass_map.write_zipper_at_path(pfx_j);
                         wz.graft(&delta.read_zipper_at_path(pfx_j));
                     }
+                    let t_g = std::time::Instant::now();
                     if let Some(touched) = crate::zipper_join::query_multi_leapfrog(
                         &pass_map,
                         pat_expr,
                         &mut effect,
                     ) {
+                        if sni_trace() {
+                            eprintln!("[sni-pass] j={j} route=GRAFT matches={touched} took={:?}", t_g.elapsed());
+                        }
                         total_candidates += touched;
                         continue;
                     }
                 }
             }
+
+            let trace_pass = sni_trace();
+            let t_pass = std::time::Instant::now();
+            let renorm_ok = !_search_buffers.is_empty();
 
             let mut prz = ProductZipper::new(
                 maps[0].read_zipper(),
@@ -2638,12 +2743,19 @@ impl Space {
             );
             prz.reserve_buffers(1 << 32, 32);
 
-            total_candidates += Self::query_multi_raw_with_unification_sources(
+            let got = Self::query_multi_raw_with_unification_sources(
                 &mut prz,
                 &search_sources,
                 &unify_sources,
                 &mut effect,
             );
+            if trace_pass {
+                eprintln!(
+                    "[sni-pass] j={j} route=PZ renorm={renorm_ok} matches={got} took={:?}",
+                    t_pass.elapsed()
+                );
+            }
+            total_candidates += got;
         }
         total_candidates
     }
