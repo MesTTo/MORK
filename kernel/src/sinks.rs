@@ -274,10 +274,46 @@ where
     false
 }
 
+/// Rewrites every candidate variable occurrence to `VarRef(index)` so that
+/// binding-consistency comparisons see variable IDENTITY instead of raw tag
+/// bytes: in the De Bruijn encoding every first occurrence is the same
+/// `NewVar` byte, so comparing raw spans conflates DISTINCT candidate
+/// variables (a stored repeated-variable schema like `(f $a $a)` wrongly
+/// covered `(f $x $y)`, dropping sound theorems from subsumed strata), and
+/// conversely a `NewVar` first occurrence never byte-matched a `VarRef`
+/// re-occurrence of the SAME variable. Positions and lengths are unchanged
+/// (both tags are one byte), so walk coordinates stay shared with `key`.
+#[cfg(feature = "guarded_emit")]
+fn resolve_candidate_vars(key: &[u8]) -> Vec<u8> {
+    let mut resolved = key.to_vec();
+    let mut next_var: u8 = 0;
+    let mut i = 0usize;
+    while i < resolved.len() {
+        match byte_item(resolved[i]) {
+            Tag::NewVar => {
+                resolved[i] = item_byte(Tag::VarRef(next_var));
+                next_var = next_var.saturating_add(1);
+                i += 1;
+            }
+            Tag::VarRef(_) => {
+                i += 1;
+            }
+            Tag::SymbolSize(size) => {
+                i += 1 + size as usize;
+            }
+            Tag::Arity(_) => {
+                i += 1;
+            }
+        }
+    }
+    resolved
+}
+
 #[cfg(feature = "guarded_emit")]
 fn schema_generalizes_candidate<'q, Z>(
     rz: &mut Z,
     key: &'q [u8],
+    resolved: &'q [u8],
     pos: usize,
     bindings: &mut Vec<&'q [u8]>,
     candidate_bound: Option<&[u8]>,
@@ -294,8 +330,8 @@ where
 
     if rz.descend_to_existing_byte(item_byte(Tag::NewVar)) {
         if let Some(len) = subexpr_len_at(key, pos) {
-            bindings.push(&key[pos..pos + len]);
-            if schema_generalizes_candidate(rz, key, pos + len, bindings, candidate_bound) {
+            bindings.push(&resolved[pos..pos + len]);
+            if schema_generalizes_candidate(rz, key, resolved, pos + len, bindings, candidate_bound) {
                 return true;
             }
             bindings.pop();
@@ -307,8 +343,8 @@ where
     while let Some(b) = vars.next() {
         let Tag::VarRef(i) = byte_item(b) else { continue; };
         let Some(bound) = bindings.get(i as usize).copied() else { continue; };
-        if key[pos..].starts_with(bound) && rz.descend_to_existing_byte(b) {
-            if schema_generalizes_candidate(rz, key, pos + bound.len(), bindings, candidate_bound) {
+        if resolved[pos..].starts_with(bound) && rz.descend_to_existing_byte(b) {
+            if schema_generalizes_candidate(rz, key, resolved, pos + bound.len(), bindings, candidate_bound) {
                 return true;
             }
             rz.ascend_byte();
@@ -323,7 +359,7 @@ where
             }
             if rz.descend_to_existing_byte(key[pos]) {
                 if rz.descend_to_check(&key[pos + 1..next])
-                    && schema_generalizes_candidate(rz, key, next, bindings, candidate_bound)
+                    && schema_generalizes_candidate(rz, key, resolved, next, bindings, candidate_bound)
                 {
                     return true;
                 }
@@ -332,7 +368,7 @@ where
         }
         Tag::Arity(_) => {
             if rz.descend_to_existing_byte(key[pos]) {
-                if schema_generalizes_candidate(rz, key, pos + 1, bindings, candidate_bound) {
+                if schema_generalizes_candidate(rz, key, resolved, pos + 1, bindings, candidate_bound) {
                     return true;
                 }
                 rz.ascend_byte();
@@ -365,7 +401,8 @@ fn guarded_emit_table_covers(read: &PathMap<()>, guard_row: Expr) -> bool {
         return false;
     }
     let mut bindings = Vec::new();
-    schema_generalizes_candidate(&mut rz, key, 0, &mut bindings, bound)
+    let resolved = resolve_candidate_vars(key);
+    schema_generalizes_candidate(&mut rz, key, &resolved, 0, &mut bindings, bound)
 }
 
 #[cfg(feature = "guarded_emit")]

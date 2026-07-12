@@ -68,6 +68,33 @@ fn guard_decimal_bound_drops_only_when_stored_bound_is_greater_or_equal() {
 }
 
 #[test]
+fn repeated_variable_schema_does_not_cover_distinct_candidate_variables() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    reset_guarded_emit_stats();
+    // The schema repeats $a; the first candidate uses DISTINCT variables in
+    // those positions, so it is NOT covered (in De Bruijn bytes both first
+    // occurrences are the same NewVar tag, which a raw span comparison
+    // conflated, wrongly dropping the candidate). The second candidate
+    // repeats one variable in the schema's repeated positions and IS covered.
+    let dump = run(b"(blocked (f $a $b $a))
+(seed (f $x (g $x) $y))
+(seed (f $x (g $y) $x))
+(exec 0 (, (seed $k)) (O (guard (blocked $k) (out $k))))
+");
+    assert!(
+        dump.contains("(out (f $a (g $a) $b))") || dump.contains("(out (f $x (g $x) $y))"),
+        "distinct-variable candidate was wrongly covered:\n{dump}"
+    );
+    assert!(
+        !dump.contains("(out (f $a (g $b) $a))") && !dump.contains("(out (f $x (g $y) $x))"),
+        "repeated-variable candidate escaped coverage:\n{dump}"
+    );
+    let stats = guarded_emit_stats();
+    assert_eq!(stats.consulted, 2);
+    assert_eq!(stats.dropped, 1);
+}
+
+#[test]
 fn guard_matches_reference_join_and_remove_program() {
     let _guard = TEST_LOCK.lock().unwrap();
     reset_guarded_emit_stats();
