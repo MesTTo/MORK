@@ -6,7 +6,7 @@ use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::hint::unreachable_unchecked;
 use std::mem::MaybeUninit;
-use std::ops::{Coroutine, CoroutineState};
+use std::ops::{Coroutine, CoroutineState, Range};
 use std::pin::Pin;
 use std::ptr::{addr_of, null, null_mut, slice_from_raw_parts, slice_from_raw_parts_mut};
 use std::str::Utf8Error;
@@ -25,7 +25,7 @@ use mork_frontend::json_parser::Transcriber;
 use log::*;
 use subprocess::{Popen, PopenConfig, Redirection};
 use subprocess::unix::PopenExt;
-use crate::sinks::{WriteResource, WriteResourceRequest};
+use crate::sinks::{Sink, WriteResource, WriteResourceRequest};
 
 thread_local! {
     /// Per-thread override for the factorized-aggregate fast path, so the differential test can toggle
@@ -2115,6 +2115,21 @@ impl Space {
         out
     }
 
+    fn collect_sink_resource_requests(
+        sinks: &[crate::sinks::ASink],
+    ) -> (Vec<crate::sinks::WriteResourceRequest>, Vec<Range<usize>>) {
+        let mut requests = Vec::new();
+        let mut sink_ranges = Vec::with_capacity(sinks.len());
+        for sink in sinks {
+            let start = requests.len();
+            requests.extend(sink.request());
+            let end = requests.len();
+            assert!(end > start, "sink must request at least one resource");
+            sink_ranges.push(start..end);
+        }
+        (requests, sink_ranges)
+    }
+
     #[cfg(feature="specialize_io")]
     pub fn transform_multi_multi_(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
         // Semi-naive immediate-consequence step (feature `semi_naive_ic`). Inside the
@@ -2877,9 +2892,7 @@ impl Space {
         // take the delta: the others fold over, or react to, the match set of
         // one firing, which the delta deliberately shrinks.
         let delta = delta.filter(|_| sinks.iter().all(|s| s.delta_safe()));
-        let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
-            sink.request().next().unwrap()
-        ).collect();
+        let (template_prefixes, sink_request_ranges) = Self::collect_sink_resource_requests(&sinks);
         let mut subsumption = Self::prefix_subsumption_resources(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -2948,8 +2961,6 @@ impl Space {
                     }) else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
-                        let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
-
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         // A sink that decides from a key gets the key alone
@@ -2973,7 +2984,11 @@ impl Space {
                         oi = toi;
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        sinks[i].sink(std::iter::once(wz), &buffer[..], &read_copy);
+                        let resources = sink_request_ranges[i].clone().map(|request_index| {
+                            let resource_index = subsumption[request_index];
+                            unsafe { std::ptr::read(&template_resources[resource_index]) }
+                        });
+                        sinks[i].sink(resources, &buffer[..], &read_copy);
                     }
                     // Fast path stops after the first successful match: one representative seeds the
                     // single group, and set_precomputed (below) supplies the factorized aggregate.
@@ -3019,8 +3034,11 @@ impl Space {
         }
 
         for (i, s) in sinks.iter_mut().enumerate() {
-            let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
-            any_new |= s.finalize(std::iter::once(wz));
+            let resources = sink_request_ranges[i].clone().map(|request_index| {
+                let resource_index = subsumption[request_index];
+                unsafe { std::ptr::read(&template_resources[resource_index]) }
+            });
+            any_new |= s.finalize(resources);
         }
         for wz in outstanding_wzs.iter_mut() {
             zh.cleanup_write_zipper(wz);
@@ -3041,9 +3059,7 @@ impl Space {
         {
             self.sni_removal_seen |= sinks.iter().any(|s| matches!(s, crate::sinks::ASink::RemoveSink(_)));
         }
-        let mut template_prefixes: Vec<_> = sinks.iter().map(|sink|
-            sink.request().next().unwrap()
-        ).collect();
+        let (template_prefixes, sink_request_ranges) = Self::collect_sink_resource_requests(&sinks);
         let mut subsumption = Self::prefix_subsumption_resources(&template_prefixes[..]);
         let mut placements = subsumption.clone();
         let mut read_copy = self.btm.clone();
@@ -3094,15 +3110,17 @@ impl Space {
                     }) else {break 'query true;};
 
                     'writes : for (i, template) in templates.iter().enumerate() {
-                        let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
-
                         trace!(target: "transform", "{i} template {} @ ({oi} {ni})", serialize(unsafe { template.span().as_ref().unwrap()}));
 
                         buffer.clear();
                         let (toi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0,oi,ni,*template,bindings,buffer,astack,ass) else { continue 'writes; };
 
                         trace!(target: "transform", "U {i} out {:?}", Expr{ ptr: buffer.as_mut_ptr() });
-                        sinks[i].sink(std::iter::once(wz), &buffer[..], &read_copy);
+                        let resources = sink_request_ranges[i].clone().map(|request_index| {
+                            let resource_index = subsumption[request_index];
+                            unsafe { std::ptr::read(&template_resources[resource_index]) }
+                        });
+                        sinks[i].sink(resources, &buffer[..], &read_copy);
                     }
                     true
                 }
@@ -3110,8 +3128,11 @@ impl Space {
         });
 
         for (i, s) in sinks.iter_mut().enumerate() {
-            let wz = unsafe { std::ptr::read(&template_resources[subsumption[i]]) };
-            any_new |= s.finalize(std::iter::once(wz));
+            let resources = sink_request_ranges[i].clone().map(|request_index| {
+                let resource_index = subsumption[request_index];
+                unsafe { std::ptr::read(&template_resources[resource_index]) }
+            });
+            any_new |= s.finalize(resources);
         }
         for wz in outstanding_wzs.iter_mut() {
             zh.cleanup_write_zipper(wz);
