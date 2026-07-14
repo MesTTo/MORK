@@ -33,6 +33,19 @@ use eval_ffi::{ExprSink, ExprSource};
 use mork_expr::macros::SerializableExpr;
 use crate::{expr, pure};
 use crate::space::ACT_PATH;
+#[cfg(feature = "einsum")]
+use crate::tensor_ops::{
+    expr_args, parse_cell, parse_input_tensor_decl, parse_output_tensor_decl, parse_tensor_decl,
+    softmax_attention_rows, symbol_string, tensor_cell_prefix, validate_attention_shapes,
+    validate_tensor_cell_template, write_dense_output_cells, EinsumInput, TensorOpF32Plan,
+    TensorOpF32Syntax, TensorOutputKind,
+};
+#[cfg(feature = "einsum")]
+use linalg::dense::Dense;
+#[cfg(feature = "einsum")]
+use linalg::jit::{EinsumF32Plan, JitInput};
+#[cfg(feature = "einsum")]
+use linalg::tensor::NDIndex;
 
 /// Default Wasmtime linear-memory reservation for MORK WASM sinks.
 pub const WASM_LINEAR_MEMORY_RESERVATION_BYTES: u64 = 1 << 32;
@@ -2018,8 +2031,363 @@ impl Sink for WeightedSelectSink {
     }
 }
 
+fn expr_functor_is(e: Expr, name: &[u8]) -> bool {
+    unsafe {
+        matches!(byte_item(*e.ptr), Tag::Arity(_))
+            && *e.ptr.add(1) == item_byte(Tag::SymbolSize(name.len() as u8))
+            && slice_from_raw_parts(e.ptr.add(2), name.len())
+                .as_ref()
+                .is_some_and(|s| s == name)
+    }
+}
+
+#[cfg(feature = "einsum")]
+fn load_einsum_input_from_resource<'w, 'a, 'k>(
+    input: &mut EinsumInput,
+    resource: WriteResource<'w, 'a, 'k>,
+) where
+    'a: 'w,
+    'k: 'w,
+{
+    let WriteResource::BTM(wz) = resource else {
+        unreachable!()
+    };
+    let mut rz = wz.fork_read_zipper();
+    input.load_from_zipper(&mut rz);
+}
+
+/// Generic f32 tensor operator sink.
+#[cfg(feature = "einsum")]
+pub struct TensorOpF32Sink {
+    op: TensorOpF32Plan,
+    output_name: String,
+    output_kind: TensorOutputKind,
+    output_shape: Vec<usize>,
+    output_prefix: &'static [u8],
+    seen: bool,
+}
+
+#[cfg(feature = "einsum")]
+impl Sink for TensorOpF32Sink {
+    fn new(e: Expr) -> Self {
+        let syntax = TensorOpF32Syntax::parse(e);
+        let op = TensorOpF32Plan::from_syntax(&syntax);
+        let output_prefix = syntax.output_prefix();
+
+        Self {
+            op,
+            output_name: syntax.output_name,
+            output_kind: syntax.output_kind,
+            output_shape: syntax.output_shape,
+            output_prefix,
+            seen: false,
+        }
+    }
+
+    fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
+        self.op
+            .direct_input_prefixes()
+            .into_iter()
+            .map(WriteResourceRequest::BTM)
+            .chain(std::iter::once(WriteResourceRequest::BTM(self.output_prefix)))
+    }
+
+    fn sink<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It, path: &[u8], _read: &PathMap<()>) where 'a: 'w, 'k: 'w {
+        self.seen = true;
+        if !self.op.uses_direct_input_scan() {
+            let cells = TensorOpF32Syntax::matched_cells(Expr {
+                ptr: path.as_ptr().cast_mut(),
+            });
+            self.op.sink_cells(&cells);
+        }
+    }
+
+    fn finalize<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a: 'w, 'k: 'w {
+        if !self.seen {
+            return false;
+        }
+
+        for input_index in 0..self.op.direct_input_count() {
+            let Some(resource) = it.next() else {
+                panic!("tensor-op-f32 missing direct input resource {input_index}");
+            };
+            let WriteResource::BTM(wz) = resource else {
+                unreachable!()
+            };
+            let mut rz = wz.fork_read_zipper();
+            self.op.load_direct_input_from_zipper(input_index, &mut rz);
+        }
+
+        let output = self.op.run(&self.output_shape);
+        let WriteResource::BTM(wz) = it.next().unwrap() else {
+            unreachable!()
+        };
+        write_dense_output_cells(wz, &output, &self.output_name, self.output_kind)
+    }
+}
+
+/// Dense f32 einsum grounded sink.
+#[cfg(feature = "einsum")]
+pub struct EinsumF32Sink {
+    spec: String,
+    plan: Option<EinsumF32Plan>,
+    output_name: String,
+    output_kind: TensorOutputKind,
+    output_shape: Vec<usize>,
+    output_prefix: &'static [u8],
+    inputs: Vec<EinsumInput>,
+    seen: bool,
+}
+
+#[cfg(feature = "einsum")]
+impl Sink for EinsumF32Sink {
+    fn new(e: Expr) -> Self {
+        let args = expr_args(e);
+        assert!(
+            args.len() >= 5 && (args.len() - 3) % 2 == 0,
+            "einsum-f32 shape is (einsum-f32 spec input-decl... output-decl input-cell...)"
+        );
+
+        let spec = symbol_string(args[1]);
+        let input_count = (args.len() - 3) / 2;
+        let mut inputs = Vec::with_capacity(input_count);
+        for i in 0..input_count {
+            let (kind, name, shape) = parse_input_tensor_decl(args[2 + i]);
+            inputs.push(EinsumInput::new(kind, name, shape));
+        }
+
+        let (output_kind, output_name, output_shape) =
+            parse_output_tensor_decl(args[2 + input_count]);
+        let output_prefix = tensor_cell_prefix(&output_name, output_shape.len());
+
+        for i in 0..input_count {
+            validate_tensor_cell_template(
+                args[3 + input_count + i],
+                inputs[i].name(),
+                inputs[i].shape().len(),
+            );
+        }
+        Self {
+            spec,
+            plan: None,
+            output_name,
+            output_kind,
+            output_shape,
+            output_prefix,
+            inputs,
+            seen: false,
+        }
+    }
+
+    fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
+        self.inputs
+            .iter()
+            .map(|input| WriteResourceRequest::BTM(input.prefix()))
+            .chain(std::iter::once(WriteResourceRequest::BTM(self.output_prefix)))
+    }
+
+    fn sink<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It, _path: &[u8], _read: &PathMap<()>) where 'a: 'w, 'k: 'w {
+        self.seen = true;
+    }
+
+    fn finalize<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a: 'w, 'k: 'w {
+        if !self.seen {
+            return false;
+        }
+
+        for (input_index, input) in self.inputs.iter_mut().enumerate() {
+            let Some(resource) = it.next() else {
+                panic!("einsum-f32 missing input resource {input_index}");
+            };
+            load_einsum_input_from_resource(input, resource);
+        }
+
+        let mut output = Dense::<f32>::zeros(self.output_shape.clone());
+        for input in &mut self.inputs {
+            input.prepare();
+        }
+        let jit_inputs: Vec<JitInput<'_>> =
+            self.inputs.iter().map(EinsumInput::jit_input).collect();
+        if self.plan.is_none() {
+            self.plan = Some(
+                EinsumF32Plan::compile(
+                    &self.spec,
+                    &jit_inputs,
+                    std::slice::from_ref(&self.output_shape),
+                )
+                .unwrap_or_else(|err| panic!("einsum-f32 compile failed: {err}")),
+            );
+        }
+        {
+            let mut outputs = [&mut output];
+            let plan = self.plan.as_ref().unwrap();
+            plan.try_run(&jit_inputs, &mut outputs)
+                .unwrap_or_else(|err| panic!("einsum-f32 failed: {err}"));
+            trace!(target: "sink", "einsum-f32 selected backend {:?}", plan.backend());
+        }
+
+        let WriteResource::BTM(wz) = it.next().unwrap() else {
+            unreachable!()
+        };
+        write_dense_output_cells(wz, &output, &self.output_name, self.output_kind)
+    }
+}
+
+/// Dense f32 scaled dot-product attention grounded sink.
+#[cfg(feature = "einsum")]
+pub struct AttentionF32Sink {
+    score_plan: Option<EinsumF32Plan>,
+    value_plan: Option<EinsumF32Plan>,
+    score_shape: Vec<usize>,
+    q_name: String,
+    k_name: String,
+    v_name: String,
+    output_name: String,
+    output_kind: TensorOutputKind,
+    output_shape: Vec<usize>,
+    output_prefix: &'static [u8],
+    q: Dense<f32>,
+    k: Dense<f32>,
+    v: Dense<f32>,
+    scale: f32,
+    seen: bool,
+}
+
+#[cfg(feature = "einsum")]
+impl Sink for AttentionF32Sink {
+    fn new(e: Expr) -> Self {
+        let args = expr_args(e);
+        assert_eq!(
+            args.len(),
+            8,
+            "attention-f32 shape is (attention-f32 q-decl k-decl v-decl output-decl q-cell k-cell v-cell)"
+        );
+
+        let (q_name, q_shape) = parse_tensor_decl(args[1]);
+        let (k_name, k_shape) = parse_tensor_decl(args[2]);
+        let (v_name, v_shape) = parse_tensor_decl(args[3]);
+        let (output_kind, output_name, output_shape) = parse_output_tensor_decl(args[4]);
+        validate_attention_shapes(&q_shape, &k_shape, &v_shape, &output_shape);
+
+        validate_tensor_cell_template(args[5], &q_name, q_shape.len());
+        validate_tensor_cell_template(args[6], &k_name, k_shape.len());
+        validate_tensor_cell_template(args[7], &v_name, v_shape.len());
+
+        let output_prefix = tensor_cell_prefix(&output_name, output_shape.len());
+        let q = Dense::<f32>::zeros(q_shape);
+        let k = Dense::<f32>::zeros(k_shape);
+        let v = Dense::<f32>::zeros(v_shape);
+        let score_shape = vec![q.shape[0], q.shape[1], q.shape[2], k.shape[2]];
+        let scale = 1.0 / (q.shape[3] as f32).sqrt();
+
+        Self {
+            score_plan: None,
+            value_plan: None,
+            score_shape,
+            q_name,
+            k_name,
+            v_name,
+            output_name,
+            output_kind,
+            output_shape,
+            output_prefix,
+            q,
+            k,
+            v,
+            scale,
+            seen: false,
+        }
+    }
+
+    fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
+        std::iter::once(WriteResourceRequest::BTM(self.output_prefix))
+    }
+
+    fn sink<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It, path: &[u8], _read: &PathMap<()>) where 'a: 'w, 'k: 'w {
+        self.seen = true;
+        let args = expr_args(Expr {
+            ptr: path.as_ptr().cast_mut(),
+        });
+
+        let (q_name, q_indices, q_value) = parse_cell(args[5]);
+        let (k_name, k_indices, k_value) = parse_cell(args[6]);
+        let (v_name, v_indices, v_value) = parse_cell(args[7]);
+        assert_eq!(q_name, self.q_name, "Q cell name changed");
+        assert_eq!(k_name, self.k_name, "K cell name changed");
+        assert_eq!(v_name, self.v_name, "V cell name changed");
+        self.q.set(&q_indices, q_value);
+        self.k.set(&k_indices, k_value);
+        self.v.set(&v_indices, v_value);
+    }
+
+    fn finalize<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a: 'w, 'k: 'w {
+        if !self.seen {
+            return false;
+        }
+
+        let mut scores = Dense::<f32>::zeros(self.score_shape.clone());
+        if self.score_plan.is_none() {
+            self.score_plan = Some(
+                EinsumF32Plan::compile(
+                    "bhqd,bhkd->bhqk",
+                    &[JitInput::Dense(&self.q), JitInput::Dense(&self.k)],
+                    std::slice::from_ref(&self.score_shape),
+                )
+                .unwrap_or_else(|err| panic!("attention-f32 score compile failed: {err}")),
+            );
+        }
+        {
+            let mut outputs = [&mut scores];
+            let score_plan = self.score_plan.as_ref().unwrap();
+            score_plan
+                .try_run(
+                    &[JitInput::Dense(&self.q), JitInput::Dense(&self.k)],
+                    &mut outputs,
+                )
+                .unwrap_or_else(|err| panic!("attention-f32 score pass failed: {err}"));
+            trace!(target: "sink", "attention-f32 score backend {:?}", score_plan.backend());
+        }
+
+        softmax_attention_rows(&mut scores, self.scale);
+
+        let mut output = Dense::<f32>::zeros(self.output_shape.clone());
+        if self.value_plan.is_none() {
+            self.value_plan = Some(
+                EinsumF32Plan::compile(
+                    "bhqk,bhkd->bhqd",
+                    &[JitInput::Dense(&scores), JitInput::Dense(&self.v)],
+                    std::slice::from_ref(&self.output_shape),
+                )
+                .unwrap_or_else(|err| panic!("attention-f32 value compile failed: {err}")),
+            );
+        }
+        {
+            let mut outputs = [&mut output];
+            let value_plan = self.value_plan.as_ref().unwrap();
+            value_plan
+                .try_run(
+                    &[JitInput::Dense(&scores), JitInput::Dense(&self.v)],
+                    &mut outputs,
+                )
+                .unwrap_or_else(|err| panic!("attention-f32 value pass failed: {err}"));
+            trace!(target: "sink", "attention-f32 value backend {:?}", value_plan.backend());
+        }
+
+        let WriteResource::BTM(wz) = it.next().unwrap() else {
+            unreachable!()
+        };
+        write_dense_output_cells(wz, &output, &self.output_name, self.output_kind)
+    }
+}
+
 
 pub enum ASink { AddSink(AddSink), RemoveSink(RemoveSink), HeadSink(HeadTailSink<true>), TailSink(HeadTailSink<false>), CountSink(CountSink), HashSink(HashSink), SumSink(SumSink), AndSink(AndSink), ACTSink(ACTSink),
+    #[cfg(feature = "einsum")]
+    TensorOpF32Sink(TensorOpF32Sink),
+    #[cfg(feature = "einsum")]
+    EinsumF32Sink(EinsumF32Sink),
+    #[cfg(feature = "einsum")]
+    AttentionF32Sink(Box<AttentionF32Sink>),
     #[cfg(feature = "guarded_emit")]
     GuardedEmitSink(GuardedEmitSink),
     #[cfg(feature = "witness_select")]
@@ -2073,6 +2441,10 @@ impl ASink {
             #[cfg(feature = "grounding")]
             ASink::PureSink(_) => true,
 
+            // Tensor sinks fold over whole input tensors per firing. Keep them
+            // off the delta path until a delta-equivalence oracle proves it.
+            #[cfg(feature = "einsum")]
+            ASink::TensorOpF32Sink(_) | ASink::EinsumF32Sink(_) | ASink::AttentionF32Sink(_) => false,
             ASink::RemoveSink(_) => false,
             ASink::HeadSink(_) => false,
             ASink::TailSink(_) => false,
@@ -2140,6 +2512,21 @@ impl Sink for ASink {
         } else if unsafe { *e.ptr == item_byte(Tag::Arity(3)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(3)) &&
             *e.ptr.offset(2) == b'A' && *e.ptr.offset(3) == b'C' && *e.ptr.offset(4) == b'T' } {
             return ASink::ACTSink(ACTSink::new(e));
+        } else if expr_functor_is(e, b"tensor-op-f32") {
+            #[cfg(feature = "einsum")]
+            return ASink::TensorOpF32Sink(TensorOpF32Sink::new(e));
+            #[cfg(not(feature = "einsum"))]
+            panic!("MORK was not built with the einsum feature, yet trying to call {:?}", e);
+        } else if expr_functor_is(e, b"einsum-f32") {
+            #[cfg(feature = "einsum")]
+            return ASink::EinsumF32Sink(EinsumF32Sink::new(e));
+            #[cfg(not(feature = "einsum"))]
+            panic!("MORK was not built with the einsum feature, yet trying to call {:?}", e);
+        } else if expr_functor_is(e, b"attention-f32") {
+            #[cfg(feature = "einsum")]
+            return ASink::AttentionF32Sink(Box::new(AttentionF32Sink::new(e)));
+            #[cfg(not(feature = "einsum"))]
+            panic!("MORK was not built with the einsum feature, yet trying to call {:?}", e);
         } else if unsafe { *e.ptr == item_byte(Tag::Arity(3)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(6)) &&
             *e.ptr.offset(2) == b'c' && *e.ptr.offset(3) == b'h' && *e.ptr.offset(4) == b'o' && *e.ptr.offset(5) == b'o' && *e.ptr.offset(6) == b's' && *e.ptr.offset(7) == b'e' } {
             #[cfg(feature = "witness_select")]
@@ -2201,6 +2588,12 @@ impl Sink for ASink {
                 ASink::SumSink(s) => { for i in s.request().into_iter() { yield i } }
                 ASink::AndSink(s) => { for i in s.request().into_iter() { yield i } }
                 ASink::ACTSink(s) => { for i in s.request().into_iter() { yield i } }
+                #[cfg(feature = "einsum")]
+                ASink::TensorOpF32Sink(s) => { for i in s.request().into_iter() { yield i } }
+                #[cfg(feature = "einsum")]
+                ASink::EinsumF32Sink(s) => { for i in s.request().into_iter() { yield i } }
+                #[cfg(feature = "einsum")]
+                ASink::AttentionF32Sink(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "guarded_emit")]
                 ASink::GuardedEmitSink(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "witness_select")]
@@ -2236,6 +2629,12 @@ impl Sink for ASink {
             ASink::SumSink(s) => { s.sink(it, path, read) }
             ASink::AndSink(s) => { s.sink(it, path, read) }
             ASink::ACTSink(s) => { s.sink(it, path, read) }
+            #[cfg(feature = "einsum")]
+            ASink::TensorOpF32Sink(s) => { s.sink(it, path, read) }
+            #[cfg(feature = "einsum")]
+            ASink::EinsumF32Sink(s) => { s.sink(it, path, read) }
+            #[cfg(feature = "einsum")]
+            ASink::AttentionF32Sink(s) => { s.sink(it, path, read) }
             #[cfg(feature = "guarded_emit")]
             ASink::GuardedEmitSink(s) => { s.sink(it, path, read) }
             #[cfg(feature = "witness_select")]
@@ -2291,6 +2690,12 @@ impl Sink for ASink {
             ASink::SumSink(s) => { s.finalize(it) }
             ASink::AndSink(s) => { s.finalize(it) }
             ASink::ACTSink(s) => { s.finalize(it) }
+            #[cfg(feature = "einsum")]
+            ASink::TensorOpF32Sink(s) => { s.finalize(it) }
+            #[cfg(feature = "einsum")]
+            ASink::EinsumF32Sink(s) => { s.finalize(it) }
+            #[cfg(feature = "einsum")]
+            ASink::AttentionF32Sink(s) => { s.finalize(it) }
             #[cfg(feature = "guarded_emit")]
             ASink::GuardedEmitSink(s) => { s.finalize(it) }
             #[cfg(feature = "witness_select")]
