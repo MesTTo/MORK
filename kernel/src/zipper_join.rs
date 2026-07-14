@@ -14,7 +14,7 @@
 //! ProductZipper.
 
 use mork_expr::{byte_item, item_byte, unify, Expr, ExprEnv, ExprZipper, Tag};
-use pathmap::utils::ByteMask;
+use pathmap::utils::{BitMask, ByteMask};
 use pathmap::zipper::{
     ReadZipperUntracked, Zipper, ZipperAbsolutePath, ZipperIteration, ZipperMoving, ZipperValues,
 };
@@ -30,7 +30,7 @@ const NEW_VAR_EXPR_BYTES: [u8; 1] = [item_byte(Tag::NewVar)];
 /// first. This is the per-byte leapfrog seek on a trie node's children.
 #[inline]
 pub fn least_ge(mask: &ByteMask, k: u8) -> Option<u8> {
-    if (mask.0[(k >> 6) as usize] >> (k & 63)) & 1 == 1 {
+    if mask.test_bit(k) {
         Some(k)
     } else {
         mask.next_bit(k)
@@ -104,11 +104,6 @@ fn is_complete(bytes: &[u8]) -> bool {
         step_parse(b, &mut subterms, &mut payload);
     }
     subterms == 0 && payload == 0
-}
-
-#[inline]
-fn has_bit(mask: &ByteMask, b: u8) -> bool {
-    (mask.0[(b >> 6) as usize] >> (b & 63)) & 1 == 1
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -407,7 +402,7 @@ impl<Z: Zipper + ZipperMoving> SubtermCursor<Z> {
             let mask = self.z.child_mask();
             if ti < target.len() {
                 let t = target[ti];
-                if has_bit(&mask, t) {
+                if mask.test_bit(t) {
                     self.z.descend_to_byte(t);
                     self.push_key_byte(t);
                     ti += 1;
@@ -2704,7 +2699,10 @@ impl UnifyJoin<'_> {
 
     fn child_exists_at_current(&self, f: usize, b: u8) -> bool {
         let path = self.factor_path(f);
-        has_bit(&self.src_map(f).read_zipper_at_path(&path).child_mask(), b)
+        self.src_map(f)
+            .read_zipper_at_path(&path)
+            .child_mask()
+            .test_bit(b)
     }
 
     fn factor_namespace(&self, f: usize) -> u8 {
@@ -3476,7 +3474,7 @@ mod tests {
                 let mask = self.z.child_mask();
                 if ti < target.len() {
                     let t = target[ti];
-                    if has_bit(&mask, t) {
+                    if mask.test_bit(t) {
                         self.z.descend_to_byte(t);
                         self.key.push(t);
                         ti += 1;
