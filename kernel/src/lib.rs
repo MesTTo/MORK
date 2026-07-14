@@ -23,6 +23,8 @@ pub use sources::ResourceRequest;
 pub mod egraph;
 #[cfg(feature = "einsum")]
 pub mod graph_tensor;
+#[cfg(feature = "einsum")]
+mod tensor_ops;
 pub mod term_identity;
 
 #[doc(hidden)]

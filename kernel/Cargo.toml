@@ -61,3 +61,8 @@ experimental_dnf = ["pathmap/zipper_alg"]
 [[example]]
 name = "wco_leapfrog"
 required-features = ["leapfrog"]
+
+[[test]]
+name = "einsum_sink"
+path = "tests/einsum_sink.rs"
+required-features = ["einsum"]

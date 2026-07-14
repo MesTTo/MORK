@@ -183,7 +183,7 @@ pub(crate) trait Sink {
     fn admits(&mut self, _key: &[u8], _read: &PathMap<()>) -> bool { true }
 }
 
-fn set_btm_val_and_note<W: ZipperWriting<()>>(wz: &mut W, full_path: &[u8]) -> bool {
+pub(crate) fn set_btm_val_and_note<W: ZipperWriting<()>>(wz: &mut W, full_path: &[u8]) -> bool {
     let inserted = wz.set_val(()).is_none();
     crate::space::stratified_note_btm_insert(full_path, inserted);
     inserted
