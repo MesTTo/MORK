@@ -2,6 +2,10 @@ use mork::expr;
 use mork::space::Space;
 use std::collections::BTreeMap;
 
+// dense16 coverage intentionally excludes attention-f32 and tensor-op attention.
+// Those paths consume scalar cells from each rule match instead of sharing the
+// direct EinsumInput gather path that can scan all strip widths.
+
 fn run_one_step_and_dump(program: &[u8], query: &str, template: &str) -> String {
     let mut space = Space::new();
     space.add_all_sexpr(program).unwrap();
@@ -110,6 +114,185 @@ fn matrix_cells(name: &str, rows: usize, cols: usize, values: &[f32]) -> String 
         }
     }
     out
+}
+
+fn linear_to_indices(mut linear: usize, shape: &[usize], out: &mut [usize]) {
+    for axis in (0..shape.len()).rev() {
+        out[axis] = linear % shape[axis];
+        linear /= shape[axis];
+    }
+}
+
+fn dense_map_from_values(shape: &[usize], values: &[f32]) -> BTreeMap<Vec<usize>, f32> {
+    let expected_len: usize = shape.iter().product();
+    assert_eq!(values.len(), expected_len);
+    let mut out = BTreeMap::new();
+    let mut indices = vec![0usize; shape.len()];
+    for (linear, &value) in values.iter().enumerate() {
+        linear_to_indices(linear, shape, &mut indices);
+        out.insert(indices.clone(), value);
+    }
+    out
+}
+
+fn assert_dense_maps_close(
+    actual: &BTreeMap<Vec<usize>, f32>,
+    expected: &BTreeMap<Vec<usize>, f32>,
+) {
+    assert_eq!(actual.len(), expected.len(), "actual {actual:?}");
+    for (indices, expected_value) in expected {
+        let actual_value = actual
+            .get(indices)
+            .unwrap_or_else(|| panic!("missing tensor cell {indices:?} in {actual:?}"));
+        let diff = (*actual_value - *expected_value).abs();
+        assert!(
+            diff <= 1.0e-5,
+            "{indices:?}: expected {expected_value}, got {actual_value}, diff {diff}"
+        );
+    }
+}
+
+fn dense16_atom_count(shape: &[usize]) -> usize {
+    assert!(!shape.is_empty());
+    let last = shape[shape.len() - 1];
+    let rows = shape[..shape.len() - 1].iter().product::<usize>();
+    rows * last.div_ceil(16)
+}
+
+fn dense16_cells(name: &str, shape: &[usize], values: &[f32]) -> String {
+    assert!(!shape.is_empty());
+    let expected_len: usize = shape.iter().product();
+    assert_eq!(values.len(), expected_len);
+    let rank = shape.len();
+    let last = shape[rank - 1];
+    assert!(last > 0);
+    let row_count = values.len() / last;
+    let mut base_indices = vec![0usize; rank - 1];
+    let mut out = String::new();
+
+    for row in 0..row_count {
+        linear_to_indices(row, &shape[..rank - 1], &mut base_indices);
+        let row_start = row * last;
+        for strip_start in (0..last).step_by(16) {
+            let value_count = 16.min(last - strip_start);
+            out.push('(');
+            out.push_str(name);
+            for index in &base_indices {
+                out.push(' ');
+                out.push_str(&index.to_string());
+            }
+            out.push(' ');
+            out.push_str(&(strip_start / 16).to_string());
+            for value in &values[row_start + strip_start..row_start + strip_start + value_count] {
+                out.push(' ');
+                out.push_str(&format_tensor_value(*value));
+            }
+            out.push_str(")\n");
+        }
+    }
+
+    out
+}
+
+fn repeated_token(token: &str, count: usize) -> String {
+    vec![token; count].join(" ")
+}
+
+fn numbered_vars(count: usize) -> String {
+    (1..=count)
+        .map(|index| format!("_{index}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn dump_dense16_selection(space: &Space, name: &str, rank: usize) -> String {
+    let mut output = String::new();
+    for value_count in 1..=16 {
+        let arity = rank + value_count + 1;
+        let query = format!("[{arity}] {name} {}", repeated_token("$", arity - 1));
+        let template = format!("[{arity}] {name} {}", numbered_vars(arity - 1));
+        output.push_str(&dump_selection(space, &query, &template));
+    }
+    output
+}
+
+fn parse_dumped_dense16_cells(output: &str, name: &str, rank: usize) -> BTreeMap<Vec<usize>, f32> {
+    let mut cells = BTreeMap::new();
+    for line in output.lines() {
+        let cell = line
+            .strip_prefix('(')
+            .and_then(|line| line.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("dumped tensor cell is not parenthesized: {line:?}"));
+        let parts: Vec<&str> = cell.split_whitespace().collect();
+        assert_eq!(parts[0], name, "dumped tensor cell name changed");
+        let value_count = parts.len() - (rank + 1);
+        assert!(
+            (1..=16).contains(&value_count),
+            "dense16 dump has invalid value count {value_count}: {line:?}"
+        );
+        let base_indices: Vec<usize> = parts[1..rank]
+            .iter()
+            .map(|index| {
+                index.parse::<usize>().unwrap_or_else(|err| {
+                    panic!("could not parse dumped tensor index {line:?}: {err}")
+                })
+            })
+            .collect();
+        let strip = parts[rank]
+            .parse::<usize>()
+            .unwrap_or_else(|err| panic!("could not parse dense16 strip {line:?}: {err}"));
+        for (offset, value) in parts[rank + 1..].iter().enumerate() {
+            let mut indices = base_indices.clone();
+            indices.push(strip * 16 + offset);
+            let value = value.parse::<f32>().unwrap_or_else(|err| {
+                panic!("could not parse dumped tensor value {line:?}: {err}")
+            });
+            cells.insert(indices, value);
+        }
+    }
+    cells
+}
+
+fn run_one_step_and_parse_dense16(
+    program: &[u8],
+    name: &str,
+    rank: usize,
+) -> BTreeMap<Vec<usize>, f32> {
+    let mut space = Space::new();
+    space.add_all_sexpr(program).unwrap();
+    assert_eq!(space.metta_calculus(1), 1);
+    let output = dump_dense16_selection(&space, name, rank);
+    parse_dumped_dense16_cells(&output, name, rank)
+}
+
+fn strip_template(name: &str, rank: usize, value_count: usize) -> String {
+    let mut parts = vec![name.to_string()];
+    parts.extend((0..rank - 1).map(|index| format!("$i{index}")));
+    parts.push("$sb".to_string());
+    parts.extend((0..value_count).map(|index| format!("$v{index}")));
+    format!("({})", parts.join(" "))
+}
+
+fn ground_scalar_template(name: &str, rank: usize) -> String {
+    let mut parts = vec![name.to_string()];
+    parts.extend(std::iter::repeat_n("0".to_string(), rank + 1));
+    format!("({})", parts.join(" "))
+}
+
+fn ground_strip_template(name: &str, rank: usize, value_count: usize) -> String {
+    let mut parts = vec![name.to_string()];
+    parts.extend(std::iter::repeat_n("0".to_string(), rank - 1));
+    parts.push("0".to_string());
+    parts.extend(std::iter::repeat_n("0".to_string(), value_count));
+    format!("({})", parts.join(" "))
+}
+
+fn identity_matrix_values(size: usize) -> Vec<f32> {
+    let mut values = vec![0.0; size * size];
+    for index in 0..size {
+        values[index * size + index] = 1.0;
+    }
+    values
 }
 
 fn dense_matmul_2x3_3x2_cells() -> String {
@@ -275,6 +458,160 @@ fn tensor_op_f32_einsum_scans_inputs_from_one_shot_trigger() {
 
     let output = run_one_step_and_dump(program, "[4] C $ $ $", "[4] C _1 _2 _3");
     assert_tensor_cells_close(&output, "C", &[([0, 0], 31.0)]);
+}
+
+fn einsum_copy_program(
+    a_cells: &str,
+    b_cells: &str,
+    a_decl: &str,
+    b_decl: &str,
+    output_decl: &str,
+    a_template: &str,
+    b_template: &str,
+) -> Vec<u8> {
+    format!(
+        r#"
+{a_cells}
+{b_cells}
+(go)
+
+(exec 0
+  (, (go))
+  (O (einsum-f32 ab,bc->ac
+        {a_decl}
+        {b_decl}
+        {output_decl}
+        {a_template}
+        {b_template})))
+"#
+    )
+    .into_bytes()
+}
+
+#[test]
+fn einsum_f32_dense16_matches_scalar_with_ragged_last_dim() {
+    let a_shape = [5, 17];
+    let b_shape = [17, 17];
+    let a_values: Vec<f32> = (0..85).map(|index| index as f32 * 0.25 - 7.0).collect();
+    let b_values = identity_matrix_values(17);
+
+    let scalar_program = einsum_copy_program(
+        &matrix_cells("A", 5, 17, &a_values),
+        &matrix_cells("B", 17, 17, &b_values),
+        "(A 5 17)",
+        "(B 17 17)",
+        "(C 5 17)",
+        &ground_scalar_template("A", 2),
+        &ground_scalar_template("B", 2),
+    );
+    let mut scalar_space = Space::new();
+    let scalar_loaded = scalar_space.add_all_sexpr(&scalar_program).unwrap();
+    assert_eq!(scalar_loaded, a_values.len() + b_values.len() + 2);
+    assert_eq!(scalar_space.metta_calculus(1), 1);
+    let scalar_output = dump_selection(&scalar_space, "[4] C $ $ $", "[4] C _1 _2 _3");
+    let scalar_cells = parse_dumped_tensor_cells(&scalar_output, "C");
+
+    let strip_program = einsum_copy_program(
+        &dense16_cells("A", &a_shape, &a_values),
+        &dense16_cells("B", &b_shape, &b_values),
+        "(A dense16 5 17)",
+        "(B dense16 17 17)",
+        "(C dense16 5 17)",
+        &ground_strip_template("A", 2, 16),
+        &ground_strip_template("B", 2, 16),
+    );
+    let mut strip_space = Space::new();
+    let strip_loaded = strip_space.add_all_sexpr(&strip_program).unwrap();
+    assert_eq!(
+        strip_loaded,
+        dense16_atom_count(&a_shape) + dense16_atom_count(&b_shape) + 2
+    );
+    assert_eq!(strip_space.metta_calculus(1), 1);
+    let strip_output = dump_dense16_selection(&strip_space, "C", 2);
+    let strip_cells = parse_dumped_dense16_cells(&strip_output, "C", 2);
+
+    assert_dense_maps_close(&strip_cells, &scalar_cells);
+}
+
+#[test]
+fn einsum_f32_mixes_dense16_and_scalar_storage() {
+    let a_shape = [2, 17];
+    let b_shape = [17, 17];
+    let a_values: Vec<f32> = (0..34).map(|index| index as f32 - 3.0).collect();
+    let b_values = identity_matrix_values(17);
+    let expected = dense_map_from_values(&a_shape, &a_values);
+
+    let strip_input_scalar_output = einsum_copy_program(
+        &dense16_cells("A", &a_shape, &a_values),
+        &dense16_cells("B", &b_shape, &b_values),
+        "(A dense16 2 17)",
+        "(B dense16 17 17)",
+        "(C 2 17)",
+        &ground_strip_template("A", 2, 16),
+        &ground_strip_template("B", 2, 16),
+    );
+    let scalar_output =
+        run_one_step_and_dump(&strip_input_scalar_output, "[4] C $ $ $", "[4] C _1 _2 _3");
+    let scalar_output = parse_dumped_tensor_cells(&scalar_output, "C");
+    assert_dense_maps_close(&scalar_output, &expected);
+
+    let scalar_input_strip_output = einsum_copy_program(
+        &matrix_cells("A", 2, 17, &a_values),
+        &matrix_cells("B", 17, 17, &b_values),
+        "(A 2 17)",
+        "(B 17 17)",
+        "(D dense16 2 17)",
+        &ground_scalar_template("A", 2),
+        &ground_scalar_template("B", 2),
+    );
+    let mut space = Space::new();
+    space.add_all_sexpr(&scalar_input_strip_output).unwrap();
+    assert_eq!(space.metta_calculus(1), 1);
+    let strip_output = dump_dense16_selection(&space, "D", 2);
+    let strip_output = parse_dumped_dense16_cells(&strip_output, "D", 2);
+    assert_dense_maps_close(&strip_output, &expected);
+}
+
+#[test]
+fn tensor_op_f32_einsum_uses_dense16_direct_input_and_output() {
+    let a_shape = [2, 17];
+    let b_shape = [17, 17];
+    let a_values: Vec<f32> = (0..34).map(|index| index as f32 * 0.5 + 1.0).collect();
+    let b_values = identity_matrix_values(17);
+    let program = format!(
+        r#"
+{}
+{}
+(go)
+
+(exec 0
+  (, (go))
+  (O (tensor-op-f32
+        (op einsum ab,bc->ac)
+        (inputs (A dense16 2 17) (B dense16 17 17))
+        (output (T dense16))
+        (from {}
+              {})
+        (backend auto))))
+"#,
+        dense16_cells("A", &a_shape, &a_values),
+        dense16_cells("B", &b_shape, &b_values),
+        ground_strip_template("A", 2, 16),
+        ground_strip_template("B", 2, 16),
+    )
+    .into_bytes();
+
+    let mut space = Space::new();
+    let loaded = space.add_all_sexpr(&program).unwrap();
+    assert_eq!(
+        loaded,
+        dense16_atom_count(&a_shape) + dense16_atom_count(&b_shape) + 2
+    );
+    assert_eq!(space.metta_calculus(1), 1);
+    let output = dump_dense16_selection(&space, "T", 2);
+    let output = parse_dumped_dense16_cells(&output, "T", 2);
+    let expected = dense_map_from_values(&a_shape, &a_values);
+    assert_dense_maps_close(&output, &expected);
 }
 
 #[test]
@@ -499,6 +836,161 @@ fn tensor_op_f32_reshapes_2x2x2_to_2x4_row_major() {
 }
 
 #[test]
+fn tensor_op_f32_runs_add_with_dense16_cells() {
+    let a_shape = [2, 4];
+    let a_values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let b_values = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+    let program = format!(
+        r#"
+{}
+{}
+
+(exec 0
+  (, (A $i $s $a0 $a1 $a2 $a3)
+     (B $i $s $b0 $b1 $b2 $b3))
+  (O (tensor-op-f32
+        (op add)
+        (inputs (A dense16 2 4) (B dense16 2 4))
+        (output (C dense16))
+        (from (A $i $s $a0 $a1 $a2 $a3)
+              (B $i $s $b0 $b1 $b2 $b3))
+        (backend auto))))
+"#,
+        dense16_cells("A", &a_shape, &a_values),
+        dense16_cells("B", &a_shape, &b_values),
+    )
+    .into_bytes();
+
+    let output = run_one_step_and_parse_dense16(&program, "C", 2);
+    let expected_values: Vec<f32> = a_values
+        .iter()
+        .zip(b_values)
+        .map(|(&lhs, rhs)| lhs + rhs)
+        .collect();
+    let expected = dense_map_from_values(&a_shape, &expected_values);
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
+fn tensor_op_f32_runs_layernorm_with_dense16_cells() {
+    let x_shape = [1, 4];
+    let scale_shape = [4];
+    let program = format!(
+        r#"
+{}
+{}
+{}
+
+(exec 0
+  (, (X $row $s $x0 $x1 $x2 $x3)
+     (G $s $g0 $g1 $g2 $g3)
+     (B $s $b0 $b1 $b2 $b3))
+  (O (tensor-op-f32
+        (op layernorm 1e-5)
+        (inputs (X dense16 1 4) (G dense16 4) (B dense16 4))
+        (output (Y dense16))
+        (from (X $row $s $x0 $x1 $x2 $x3)
+              (G $s $g0 $g1 $g2 $g3)
+              (B $s $b0 $b1 $b2 $b3))
+        (backend auto))))
+"#,
+        dense16_cells("X", &x_shape, &[1.0, 2.0, 3.0, 4.0]),
+        dense16_cells("G", &scale_shape, &[1.0, 1.0, 1.0, 1.0]),
+        dense16_cells("B", &scale_shape, &[0.0, 0.0, 0.0, 0.0]),
+    )
+    .into_bytes();
+
+    let output = run_one_step_and_parse_dense16(&program, "Y", 2);
+    let expected = dense_map_from_values(
+        &x_shape,
+        &[-1.341_635_5, -0.447_211_83, 0.447_211_83, 1.341_635_5],
+    );
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
+fn tensor_op_f32_runs_gelu_with_dense16_cells() {
+    let shape = [4];
+    let program = format!(
+        r#"
+{}
+
+(exec 0
+  (, (X $s $x0 $x1 $x2 $x3))
+  (O (tensor-op-f32
+        (op gelu)
+        (inputs (X dense16 4))
+        (output (Y dense16))
+        (from (X $s $x0 $x1 $x2 $x3))
+        (backend auto))))
+"#,
+        dense16_cells("X", &shape, &[-1.0, 0.0, 1.0, 2.0]),
+    )
+    .into_bytes();
+
+    let output = run_one_step_and_parse_dense16(&program, "Y", 1);
+    let expected = dense_map_from_values(&shape, &[-0.158_808_01, 0.0, 0.841_192, 1.954_597_7]);
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
+fn tensor_op_f32_runs_softmax_with_dense16_cells() {
+    let shape = [1, 4];
+    let input = [1.0_f32, 2.0, 3.0, 4.0];
+    let max = input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp_values: Vec<f32> = input.iter().map(|value| (*value - max).exp()).collect();
+    let sum: f32 = exp_values.iter().sum();
+    let expected_values: Vec<f32> = exp_values.iter().map(|value| value / sum).collect();
+    let program = format!(
+        r#"
+{}
+
+(exec 0
+  (, (X $row $s $x0 $x1 $x2 $x3))
+  (O (tensor-op-f32
+        (op softmax)
+        (inputs (X dense16 1 4))
+        (output (Y dense16))
+        (from (X $row $s $x0 $x1 $x2 $x3))
+        (backend auto))))
+"#,
+        dense16_cells("X", &shape, &input),
+    )
+    .into_bytes();
+
+    let output = run_one_step_and_parse_dense16(&program, "Y", 2);
+    let expected = dense_map_from_values(&shape, &expected_values);
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
+fn tensor_op_f32_runs_reshape_with_dense16_cells() {
+    let input_shape = [2, 4];
+    let output_shape = [2, 2, 2];
+    let values: Vec<f32> = (0..8).map(|value| value as f32).collect();
+    let program = format!(
+        r#"
+{}
+
+(exec 0
+  (, (X $row $s $x0 $x1 $x2 $x3))
+  (O (tensor-op-f32
+        (op reshape)
+        (inputs (X dense16 2 4))
+        (output (OUT dense16 2 2 2))
+        (from (X $row $s $x0 $x1 $x2 $x3))
+        (backend auto))))
+"#,
+        dense16_cells("X", &input_shape, &values),
+    )
+    .into_bytes();
+
+    let output = run_one_step_and_parse_dense16(&program, "OUT", 3);
+    let expected = dense_map_from_values(&output_shape, &values);
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
 #[should_panic(expected = "explicit output shape does not match inferred operator shape")]
 fn tensor_op_f32_rejects_wrong_explicit_output_shape() {
     let mut space = Space::new();
@@ -587,7 +1079,15 @@ fn tensor_op_f32_stratified_shrink_rewrite_counts_removed_output_cells() {
 
     assert_eq!(space.metta_calculus(2), 2);
     let output = dump_selection(&space, "[4] CT $ $ $", "[4] CT _1 _2 _3");
-    assert_excludes_all(&output, &["(CT 0 0 999)", "(CT 0 1 888)", "(CT 1 0 777)", "(CT 1 1 666)"]);
+    assert_excludes_all(
+        &output,
+        &[
+            "(CT 0 0 999)",
+            "(CT 0 1 888)",
+            "(CT 1 0 777)",
+            "(CT 1 1 666)",
+        ],
+    );
     assert_excludes_all(&output, &["(CT 0 0 58)", "(CT 0 1 64)"]);
     assert_contains_all(&output, &["(CT 1 0 139)", "(CT 1 1 154)"]);
     assert!(
@@ -600,6 +1100,133 @@ fn tensor_op_f32_stratified_shrink_rewrite_counts_removed_output_cells() {
         dump_selection(&space, "[2] ready $", "[2] ready _1"),
         "(ready tensor)\n"
     );
+}
+
+#[cfg(feature = "stratified_quiescence")]
+#[test]
+fn einsum_f32_stratified_dense16_shrink_rewrite_counts_removed_output_strips() {
+    let a_shape = [1, 17];
+    let b_shape = [17, 17];
+    let a_values: Vec<f32> = (0..17).map(|index| index as f32 + 1.0).collect();
+    let b_values = identity_matrix_values(17);
+    let sink = format!(
+        r#"(einsum-f32 ab,bc->ac
+        (A dense16 1 17)
+        (B dense16 17 17)
+        (CT dense16 1 17)
+        {}
+        {})"#,
+        ground_strip_template("A", 2, 16),
+        ground_strip_template("B", 2, 16),
+    );
+    let program = format!(
+        r#"
+{}
+{}
+(go)
+(CT 0 0 999 998 997 996 995 994 993 992 991 990 989 988 987 986 985 984)
+(CT 0 1 888)
+(CT 0 2 777)
+
+((tensor rewrite)
+  (, ((tensor rewrite) $p $t)
+     (go))
+  (O {sink}
+     (+ (exec (stage tensor rewrite) $p $t))))
+
+(exec (stage tensor rewrite)
+      (, ((tensor rewrite) $p $t)
+         (go))
+      (O {sink}
+         (+ (exec (stage tensor rewrite) $p $t))))
+
+(exec (quiesce tensor ready)
+      (, (CT 0 1 $v))
+      (O (+ (ready tensor))))
+"#,
+        dense16_cells("A", &a_shape, &a_values),
+        dense16_cells("B", &b_shape, &b_values),
+    );
+
+    let mut space = Space::new();
+    space.add_all_sexpr(program.as_bytes()).unwrap();
+
+    assert_eq!(space.metta_calculus(2), 2);
+    let output = dump_dense16_selection(&space, "CT", 2);
+    let cells = parse_dumped_dense16_cells(&output, "CT", 2);
+    let expected = dense_map_from_values(&a_shape, &a_values);
+    assert_dense_maps_close(&cells, &expected);
+    assert!(
+        !cells.contains_key(&vec![0, 32]),
+        "stale strip survived: {cells:?}"
+    );
+    assert!(
+        dump_selection(&space, "[2] ready $", "[2] ready _1").is_empty(),
+        "barrier advanced before the dense16 shrinking rewrite reached quiescence"
+    );
+
+    assert_eq!(space.metta_calculus(1), 1);
+    assert_eq!(
+        dump_selection(&space, "[2] ready $", "[2] ready _1"),
+        "(ready tensor)\n"
+    );
+}
+
+#[test]
+fn einsum_f32_dense16_ragged_tail_round_trips_through_output_then_input() {
+    let a_shape = [5, 17];
+    let b_shape = [17, 17];
+    let a_values: Vec<f32> = (0..85).map(|index| index as f32 / 3.0 - 4.0).collect();
+    let b_values = identity_matrix_values(17);
+    let first_sink = format!(
+        r#"(einsum-f32 ab,bc->ac
+        (A dense16 5 17)
+        (B dense16 17 17)
+        (C dense16 5 17)
+        {}
+        {})"#,
+        ground_strip_template("A", 2, 16),
+        ground_strip_template("B", 2, 16),
+    );
+    let second_sink = format!(
+        r#"(einsum-f32 ab,bc->ac
+        (C dense16 5 17)
+        (B dense16 17 17)
+        (D dense16 5 17)
+        {}
+        {})"#,
+        ground_strip_template("C", 2, 16),
+        ground_strip_template("B", 2, 16),
+    );
+    let program = format!(
+        r#"
+{}
+{}
+(roundtrip start)
+
+(exec 0
+  (, (roundtrip start))
+  (O {first_sink}
+     (+ (roundtrip written))))
+
+(exec 0
+  (, (roundtrip written))
+  (O {second_sink}))
+"#,
+        dense16_cells("A", &a_shape, &a_values),
+        dense16_cells("B", &b_shape, &b_values),
+    )
+    .into_bytes();
+
+    let mut space = Space::new();
+    space.add_all_sexpr(&program).unwrap();
+    assert_eq!(space.metta_calculus(1), 1);
+    assert_eq!(space.metta_calculus(1), 1);
+
+    let output = dump_dense16_selection(&space, "D", 2);
+    let output = parse_dumped_dense16_cells(&output, "D", 2);
+    let expected = dense_map_from_values(&a_shape, &a_values);
+    assert_dense_maps_close(&output, &expected);
 }
 
 #[test]

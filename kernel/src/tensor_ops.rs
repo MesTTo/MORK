@@ -54,9 +54,18 @@ pub(crate) fn parse_tensor_decl(e: Expr) -> (String, Vec<usize>) {
     (name, shape)
 }
 
+pub(crate) const DENSE_STRIP_WIDTH: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenseCellFormat {
+    Scalar,
+    Strip16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TensorInputKind {
     Dense,
+    Dense16,
     Csr,
 }
 
@@ -97,15 +106,25 @@ fn parse_qualified_tensor_decl<T: Copy>(
 fn tensor_input_kind(token: &str) -> Option<TensorInputKind> {
     match token {
         "dense" => Some(TensorInputKind::Dense),
+        "dense16" => Some(TensorInputKind::Dense16),
         "csr" => Some(TensorInputKind::Csr),
         _ => None,
     }
 }
 
-fn tensor_output_kind(token: &str) -> Option<TensorOutputKind> {
+fn dense_format_for_input_kind(kind: TensorInputKind) -> Option<DenseCellFormat> {
+    match kind {
+        TensorInputKind::Dense => Some(DenseCellFormat::Scalar),
+        TensorInputKind::Dense16 => Some(DenseCellFormat::Strip16),
+        TensorInputKind::Csr => None,
+    }
+}
+
+fn tensor_output_tag(token: &str) -> Option<(TensorOutputKind, DenseCellFormat)> {
     match token {
-        "dense" => Some(TensorOutputKind::Dense),
-        "nonzero" | "nz" | "sparse" => Some(TensorOutputKind::NonZero),
+        "dense" => Some((TensorOutputKind::Dense, DenseCellFormat::Scalar)),
+        "dense16" => Some((TensorOutputKind::Dense, DenseCellFormat::Strip16)),
+        "nonzero" | "nz" | "sparse" => Some((TensorOutputKind::NonZero, DenseCellFormat::Scalar)),
         _ => None,
     }
 }
@@ -126,20 +145,29 @@ pub(crate) fn parse_input_tensor_decl(e: Expr) -> (TensorInputKind, String, Vec<
     (TensorInputKind::Dense, first, shape)
 }
 
-pub(crate) fn parse_output_tensor_decl(e: Expr) -> (TensorOutputKind, String, Vec<usize>) {
+pub(crate) fn parse_output_tensor_decl(
+    e: Expr,
+) -> (TensorOutputKind, DenseCellFormat, String, Vec<usize>) {
     let args = expr_args(e);
     assert!(
         args.len() >= 2,
         "tensor output declaration must be shaped like (Name dim...) or (nonzero Name dim...)"
     );
 
-    if let Some(parsed) = parse_qualified_tensor_decl(&args, tensor_output_kind) {
-        return parsed;
+    if let Some(((kind, format), name, shape)) =
+        parse_qualified_tensor_decl(&args, tensor_output_tag)
+    {
+        return (kind, format, name, shape);
     }
 
     let first = symbol_string(args[0]);
     let shape = parse_usize_shape(&args[1..]);
-    (TensorOutputKind::Dense, first, shape)
+    (
+        TensorOutputKind::Dense,
+        DenseCellFormat::Scalar,
+        first,
+        shape,
+    )
 }
 
 pub(crate) fn parse_cell(e: Expr) -> (String, Vec<usize>, f32) {
@@ -155,6 +183,80 @@ pub(crate) fn parse_cell(e: Expr) -> (String, Vec<usize>, f32) {
     (name, indices, value)
 }
 
+fn parse_strip_cell(e: Expr, rank: usize) -> (String, Vec<usize>, usize, Vec<f32>) {
+    assert!(rank > 0, "dense16 tensor cells need rank >= 1");
+    let args = expr_args(e);
+    assert!(
+        args.len() >= rank + 2,
+        "dense16 tensor cell must be shaped like (Name index-prefix... strip value...)"
+    );
+    let name = symbol_string(args[0]);
+    let value_count = args.len() - (rank + 1);
+    assert!(
+        (1..=DENSE_STRIP_WIDTH).contains(&value_count),
+        "dense16 tensor cell must carry 1..={DENSE_STRIP_WIDTH} values, got {value_count}"
+    );
+    let indices = args[1..rank].iter().map(|&arg| symbol_usize(arg)).collect();
+    let strip = symbol_usize(args[rank]);
+    let values = args[rank + 1..]
+        .iter()
+        .map(|&arg| symbol_f32(arg))
+        .collect();
+    (name, indices, strip, values)
+}
+
+fn set_dense_cell(
+    tensor: &mut Dense<f32>,
+    expected_name: &str,
+    format: DenseCellFormat,
+    cell: Expr,
+) {
+    match format {
+        DenseCellFormat::Scalar => {
+            let (name, indices, value) = parse_cell(cell);
+            assert_eq!(name, expected_name, "input cell name changed");
+            tensor.set(&indices, value);
+        }
+        DenseCellFormat::Strip16 => {
+            let shape = tensor.shape.clone();
+            let rank = shape.len();
+            assert!(rank > 0, "dense16 tensor input needs rank >= 1");
+            let last_dim = shape[rank - 1];
+            assert!(last_dim > 0, "dense16 tensor input last dimension is empty");
+            let (name, mut indices, strip, values) = parse_strip_cell(cell, rank);
+            assert_eq!(name, expected_name, "input cell name changed");
+            assert_eq!(
+                indices.len(),
+                rank - 1,
+                "dense16 tensor cell prefix rank changed"
+            );
+            for (axis, (&index, &dim)) in indices.iter().zip(&shape).enumerate() {
+                assert!(
+                    index < dim,
+                    "dense16 index {index} on axis {axis} is outside dimension {dim}"
+                );
+            }
+            let start = strip * DENSE_STRIP_WIDTH;
+            assert!(
+                start < last_dim,
+                "dense16 strip {strip} starts outside last dimension {last_dim}"
+            );
+            let expected_values = DENSE_STRIP_WIDTH.min(last_dim - start);
+            assert_eq!(
+                values.len(),
+                expected_values,
+                "dense16 strip {strip} must contain {expected_values} values"
+            );
+            indices.push(start);
+            for (offset, value) in values.into_iter().enumerate() {
+                let last_axis = indices.len() - 1;
+                indices[last_axis] = start + offset;
+                tensor.set(&indices, value);
+            }
+        }
+    }
+}
+
 fn write_symbol(buf: &mut Vec<u8>, symbol: &str) {
     assert!(
         !symbol.is_empty() && symbol.len() < 64,
@@ -162,6 +264,15 @@ fn write_symbol(buf: &mut Vec<u8>, symbol: &str) {
     );
     buf.push(item_byte(Tag::SymbolSize(symbol.len() as u8)));
     buf.extend_from_slice(symbol.as_bytes());
+}
+
+fn write_f32_symbol(buf: &mut Vec<u8>, value: f32) {
+    let value = if value == 0.0 {
+        "0".to_string()
+    } else {
+        value.to_string()
+    };
+    write_symbol(buf, &value);
 }
 
 fn write_tensor_cell(buf: &mut Vec<u8>, name: &str, indices: &[usize], value: f32) {
@@ -172,12 +283,34 @@ fn write_tensor_cell(buf: &mut Vec<u8>, name: &str, indices: &[usize], value: f3
     for index in indices {
         write_symbol(buf, &index.to_string());
     }
-    let value = if value == 0.0 {
-        "0".to_string()
-    } else {
-        value.to_string()
-    };
-    write_symbol(buf, &value);
+    write_f32_symbol(buf, value);
+}
+
+fn write_tensor_strip_cell(
+    buf: &mut Vec<u8>,
+    name: &str,
+    base_indices: &[usize],
+    strip: usize,
+    values: &[f32],
+) {
+    assert!(
+        (1..=DENSE_STRIP_WIDTH).contains(&values.len()),
+        "dense16 strip must contain 1..={DENSE_STRIP_WIDTH} values"
+    );
+    let arity = base_indices.len() + values.len() + 2;
+    assert!(
+        arity < 64,
+        "dense16 tensor cell arity is too large: {arity}"
+    );
+    buf.push(item_byte(Tag::Arity(arity as u8)));
+    write_symbol(buf, name);
+    for index in base_indices {
+        write_symbol(buf, &index.to_string());
+    }
+    write_symbol(buf, &strip.to_string());
+    for &value in values {
+        write_f32_symbol(buf, value);
+    }
 }
 
 pub(crate) fn tensor_cell_prefix(name: &str, rank: usize) -> &'static [u8] {
@@ -187,6 +320,40 @@ pub(crate) fn tensor_cell_prefix(name: &str, rank: usize) -> &'static [u8] {
     prefix.push(item_byte(Tag::Arity(arity as u8)));
     write_symbol(&mut prefix, name);
     Box::leak(prefix.into_boxed_slice())
+}
+
+pub(crate) fn tensor_strip_cell_prefix(
+    name: &str,
+    rank: usize,
+    value_count: usize,
+) -> &'static [u8] {
+    assert!(rank > 0, "dense16 tensor cells need rank >= 1");
+    assert!(
+        (1..=DENSE_STRIP_WIDTH).contains(&value_count),
+        "dense16 strip prefix needs 1..={DENSE_STRIP_WIDTH} values, got {value_count}"
+    );
+    let mut prefix = Vec::new();
+    let arity = rank + value_count + 1;
+    assert!(
+        arity < 64,
+        "dense16 tensor cell arity is too large: {arity}"
+    );
+    prefix.push(item_byte(Tag::Arity(arity as u8)));
+    write_symbol(&mut prefix, name);
+    Box::leak(prefix.into_boxed_slice())
+}
+
+pub(crate) fn dense_cell_prefixes(
+    name: &str,
+    rank: usize,
+    format: DenseCellFormat,
+) -> Vec<&'static [u8]> {
+    match format {
+        DenseCellFormat::Scalar => vec![tensor_cell_prefix(name, rank)],
+        DenseCellFormat::Strip16 => (1..=DENSE_STRIP_WIDTH)
+            .map(|value_count| tensor_strip_cell_prefix(name, rank, value_count))
+            .collect(),
+    }
 }
 
 fn linear_to_index(mut linear: usize, shape: &[usize], out: &mut [usize]) {
@@ -208,6 +375,35 @@ pub(crate) fn validate_tensor_cell_template(template: Expr, name: &str, rank: us
         rank + 2,
         "input cell template rank does not match input declaration"
     );
+}
+
+pub(crate) fn validate_dense_cell_template(
+    template: Expr,
+    name: &str,
+    rank: usize,
+    format: DenseCellFormat,
+) {
+    match format {
+        DenseCellFormat::Scalar => validate_tensor_cell_template(template, name, rank),
+        DenseCellFormat::Strip16 => {
+            assert!(rank > 0, "dense16 tensor cell template needs rank >= 1");
+            let cell_args = expr_args(template);
+            assert_eq!(
+                symbol_string(cell_args[0]),
+                name,
+                "input cell template name does not match input declaration"
+            );
+            assert!(
+                cell_args.len() > rank + 1,
+                "dense16 tensor cell template rank does not match input declaration"
+            );
+            let value_count = cell_args.len().checked_sub(rank + 1).unwrap_or(0);
+            assert!(
+                (1..=DENSE_STRIP_WIDTH).contains(&value_count),
+                "dense16 tensor cell template must carry 1..={DENSE_STRIP_WIDTH} values, got {value_count}"
+            );
+        }
+    }
 }
 
 fn flatten_csr_row(indices: &[usize], shape: &[usize]) -> usize {
@@ -268,6 +464,7 @@ pub(crate) enum EinsumInput {
     Dense {
         name: String,
         tensor: Dense<f32>,
+        format: DenseCellFormat,
     },
     Csr {
         name: String,
@@ -280,9 +477,10 @@ pub(crate) enum EinsumInput {
 impl EinsumInput {
     pub(crate) fn new(kind: TensorInputKind, name: String, shape: Vec<usize>) -> Self {
         match kind {
-            TensorInputKind::Dense => Self::Dense {
+            TensorInputKind::Dense | TensorInputKind::Dense16 => Self::Dense {
                 name,
                 tensor: Dense::<f32>::zeros(shape),
+                format: dense_format_for_input_kind(kind).unwrap(),
             },
             TensorInputKind::Csr => {
                 assert!(
@@ -312,11 +510,35 @@ impl EinsumInput {
         }
     }
 
-    pub(crate) fn prefix(&self) -> &'static [u8] {
-        tensor_cell_prefix(self.name(), self.shape().len())
+    pub(crate) fn cell_format(&self) -> DenseCellFormat {
+        match self {
+            Self::Dense { format, .. } => *format,
+            Self::Csr { .. } => DenseCellFormat::Scalar,
+        }
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn prefixes(&self) -> Vec<&'static [u8]> {
+        match self {
+            Self::Dense {
+                name,
+                tensor,
+                format,
+            } => dense_cell_prefixes(name, tensor.shape.len(), *format),
+            Self::Csr { name, shape, .. } => vec![tensor_cell_prefix(name, shape.len())],
+        }
+    }
+
+    pub(crate) fn prefix_count(&self) -> usize {
+        match self {
+            Self::Dense { format, .. } => match format {
+                DenseCellFormat::Scalar => 1,
+                DenseCellFormat::Strip16 => DENSE_STRIP_WIDTH,
+            },
+            Self::Csr { .. } => 1,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
         match self {
             Self::Dense { tensor, .. } => tensor.clear(),
             Self::Csr {
@@ -369,17 +591,37 @@ impl EinsumInput {
         }
     }
 
+    pub(crate) fn set_cell(&mut self, cell: Expr) {
+        match self {
+            Self::Dense {
+                name,
+                tensor,
+                format,
+            } => set_dense_cell(tensor, name, *format, cell),
+            Self::Csr { .. } => {
+                let (name, indices, value) = parse_cell(cell);
+                assert_eq!(name, self.name(), "input cell name changed");
+                self.set(indices, value);
+            }
+        }
+    }
+
     pub(crate) fn load_from_zipper<Z>(&mut self, rz: &mut Z)
     where
         Z: ZipperAbsolutePath + ZipperIteration + ZipperValues<()>,
     {
         self.clear();
+        self.load_from_zipper_append(rz);
+    }
+
+    pub(crate) fn load_from_zipper_append<Z>(&mut self, rz: &mut Z)
+    where
+        Z: ZipperAbsolutePath + ZipperIteration + ZipperValues<()>,
+    {
         while rz.to_next_val() {
-            let (name, indices, value) = parse_cell(Expr {
+            self.set_cell(Expr {
                 ptr: rz.origin_path().as_ptr().cast_mut(),
             });
-            assert_eq!(name, self.name(), "input cell name changed");
-            self.set(indices, value);
         }
     }
 }
@@ -458,8 +700,29 @@ pub(crate) fn write_dense_output_cells(
     output_name: &str,
     output_kind: TensorOutputKind,
 ) -> bool {
-    wz.reset();
     let root_len = wz.root_prefix_path().len();
+    let mut changed = clear_dense_output_prefix(wz);
+
+    let mut indices = vec![0usize; output.shape.len()];
+    let mut encoded = Vec::new();
+
+    for linear in 0..output.data.len() {
+        let value = output.data[linear];
+        if !output_kind.should_emit(value) {
+            continue;
+        }
+        linear_to_index(linear, &output.shape, &mut indices);
+        encoded.clear();
+        write_tensor_cell(&mut encoded, output_name, &indices, value);
+        wz.move_to_path(&encoded[root_len..]);
+        changed |= crate::sinks::set_btm_val_and_note(wz, &encoded);
+    }
+
+    changed
+}
+
+fn clear_dense_output_prefix(wz: &mut WriteZipperTracked<'_, '_, ()>) -> bool {
+    wz.reset();
     let removed_paths = {
         let root = wz.root_prefix_path().to_vec();
         let root_had_value = wz.val().is_some();
@@ -479,25 +742,51 @@ pub(crate) fn write_dense_output_cells(
         }
         paths
     };
-    let mut changed = wz.val().is_some() || wz.child_mask().count_bits() != 0;
+    let changed = wz.val().is_some() || wz.child_mask().count_bits() != 0;
     wz.graft_map(PathMap::new());
     for path in &removed_paths {
         crate::space::stratified_note_btm_remove(path, true);
     }
+    changed
+}
 
-    let mut indices = vec![0usize; output.shape.len()];
+pub(crate) fn write_dense16_output_cells_for_value_count(
+    wz: &mut WriteZipperTracked<'_, '_, ()>,
+    output: &Dense<f32>,
+    output_name: &str,
+    value_count: usize,
+) -> bool {
+    assert!(
+        (1..=DENSE_STRIP_WIDTH).contains(&value_count),
+        "dense16 output writer needs 1..={DENSE_STRIP_WIDTH} values, got {value_count}"
+    );
+    let root_len = wz.root_prefix_path().len();
+    let mut changed = clear_dense_output_prefix(wz);
+    let rank = output.shape.len();
+    assert!(rank > 0, "dense16 output needs rank >= 1");
+    let last_dim = output.shape[rank - 1];
+    assert!(last_dim > 0, "dense16 output last dimension is empty");
+    let row_count = output.data.len() / last_dim;
+    let row_shape = &output.shape[..rank - 1];
+    let mut base_indices = vec![0usize; rank - 1];
     let mut encoded = Vec::new();
 
-    for linear in 0..output.data.len() {
-        let value = output.data[linear];
-        if !output_kind.should_emit(value) {
-            continue;
+    for row in 0..row_count {
+        linear_to_index(row, row_shape, &mut base_indices);
+        let row_start = row * last_dim;
+        for strip_start in (0..last_dim).step_by(DENSE_STRIP_WIDTH) {
+            let strip_values = DENSE_STRIP_WIDTH.min(last_dim - strip_start);
+            if strip_values != value_count {
+                continue;
+            }
+            let strip = strip_start / DENSE_STRIP_WIDTH;
+            let values =
+                &output.data[row_start + strip_start..row_start + strip_start + strip_values];
+            encoded.clear();
+            write_tensor_strip_cell(&mut encoded, output_name, &base_indices, strip, values);
+            wz.move_to_path(&encoded[root_len..]);
+            changed |= crate::sinks::set_btm_val_and_note(wz, &encoded);
         }
-        linear_to_index(linear, &output.shape, &mut indices);
-        encoded.clear();
-        write_tensor_cell(&mut encoded, output_name, &indices, value);
-        wz.move_to_path(&encoded[root_len..]);
-        changed |= crate::sinks::set_btm_val_and_note(wz, &encoded);
     }
 
     changed
@@ -521,6 +810,7 @@ pub(crate) fn parse_expr_group(e: Expr, names: &[&str], label: &str) -> Vec<Expr
 #[derive(Debug, Clone)]
 pub(crate) struct TensorOpOutputDecl {
     kind: TensorOutputKind,
+    format: DenseCellFormat,
     name: String,
     shape: Option<Vec<usize>>,
 }
@@ -579,11 +869,12 @@ fn parse_tensor_op_input_decl(e: Expr) -> (TensorInputKind, String, Vec<usize>) 
     let args = expr_args(e);
     assert!(
         args.len() >= 3,
-        "tensor-op-f32 input declaration must be shaped like (Name dense dim...) or (Name csr dim...)"
+        "tensor-op-f32 input declaration must be shaped like (Name dense dim...), (Name dense16 dim...), or (Name csr dim...)"
     );
     let name = symbol_string(args[0]);
     let kind = match symbol_string(args[1]).as_str() {
         "dense" => TensorInputKind::Dense,
+        "dense16" => TensorInputKind::Dense16,
         "csr" => TensorInputKind::Csr,
         kind => panic!("unsupported tensor-op-f32 input kind {kind:?}"),
     };
@@ -595,12 +886,13 @@ fn parse_tensor_op_output_decl(e: Expr) -> TensorOpOutputDecl {
     let args = expr_args(e);
     assert!(
         args.len() >= 2,
-        "tensor-op-f32 output declaration must be shaped like (Name dense [dim...]) or (Name nonzero [dim...])"
+        "tensor-op-f32 output declaration must be shaped like (Name dense [dim...]), (Name dense16 [dim...]), or (Name nonzero [dim...])"
     );
     let name = symbol_string(args[0]);
-    let kind = match symbol_string(args[1]).as_str() {
-        "dense" => TensorOutputKind::Dense,
-        "nonzero" | "sparse" => TensorOutputKind::NonZero,
+    let (kind, format) = match symbol_string(args[1]).as_str() {
+        "dense" => (TensorOutputKind::Dense, DenseCellFormat::Scalar),
+        "dense16" => (TensorOutputKind::Dense, DenseCellFormat::Strip16),
+        "nonzero" | "sparse" => (TensorOutputKind::NonZero, DenseCellFormat::Scalar),
         kind => panic!("unsupported tensor-op-f32 output kind {kind:?}"),
     };
     let shape = if args.len() == 2 {
@@ -608,7 +900,12 @@ fn parse_tensor_op_output_decl(e: Expr) -> TensorOpOutputDecl {
     } else {
         Some(args[2..].iter().map(|&arg| symbol_usize(arg)).collect())
     };
-    TensorOpOutputDecl { kind, name, shape }
+    TensorOpOutputDecl {
+        kind,
+        format,
+        name,
+        shape,
+    }
 }
 
 fn validate_backend_clause(args: &[Expr]) {
@@ -648,9 +945,9 @@ fn infer_attention_output_shape(input_decls: &[Expr]) -> Vec<usize> {
         3,
         "attention tensor-op-f32 needs Q, K, and V input declarations"
     );
-    let (_, q_shape) = parse_dense_input_decl(input_decls[0]);
-    let (_, k_shape) = parse_dense_input_decl(input_decls[1]);
-    let (_, v_shape) = parse_dense_input_decl(input_decls[2]);
+    let (_, q_shape) = parse_scalar_dense_input_decl(input_decls[0]);
+    let (_, k_shape) = parse_scalar_dense_input_decl(input_decls[1]);
+    let (_, v_shape) = parse_scalar_dense_input_decl(input_decls[2]);
     assert_eq!(
         q_shape.len(),
         4,
@@ -711,8 +1008,8 @@ fn infer_add_output_shape(input_decls: &[Expr]) -> Vec<usize> {
         2,
         "add tensor-op-f32 needs two input declarations"
     );
-    let (_, lhs_shape) = parse_dense_input_decl(input_decls[0]);
-    let (_, rhs_shape) = parse_dense_input_decl(input_decls[1]);
+    let (_, lhs_shape, _) = parse_dense_input_decl(input_decls[0]);
+    let (_, rhs_shape, _) = parse_dense_input_decl(input_decls[1]);
     assert_eq!(
         rhs_shape, lhs_shape,
         "add tensor-op-f32 input shapes must match"
@@ -726,9 +1023,9 @@ fn infer_layernorm_output_shape(input_decls: &[Expr]) -> Vec<usize> {
         3,
         "layernorm tensor-op-f32 needs X, G, and B input declarations"
     );
-    let (_, x_shape) = parse_dense_input_decl(input_decls[0]);
-    let (_, gamma_shape) = parse_dense_input_decl(input_decls[1]);
-    let (_, beta_shape) = parse_dense_input_decl(input_decls[2]);
+    let (_, x_shape, _) = parse_dense_input_decl(input_decls[0]);
+    let (_, gamma_shape, _) = parse_dense_input_decl(input_decls[1]);
+    let (_, beta_shape, _) = parse_dense_input_decl(input_decls[2]);
     let hidden = last_axis_len("layernorm", &x_shape);
     assert_eq!(
         gamma_shape.as_slice(),
@@ -749,7 +1046,7 @@ fn infer_unary_dense_output_shape(op_name: &str, input_decls: &[Expr]) -> Vec<us
         1,
         "{op_name} tensor-op-f32 needs one input declaration"
     );
-    let (_, shape) = parse_dense_input_decl(input_decls[0]);
+    let (_, shape, _) = parse_dense_input_decl(input_decls[0]);
     if op_name == "softmax" {
         last_axis_len(op_name, &shape);
     }
@@ -775,7 +1072,7 @@ fn infer_reshape_output_shape(input_decls: &[Expr], output: &TensorOpOutputDecl)
         1,
         "reshape tensor-op-f32 needs one input declaration"
     );
-    let (_, input_shape) = parse_dense_input_decl(input_decls[0]);
+    let (_, input_shape, _) = parse_dense_input_decl(input_decls[0]);
     let output_shape = output
         .shape
         .clone()
@@ -868,6 +1165,7 @@ pub(crate) struct TensorOpF32Syntax {
     op_args: Vec<Expr>,
     input_decls: Vec<Expr>,
     pub(crate) output_kind: TensorOutputKind,
+    pub(crate) output_format: DenseCellFormat,
     pub(crate) output_name: String,
     pub(crate) output_shape: Vec<usize>,
     cell_templates: Vec<Expr>,
@@ -941,14 +1239,19 @@ impl TensorOpF32Syntax {
             op_args,
             input_decls,
             output_kind,
+            output_format: output.format,
             output_name: output.name,
             output_shape,
             cell_templates,
         }
     }
 
-    pub(crate) fn output_prefix(&self) -> &'static [u8] {
-        tensor_cell_prefix(&self.output_name, self.output_shape.len())
+    pub(crate) fn output_prefixes(&self) -> Vec<&'static [u8]> {
+        dense_cell_prefixes(
+            &self.output_name,
+            self.output_shape.len(),
+            self.output_format,
+        )
     }
 
     pub(crate) fn matched_cells(e: Expr) -> Vec<Expr> {
@@ -967,12 +1270,20 @@ impl TensorOpF32Syntax {
     }
 }
 
-fn parse_dense_input_decl(e: Expr) -> (String, Vec<usize>) {
+fn parse_dense_input_decl(e: Expr) -> (String, Vec<usize>, DenseCellFormat) {
+    let (kind, name, shape) = parse_tensor_op_input_decl(e);
+    let Some(format) = dense_format_for_input_kind(kind) else {
+        panic!("this tensor-op-f32 operator only accepts dense inputs")
+    };
+    (name, shape, format)
+}
+
+fn parse_scalar_dense_input_decl(e: Expr) -> (String, Vec<usize>) {
     let (kind, name, shape) = parse_tensor_op_input_decl(e);
     assert_eq!(
-        kind,
-        TensorInputKind::Dense,
-        "this tensor-op-f32 operator only accepts dense inputs"
+        dense_format_for_input_kind(kind),
+        Some(DenseCellFormat::Scalar),
+        "this tensor-op-f32 operator only accepts scalar dense inputs"
     );
     (name, shape)
 }
@@ -980,13 +1291,15 @@ fn parse_dense_input_decl(e: Expr) -> (String, Vec<usize>) {
 struct DenseTensorInput {
     name: String,
     tensor: Dense<f32>,
+    format: DenseCellFormat,
 }
 
 impl DenseTensorInput {
-    fn new(name: String, shape: Vec<usize>) -> Self {
+    fn new(name: String, shape: Vec<usize>, format: DenseCellFormat) -> Self {
         Self {
             name,
             tensor: Dense::<f32>::zeros(shape),
+            format,
         }
     }
 
@@ -995,16 +1308,14 @@ impl DenseTensorInput {
     }
 
     fn set(&mut self, cell: Expr) {
-        let (name, indices, value) = parse_cell(cell);
-        assert_eq!(name, self.name, "input cell name changed");
-        self.tensor.set(&indices, value);
+        set_dense_cell(&mut self.tensor, &self.name, self.format, cell);
     }
 }
 
 fn build_dense_tensor_input(decl: Expr, template: Expr) -> DenseTensorInput {
-    let (name, shape) = parse_dense_input_decl(decl);
-    validate_tensor_cell_template(template, &name, shape.len());
-    DenseTensorInput::new(name, shape)
+    let (name, shape, format) = parse_dense_input_decl(decl);
+    validate_dense_cell_template(template, &name, shape.len(), format);
+    DenseTensorInput::new(name, shape, format)
 }
 
 enum TensorOpF32Kernel {
@@ -1085,7 +1396,12 @@ impl TensorOpF32Plan {
                 for (decl, template) in syntax.input_decls.iter().zip(&syntax.cell_templates) {
                     let (kind, name, shape) = parse_tensor_op_input_decl(*decl);
                     let input = EinsumInput::new(kind, name, shape);
-                    validate_tensor_cell_template(*template, input.name(), input.shape().len());
+                    validate_dense_cell_template(
+                        *template,
+                        input.name(),
+                        input.shape().len(),
+                        input.cell_format(),
+                    );
                     inputs.push(input);
                 }
                 TensorOpF32Kernel::Einsum {
@@ -1114,10 +1430,15 @@ impl TensorOpF32Plan {
                     3,
                     "attention tensor-op-f32 needs Q, K, and V cell templates"
                 );
+                assert_eq!(
+                    syntax.output_format,
+                    DenseCellFormat::Scalar,
+                    "attention tensor-op-f32 currently supports scalar output cells only"
+                );
 
-                let (q_name, q_shape) = parse_dense_input_decl(syntax.input_decls[0]);
-                let (k_name, k_shape) = parse_dense_input_decl(syntax.input_decls[1]);
-                let (v_name, v_shape) = parse_dense_input_decl(syntax.input_decls[2]);
+                let (q_name, q_shape) = parse_scalar_dense_input_decl(syntax.input_decls[0]);
+                let (k_name, k_shape) = parse_scalar_dense_input_decl(syntax.input_decls[1]);
+                let (v_name, v_shape) = parse_scalar_dense_input_decl(syntax.input_decls[2]);
                 validate_attention_shapes(&q_shape, &k_shape, &v_shape, &syntax.output_shape);
                 validate_tensor_cell_template(syntax.cell_templates[0], &q_name, q_shape.len());
                 validate_tensor_cell_template(syntax.cell_templates[1], &k_name, k_shape.len());
@@ -1261,16 +1582,18 @@ impl TensorOpF32Plan {
     pub(crate) fn direct_input_prefixes(&self) -> Vec<&'static [u8]> {
         match &self.kernel {
             TensorOpF32Kernel::Einsum { inputs, .. } => {
-                inputs.iter().map(EinsumInput::prefix).collect()
+                inputs.iter().flat_map(EinsumInput::prefixes).collect()
             }
             _ => Vec::new(),
         }
     }
 
-    pub(crate) fn direct_input_count(&self) -> usize {
+    pub(crate) fn direct_input_prefix_counts(&self) -> Vec<usize> {
         match &self.kernel {
-            TensorOpF32Kernel::Einsum { inputs, .. } => inputs.len(),
-            _ => 0,
+            TensorOpF32Kernel::Einsum { inputs, .. } => {
+                inputs.iter().map(EinsumInput::prefix_count).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -1278,12 +1601,19 @@ impl TensorOpF32Plan {
         matches!(self.kernel, TensorOpF32Kernel::Einsum { .. })
     }
 
+    pub(crate) fn clear_direct_input(&mut self, index: usize) {
+        match &mut self.kernel {
+            TensorOpF32Kernel::Einsum { inputs, .. } => inputs[index].clear(),
+            _ => unreachable!("only einsum tensor-op-f32 uses direct input scans"),
+        }
+    }
+
     pub(crate) fn load_direct_input_from_zipper<Z>(&mut self, index: usize, rz: &mut Z)
     where
         Z: ZipperAbsolutePath + ZipperIteration + ZipperValues<()>,
     {
         match &mut self.kernel {
-            TensorOpF32Kernel::Einsum { inputs, .. } => inputs[index].load_from_zipper(rz),
+            TensorOpF32Kernel::Einsum { inputs, .. } => inputs[index].load_from_zipper_append(rz),
             _ => unreachable!("only einsum tensor-op-f32 uses direct input scans"),
         }
     }
@@ -1297,9 +1627,7 @@ impl TensorOpF32Plan {
                     "einsum tensor-op-f32 cell count changed"
                 );
                 for (input, &cell) in inputs.iter_mut().zip(cells) {
-                    let (name, indices, value) = parse_cell(cell);
-                    assert_eq!(name, input.name(), "input cell name changed");
-                    input.set(indices, value);
+                    input.set_cell(cell);
                 }
             }
             TensorOpF32Kernel::AttentionScaledDot(kernel) => {

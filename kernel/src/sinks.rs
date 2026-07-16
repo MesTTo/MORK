@@ -35,10 +35,11 @@ use crate::{expr, pure};
 use crate::space::ACT_PATH;
 #[cfg(feature = "einsum")]
 use crate::tensor_ops::{
-    expr_args, parse_cell, parse_input_tensor_decl, parse_output_tensor_decl, parse_tensor_decl,
-    softmax_attention_rows, symbol_string, tensor_cell_prefix, validate_attention_shapes,
-    validate_tensor_cell_template, write_dense_output_cells, EinsumInput, TensorOpF32Plan,
-    TensorOpF32Syntax, TensorOutputKind,
+    dense_cell_prefixes, expr_args, parse_cell, parse_input_tensor_decl, parse_output_tensor_decl,
+    parse_tensor_decl, softmax_attention_rows, symbol_string, validate_attention_shapes,
+    validate_dense_cell_template, validate_tensor_cell_template,
+    write_dense16_output_cells_for_value_count, write_dense_output_cells, DenseCellFormat,
+    EinsumInput, TensorOpF32Plan, TensorOpF32Syntax, TensorOutputKind, DENSE_STRIP_WIDTH,
 };
 #[cfg(feature = "einsum")]
 use linalg::dense::Dense;
@@ -2053,7 +2054,49 @@ fn load_einsum_input_from_resource<'w, 'a, 'k>(
         unreachable!()
     };
     let mut rz = wz.fork_read_zipper();
-    input.load_from_zipper(&mut rz);
+    input.load_from_zipper_append(&mut rz);
+}
+
+#[cfg(feature = "einsum")]
+fn write_tensor_output_from_resources<'w, 'a, 'k, It>(
+    it: &mut It,
+    output: &Dense<f32>,
+    output_name: &str,
+    output_kind: TensorOutputKind,
+    output_format: DenseCellFormat,
+) -> bool
+where
+    'a: 'w,
+    'k: 'w,
+    It: Iterator<Item = WriteResource<'w, 'a, 'k>>,
+{
+    match output_format {
+        DenseCellFormat::Scalar => {
+            let WriteResource::BTM(wz) = it.next().unwrap() else {
+                unreachable!()
+            };
+            write_dense_output_cells(wz, output, output_name, output_kind)
+        }
+        DenseCellFormat::Strip16 => {
+            assert!(
+                matches!(output_kind, TensorOutputKind::Dense),
+                "dense16 output does not support sparse emit modes"
+            );
+            let mut changed = false;
+            for value_count in 1..=DENSE_STRIP_WIDTH {
+                let WriteResource::BTM(wz) = it.next().unwrap() else {
+                    unreachable!()
+                };
+                changed |= write_dense16_output_cells_for_value_count(
+                    wz,
+                    output,
+                    output_name,
+                    value_count,
+                );
+            }
+            changed
+        }
+    }
 }
 
 /// Generic f32 tensor operator sink.
@@ -2062,8 +2105,9 @@ pub struct TensorOpF32Sink {
     op: TensorOpF32Plan,
     output_name: String,
     output_kind: TensorOutputKind,
+    output_format: DenseCellFormat,
     output_shape: Vec<usize>,
-    output_prefix: &'static [u8],
+    output_prefixes: Vec<&'static [u8]>,
     seen: bool,
 }
 
@@ -2072,14 +2116,15 @@ impl Sink for TensorOpF32Sink {
     fn new(e: Expr) -> Self {
         let syntax = TensorOpF32Syntax::parse(e);
         let op = TensorOpF32Plan::from_syntax(&syntax);
-        let output_prefix = syntax.output_prefix();
+        let output_prefixes = syntax.output_prefixes();
 
         Self {
             op,
             output_name: syntax.output_name,
             output_kind: syntax.output_kind,
+            output_format: syntax.output_format,
             output_shape: syntax.output_shape,
-            output_prefix,
+            output_prefixes,
             seen: false,
         }
     }
@@ -2089,7 +2134,7 @@ impl Sink for TensorOpF32Sink {
             .direct_input_prefixes()
             .into_iter()
             .map(WriteResourceRequest::BTM)
-            .chain(std::iter::once(WriteResourceRequest::BTM(self.output_prefix)))
+            .chain(self.output_prefixes.iter().copied().map(WriteResourceRequest::BTM))
     }
 
     fn sink<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It, path: &[u8], _read: &PathMap<()>) where 'a: 'w, 'k: 'w {
@@ -2107,22 +2152,33 @@ impl Sink for TensorOpF32Sink {
             return false;
         }
 
-        for input_index in 0..self.op.direct_input_count() {
-            let Some(resource) = it.next() else {
-                panic!("tensor-op-f32 missing direct input resource {input_index}");
-            };
-            let WriteResource::BTM(wz) = resource else {
-                unreachable!()
-            };
-            let mut rz = wz.fork_read_zipper();
-            self.op.load_direct_input_from_zipper(input_index, &mut rz);
+        for (input_index, prefix_count) in self
+            .op
+            .direct_input_prefix_counts()
+            .into_iter()
+            .enumerate()
+        {
+            self.op.clear_direct_input(input_index);
+            for _ in 0..prefix_count {
+                let Some(resource) = it.next() else {
+                    panic!("tensor-op-f32 missing direct input resource {input_index}");
+                };
+                let WriteResource::BTM(wz) = resource else {
+                    unreachable!()
+                };
+                let mut rz = wz.fork_read_zipper();
+                self.op.load_direct_input_from_zipper(input_index, &mut rz);
+            }
         }
 
         let output = self.op.run(&self.output_shape);
-        let WriteResource::BTM(wz) = it.next().unwrap() else {
-            unreachable!()
-        };
-        write_dense_output_cells(wz, &output, &self.output_name, self.output_kind)
+        write_tensor_output_from_resources(
+            &mut it,
+            &output,
+            &self.output_name,
+            self.output_kind,
+            self.output_format,
+        )
     }
 }
 
@@ -2133,8 +2189,9 @@ pub struct EinsumF32Sink {
     plan: Option<EinsumF32Plan>,
     output_name: String,
     output_kind: TensorOutputKind,
+    output_format: DenseCellFormat,
     output_shape: Vec<usize>,
-    output_prefix: &'static [u8],
+    output_prefixes: Vec<&'static [u8]>,
     inputs: Vec<EinsumInput>,
     seen: bool,
 }
@@ -2156,15 +2213,16 @@ impl Sink for EinsumF32Sink {
             inputs.push(EinsumInput::new(kind, name, shape));
         }
 
-        let (output_kind, output_name, output_shape) =
+        let (output_kind, output_format, output_name, output_shape) =
             parse_output_tensor_decl(args[2 + input_count]);
-        let output_prefix = tensor_cell_prefix(&output_name, output_shape.len());
+        let output_prefixes = dense_cell_prefixes(&output_name, output_shape.len(), output_format);
 
         for i in 0..input_count {
-            validate_tensor_cell_template(
+            validate_dense_cell_template(
                 args[3 + input_count + i],
                 inputs[i].name(),
                 inputs[i].shape().len(),
+                inputs[i].cell_format(),
             );
         }
         Self {
@@ -2172,8 +2230,9 @@ impl Sink for EinsumF32Sink {
             plan: None,
             output_name,
             output_kind,
+            output_format,
             output_shape,
-            output_prefix,
+            output_prefixes,
             inputs,
             seen: false,
         }
@@ -2182,8 +2241,9 @@ impl Sink for EinsumF32Sink {
     fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
         self.inputs
             .iter()
-            .map(|input| WriteResourceRequest::BTM(input.prefix()))
-            .chain(std::iter::once(WriteResourceRequest::BTM(self.output_prefix)))
+            .flat_map(EinsumInput::prefixes)
+            .map(WriteResourceRequest::BTM)
+            .chain(self.output_prefixes.iter().copied().map(WriteResourceRequest::BTM))
     }
 
     fn sink<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It, _path: &[u8], _read: &PathMap<()>) where 'a: 'w, 'k: 'w {
@@ -2196,10 +2256,13 @@ impl Sink for EinsumF32Sink {
         }
 
         for (input_index, input) in self.inputs.iter_mut().enumerate() {
-            let Some(resource) = it.next() else {
-                panic!("einsum-f32 missing input resource {input_index}");
-            };
-            load_einsum_input_from_resource(input, resource);
+            input.clear();
+            for _ in 0..input.prefix_count() {
+                let Some(resource) = it.next() else {
+                    panic!("einsum-f32 missing input resource {input_index}");
+                };
+                load_einsum_input_from_resource(input, resource);
+            }
         }
 
         let mut output = Dense::<f32>::zeros(self.output_shape.clone());
@@ -2226,10 +2289,13 @@ impl Sink for EinsumF32Sink {
             trace!(target: "sink", "einsum-f32 selected backend {:?}", plan.backend());
         }
 
-        let WriteResource::BTM(wz) = it.next().unwrap() else {
-            unreachable!()
-        };
-        write_dense_output_cells(wz, &output, &self.output_name, self.output_kind)
+        write_tensor_output_from_resources(
+            &mut it,
+            &output,
+            &self.output_name,
+            self.output_kind,
+            self.output_format,
+        )
     }
 }
 
@@ -2245,7 +2311,7 @@ pub struct AttentionF32Sink {
     output_name: String,
     output_kind: TensorOutputKind,
     output_shape: Vec<usize>,
-    output_prefix: &'static [u8],
+    output_prefixes: Vec<&'static [u8]>,
     q: Dense<f32>,
     k: Dense<f32>,
     v: Dense<f32>,
@@ -2266,14 +2332,19 @@ impl Sink for AttentionF32Sink {
         let (q_name, q_shape) = parse_tensor_decl(args[1]);
         let (k_name, k_shape) = parse_tensor_decl(args[2]);
         let (v_name, v_shape) = parse_tensor_decl(args[3]);
-        let (output_kind, output_name, output_shape) = parse_output_tensor_decl(args[4]);
+        let (output_kind, output_format, output_name, output_shape) = parse_output_tensor_decl(args[4]);
+        assert_eq!(
+            output_format,
+            DenseCellFormat::Scalar,
+            "attention-f32 currently supports scalar output cells only"
+        );
         validate_attention_shapes(&q_shape, &k_shape, &v_shape, &output_shape);
 
         validate_tensor_cell_template(args[5], &q_name, q_shape.len());
         validate_tensor_cell_template(args[6], &k_name, k_shape.len());
         validate_tensor_cell_template(args[7], &v_name, v_shape.len());
 
-        let output_prefix = tensor_cell_prefix(&output_name, output_shape.len());
+        let output_prefixes = dense_cell_prefixes(&output_name, output_shape.len(), output_format);
         let q = Dense::<f32>::zeros(q_shape);
         let k = Dense::<f32>::zeros(k_shape);
         let v = Dense::<f32>::zeros(v_shape);
@@ -2290,7 +2361,7 @@ impl Sink for AttentionF32Sink {
             output_name,
             output_kind,
             output_shape,
-            output_prefix,
+            output_prefixes,
             q,
             k,
             v,
@@ -2300,7 +2371,7 @@ impl Sink for AttentionF32Sink {
     }
 
     fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
-        std::iter::once(WriteResourceRequest::BTM(self.output_prefix))
+        self.output_prefixes.iter().copied().map(WriteResourceRequest::BTM)
     }
 
     fn sink<'w, 'a, 'k, It: Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It, path: &[u8], _read: &PathMap<()>) where 'a: 'w, 'k: 'w {
@@ -2373,10 +2444,13 @@ impl Sink for AttentionF32Sink {
             trace!(target: "sink", "attention-f32 value backend {:?}", value_plan.backend());
         }
 
-        let WriteResource::BTM(wz) = it.next().unwrap() else {
-            unreachable!()
-        };
-        write_dense_output_cells(wz, &output, &self.output_name, self.output_kind)
+        write_tensor_output_from_resources(
+            &mut it,
+            &output,
+            &self.output_name,
+            self.output_kind,
+            DenseCellFormat::Scalar,
+        )
     }
 }
 
