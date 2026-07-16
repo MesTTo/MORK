@@ -121,6 +121,66 @@ impl Reduce {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Type-level semiring (VM monomorphisation)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The reduce operator lifted to a type, so the VM inner loop inlines it as
+/// an instruction instead of re-branching on a `Reduce` field per element.
+pub(crate) trait ReduceOp<T: Scalar> {
+    /// Whether this is `Reduce::Sum`. Half of the `skip_missing` predicate.
+    const IS_SUM: bool;
+    fn identity() -> T;
+    fn apply(acc: T, v: T) -> T;
+}
+
+/// The combine operator lifted to a type. See [`ReduceOp`].
+pub(crate) trait CombineOp<T: Scalar> {
+    /// Whether this is `Combine::Mul`. Half of the `skip_missing` predicate.
+    const IS_MUL: bool;
+    fn apply(a: T, b: T) -> T;
+}
+
+macro_rules! reduce_op {
+    ($name:ident, $is_sum:expr, $ident:expr, |$acc:ident, $v:ident| $body:expr) => {
+        pub(crate) struct $name;
+        impl<T: Scalar> ReduceOp<T> for $name {
+            const IS_SUM: bool = $is_sum;
+            #[inline(always)]
+            fn identity() -> T {
+                $ident
+            }
+            #[inline(always)]
+            fn apply($acc: T, $v: T) -> T {
+                $body
+            }
+        }
+    };
+}
+
+reduce_op!(RSum, true, T::ZERO, |acc, v| acc + v);
+reduce_op!(RProd, false, T::ONE, |acc, v| acc * v);
+reduce_op!(RMax, false, T::LEAST, |acc, v| if v > acc { v } else { acc });
+reduce_op!(RMin, false, T::GREATEST, |acc, v| if v < acc { v } else { acc });
+
+macro_rules! combine_op {
+    ($name:ident, $is_mul:expr, |$a:ident, $b:ident| $body:expr) => {
+        pub(crate) struct $name;
+        impl<T: Scalar> CombineOp<T> for $name {
+            const IS_MUL: bool = $is_mul;
+            #[inline(always)]
+            fn apply($a: T, $b: T) -> T {
+                $body
+            }
+        }
+    };
+}
+
+combine_op!(CMul, true, |a, b| a * b);
+combine_op!(CAdd, false, |a, b| a + b);
+combine_op!(CMin, false, |a, b| if b < a { b } else { a });
+combine_op!(CMax, false, |a, b| if b > a { b } else { a });
+
 /// Elementwise combination ⊗: how the input operands at one index tuple are
 /// merged into a single contribution (left-to-right in input order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,23 +766,65 @@ impl Program {
         let sparse_views: Vec<Option<&dyn Sparse2D<T>>> =
             inputs.iter().map(|i| i.as_sparse_2d()).collect();
 
+        // Branch on the semiring exactly once, here, then run a body in which
+        // both operators are inlined instructions. Reading `self.reduce` /
+        // `self.combine` inside `mul_acc` instead costs a branch per operand
+        // per index tuple, in the innermost loop.
+        macro_rules! go {
+            ($r:ty, $c:ty) => {
+                self.exec_mono::<$r, $c, T, In, Out>(inputs, &sparse_views, outs)
+            };
+        }
+        match (self.reduce, self.combine) {
+            (Reduce::Sum, Combine::Mul) => go!(RSum, CMul),
+            (Reduce::Sum, Combine::Add) => go!(RSum, CAdd),
+            (Reduce::Sum, Combine::Min) => go!(RSum, CMin),
+            (Reduce::Sum, Combine::Max) => go!(RSum, CMax),
+            (Reduce::Prod, Combine::Mul) => go!(RProd, CMul),
+            (Reduce::Prod, Combine::Add) => go!(RProd, CAdd),
+            (Reduce::Prod, Combine::Min) => go!(RProd, CMin),
+            (Reduce::Prod, Combine::Max) => go!(RProd, CMax),
+            (Reduce::Max, Combine::Mul) => go!(RMax, CMul),
+            (Reduce::Max, Combine::Add) => go!(RMax, CAdd),
+            (Reduce::Max, Combine::Min) => go!(RMax, CMin),
+            (Reduce::Max, Combine::Max) => go!(RMax, CMax),
+            (Reduce::Min, Combine::Mul) => go!(RMin, CMul),
+            (Reduce::Min, Combine::Add) => go!(RMin, CAdd),
+            (Reduce::Min, Combine::Min) => go!(RMin, CMin),
+            (Reduce::Min, Combine::Max) => go!(RMin, CMax),
+        }
+    }
+
+    /// [`exec`](Self::exec) with the semiring fixed as type parameters.
+    fn exec_mono<R, C, T, In, Out>(
+        &self,
+        inputs: &[&In],
+        sparse_views: &[Option<&dyn Sparse2D<T>>],
+        outs: &mut [&mut Out],
+    ) where
+        R: ReduceOp<T>,
+        C: CombineOp<T>,
+        T: Scalar,
+        In: NDIndex<T> + ?Sized,
+        Out: NDIndex<T> + ?Sized,
+    {
         let mut vals = [0usize; 26];
         let mut buf = [0usize; 26];
         let mut sparse_vals: Vec<T> = vec![T::default(); inputs.len()];
         let mut acc_state: Option<AccState<T>> = None;
-        self.exec_at(
+        self.exec_at::<R, C, T, In, Out>(
             0,
             &mut vals,
             &mut buf,
             &mut sparse_vals,
             &mut acc_state,
             inputs,
-            &sparse_views,
+            sparse_views,
             outs,
         );
     }
 
-    fn exec_at<T: Scalar, In: NDIndex<T> + ?Sized, Out: NDIndex<T> + ?Sized>(
+    fn exec_at<R, C, T, In, Out>(
         &self,
         mut pc: usize,
         vals: &mut [usize; 26],
@@ -732,7 +834,14 @@ impl Program {
         inputs: &[&In],
         sparse_views: &[Option<&dyn Sparse2D<T>>],
         outs: &mut [&mut Out],
-    ) -> usize {
+    ) -> usize
+    where
+        R: ReduceOp<T>,
+        C: CombineOp<T>,
+        T: Scalar,
+        In: NDIndex<T> + ?Sized,
+        Out: NDIndex<T> + ?Sized,
+    {
         let ops = &self.ops;
         while pc < ops.len() {
             match &ops[pc] {
@@ -741,12 +850,12 @@ impl Program {
                     if *fused {
                         for v in 0..*dim {
                             vals[s] = v;
-                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, outs);
+                            self.mul_acc::<R, C, T, In, Out>(vals, buf, sparse_vals, acc_state, inputs, outs);
                         }
                     } else {
                         for v in 0..*dim {
                             vals[s] = v;
-                            self.exec_at(
+                            self.exec_at::<R, C, T, In, Out>(
                                 pc + 1,
                                 vals,
                                 buf,
@@ -776,14 +885,14 @@ impl Program {
                             let (col, val) = sparse.row_entry(row, ei);
                             vals[cs] = col;
                             sparse_vals[*input_idx] = val;
-                            self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, outs);
+                            self.mul_acc::<R, C, T, In, Out>(vals, buf, sparse_vals, acc_state, inputs, outs);
                         }
                     } else {
                         for ei in 0..nnz {
                             let (col, val) = sparse.row_entry(row, ei);
                             vals[cs] = col;
                             sparse_vals[*input_idx] = val;
-                            self.exec_at(
+                            self.exec_at::<R, C, T, In, Out>(
                                 pc + 1,
                                 vals,
                                 buf,
@@ -800,7 +909,7 @@ impl Program {
                 VmOp::LoopEnd => return pc + 1,
                 VmOp::AccStart { acc_slot, acc_out_pos, dim } => {
                     *acc_state = Some(AccState {
-                        acc: vec![self.reduce.identity(); *dim],
+                        acc: vec![R::identity(); *dim],
                         touched: vec![false; *dim],
                         nz_cols: Vec::new(),
                         acc_slot: *acc_slot,
@@ -827,8 +936,8 @@ impl Program {
                             // flush lands on the identity and later flushes
                             // keep reducing.
                             let cur = outs[0].get(&buf[..len]);
-                            outs[0].set(&buf[..len], self.reduce.apply(cur, st.acc[j]));
-                            st.acc[j] = self.reduce.identity();
+                            outs[0].set(&buf[..len], R::apply(cur, st.acc[j]));
+                            st.acc[j] = R::identity();
                             st.touched[j] = false;
                         }
                         st.nz_cols.clear();
@@ -836,7 +945,7 @@ impl Program {
                     pc += 1;
                 }
                 VmOp::MulAcc => {
-                    self.mul_acc(vals, buf, sparse_vals, acc_state, inputs, outs);
+                    self.mul_acc::<R, C, T, In, Out>(vals, buf, sparse_vals, acc_state, inputs, outs);
                     pc += 1;
                 }
             }
@@ -845,7 +954,7 @@ impl Program {
     }
 
     #[inline]
-    fn mul_acc<T: Scalar, In: NDIndex<T> + ?Sized, Out: NDIndex<T> + ?Sized>(
+    fn mul_acc<R, C, T, In, Out>(
         &self,
         vals: &[usize; 26],
         buf: &mut [usize; 26],
@@ -853,7 +962,13 @@ impl Program {
         acc_state: &mut Option<AccState<T>>,
         inputs: &[&In],
         outs: &mut [&mut Out],
-    ) {
+    ) where
+        R: ReduceOp<T>,
+        C: CombineOp<T>,
+        T: Scalar,
+        In: NDIndex<T> + ?Sized,
+        Out: NDIndex<T> + ?Sized,
+    {
         let mut contrib = None::<T>;
         for (i, pattern) in self.input_patterns.iter().enumerate() {
             let v = if self.sparse_value_source[i].is_some() {
@@ -871,11 +986,11 @@ impl Program {
                 // contribution collapses to the reduce identity — skip it.
                 // Under any other semiring it's an actual 0 value that must
                 // still compete in the reduction (e.g. max(…, 0)).
-                None if self.skip_missing => return,
+                None if <R as ReduceOp<T>>::IS_SUM && <C as CombineOp<T>>::IS_MUL => return,
                 None => T::ZERO,
             };
             contrib = Some(match contrib {
-                Some(p) => self.combine.apply(p, v),
+                Some(p) => C::apply(p, v),
                 None => v,
             });
         }
@@ -886,7 +1001,7 @@ impl Program {
                     st.touched[idx] = true;
                     st.nz_cols.push(idx);
                 }
-                st.acc[idx] = self.reduce.apply(st.acc[idx], p);
+                st.acc[idx] = R::apply(st.acc[idx], p);
             } else {
                 for (oi, pattern) in self.output_patterns.iter().enumerate() {
                     let len = pattern.len();
@@ -894,7 +1009,7 @@ impl Program {
                         buf[i] = vals[s as usize];
                     }
                     let cur = outs[oi].get(&buf[..len]);
-                    outs[oi].set(&buf[..len], self.reduce.apply(cur, p));
+                    outs[oi].set(&buf[..len], R::apply(cur, p));
                 }
             }
         }
