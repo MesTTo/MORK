@@ -32,6 +32,7 @@ subprocess = { version = "0.2.13" }
 pathspace_oracles = []
 semi_naive_ic = []
 stratified_quiescence = []
+exec_trace = []
 default = ["grounding", "specialize_io"]
 einsum = ["dep:linalg"]
 neo4j = ["dep:neo4rs", "dep:tokio"]

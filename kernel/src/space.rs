@@ -193,6 +193,89 @@ pub fn reset_counters() {
     WRITES.with(|c| c.set(0));
 }
 
+#[cfg(feature = "exec_trace")]
+const EXEC_TRACE_ID_BYTES: usize = 80;
+
+#[cfg(feature = "exec_trace")]
+enum ExecTrace {
+    Uninitialized,
+    Disabled,
+    Open(std::io::BufWriter<File>),
+}
+
+#[cfg(feature = "exec_trace")]
+thread_local! {
+    static EXEC_TRACE: std::cell::RefCell<ExecTrace> =
+        const { std::cell::RefCell::new(ExecTrace::Uninitialized) };
+}
+
+#[cfg(feature = "exec_trace")]
+fn exec_trace_from_env() -> ExecTrace {
+    let Some(path) = std::env::var_os("MORK_EXEC_TRACE") else {
+        return ExecTrace::Disabled;
+    };
+    let file = File::create(&path)
+        .unwrap_or_else(|err| panic!("failed to create MORK_EXEC_TRACE {:?}: {err}", path));
+    ExecTrace::Open(std::io::BufWriter::new(file))
+}
+
+#[cfg(feature = "exec_trace")]
+fn exec_trace_identity(path: &[u8]) -> String {
+    let prefix_len = path.len().min(EXEC_TRACE_ID_BYTES);
+    let mut shown = serialize(&path[..prefix_len]);
+    if prefix_len < path.len() {
+        shown.push_str(" ...");
+    }
+    shown
+}
+
+#[cfg(feature = "exec_trace")]
+fn record_exec_trace(
+    step: usize,
+    exec_path: &[u8],
+    before: (usize, usize, usize),
+    after: (usize, usize, usize),
+) {
+    EXEC_TRACE.with(|cell| {
+        let mut trace = cell.borrow_mut();
+        if matches!(*trace, ExecTrace::Uninitialized) {
+            *trace = exec_trace_from_env();
+        }
+        let ExecTrace::Open(writer) = &mut *trace else {
+            return;
+        };
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}",
+            step,
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            exec_trace_identity(exec_path)
+        )
+        .expect("failed to write MORK_EXEC_TRACE");
+    });
+}
+
+#[cfg(feature = "exec_trace")]
+pub fn flush_exec_trace() {
+    EXEC_TRACE.with(|cell| {
+        if let ExecTrace::Open(writer) = &mut *cell.borrow_mut() {
+            writer.flush().expect("failed to flush MORK_EXEC_TRACE");
+        }
+    });
+}
+
+#[cfg(all(test, feature = "exec_trace"))]
+fn reset_exec_trace_for_test() {
+    EXEC_TRACE.with(|cell| {
+        if let ExecTrace::Open(writer) = &mut *cell.borrow_mut() {
+            writer.flush().expect("failed to flush MORK_EXEC_TRACE");
+        }
+        *cell.borrow_mut() = ExecTrace::Uninitialized;
+    });
+}
+
 const EXEC_PREFIX: [u8; 6] = const { [item_byte(Tag::Arity(4)), item_byte(Tag::SymbolSize(4)), b'e', b'x', b'e', b'c'] };
 
 #[cfg(feature = "stratified_quiescence")]
@@ -3087,11 +3170,15 @@ impl Space {
     }
 
     fn interpret_taken_exec(&mut self, mut x: Vec<u8>, done: usize) {
+        #[cfg(feature = "exec_trace")]
+        let counters_before = counters();
         let xe = Expr { ptr: x.as_mut_ptr() };
         let start = Instant::now();
         if let Err(e) = self.interpret(xe) {
             debug!(target: "interpret", "not interpreting: {}", e);
         }
+        #[cfg(feature = "exec_trace")]
+        record_exec_trace(done, &x, counters_before, counters());
         if self.timing {
             let start_string = start.elapsed().as_nanos().to_string();
             let start_str = start_string.as_str();
@@ -3383,6 +3470,62 @@ mod tests {
         );
 
         assert_eq!(count, 2);
+    }
+
+    #[cfg(feature = "exec_trace")]
+    #[test]
+    fn exec_trace_records_one_line_per_step_with_counter_deltas() {
+        let path = std::env::temp_dir().join(format!(
+            "mork-exec-trace-{}-{}.log",
+            std::process::id(),
+            "counter-deltas"
+        ));
+        let old_trace = std::env::var_os("MORK_EXEC_TRACE");
+        reset_exec_trace_for_test();
+        unsafe { std::env::set_var("MORK_EXEC_TRACE", &path) };
+
+        let mut space = Space::new();
+        space
+            .add_all_sexpr(
+                br#"
+(seed a)
+(exec 0 (, (seed $x)) (, (mid $x) (exec 1 (, (mid $y)) (, (done $y)))))
+(exec 2 (, (done $z)) (, (final $z)))
+"#,
+            )
+            .unwrap();
+        reset_counters();
+
+        let steps = space.metta_calculus(10);
+        flush_exec_trace();
+        let final_counters = counters();
+
+        reset_exec_trace_for_test();
+        match old_trace {
+            Some(value) => unsafe { std::env::set_var("MORK_EXEC_TRACE", value) },
+            None => unsafe { std::env::remove_var("MORK_EXEC_TRACE") },
+        }
+
+        assert_eq!(steps, 3);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut sums = (0usize, 0usize, 0usize);
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), steps);
+        for (expected_step, line) in lines.iter().enumerate() {
+            let fields: Vec<_> = line.splitn(5, '\t').collect();
+            assert_eq!(fields.len(), 5, "bad trace line: {line}");
+            assert_eq!(fields[0].parse::<usize>().unwrap(), expected_step);
+            assert!(
+                fields[4].starts_with("[4] exec"),
+                "trace identity should serialize the fired exec: {line}"
+            );
+            sums.0 += fields[1].parse::<usize>().unwrap();
+            sums.1 += fields[2].parse::<usize>().unwrap();
+            sums.2 += fields[3].parse::<usize>().unwrap();
+        }
+        assert_eq!(sums, final_counters);
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
