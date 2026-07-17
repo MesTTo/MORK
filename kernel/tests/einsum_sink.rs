@@ -123,6 +123,26 @@ fn linear_to_indices(mut linear: usize, shape: &[usize], out: &mut [usize]) {
     }
 }
 
+fn dense_cells(name: &str, shape: &[usize], values: &[f32]) -> String {
+    let expected_len: usize = shape.iter().product();
+    assert_eq!(values.len(), expected_len);
+    let mut out = String::new();
+    let mut indices = vec![0usize; shape.len()];
+    for (linear, &value) in values.iter().enumerate() {
+        linear_to_indices(linear, shape, &mut indices);
+        out.push('(');
+        out.push_str(name);
+        for index in &indices {
+            out.push(' ');
+            out.push_str(&index.to_string());
+        }
+        out.push(' ');
+        out.push_str(&format_tensor_value(value));
+        out.push_str(")\n");
+    }
+    out
+}
+
 fn dense_map_from_values(shape: &[usize], values: &[f32]) -> BTreeMap<Vec<usize>, f32> {
     let expected_len: usize = shape.iter().product();
     assert_eq!(values.len(), expected_len);
@@ -322,6 +342,44 @@ fn tensor_op_einsum_exec(pattern: &str, inputs: &str, output: &str, extra: &str)
         (backend auto))))
 "#
     )
+}
+
+fn tensor_op_unary_tanh_exec(
+    pattern: &str,
+    input_decl: &str,
+    output_decl: &str,
+    input_template: &str,
+    extra: &str,
+) -> String {
+    format!(
+        r#"
+(exec 0
+  {pattern}
+  (O (tensor-op-f32
+        (op unary tanh)
+        (inputs {input_decl})
+        (output {output_decl})
+        (from {input_template}){extra}
+        (backend auto))))
+"#
+    )
+}
+
+fn unary_tanh_program(
+    input_cells: &str,
+    input_decl: &str,
+    output_decl: &str,
+    input_template: &str,
+) -> Vec<u8> {
+    format!(
+        r#"
+{input_cells}
+(go)
+{}
+"#,
+        tensor_op_unary_tanh_exec("(, (go))", input_decl, output_decl, input_template, "")
+    )
+    .into_bytes()
 }
 
 fn sparse_dense_matmul_program(output_decl: &str) -> Vec<u8> {
@@ -729,6 +787,24 @@ fn tensor_op_f32_runs_gelu_from_operator_syntax() {
 }
 
 #[test]
+fn tensor_op_f32_runs_unary_tanh_from_operator_syntax() {
+    let shape = [4];
+    let values = [-2.0_f32, -0.25, 0.0, 1.5];
+    let program = unary_tanh_program(
+        &dense_cells("X", &shape, &values),
+        "(X dense 4)",
+        "(Y dense)",
+        &ground_scalar_template("X", 1),
+    );
+
+    let output = run_one_step_and_dump(&program, "[3] Y $ $", "[3] Y _1 _2");
+    let output = parse_dumped_tensor_cells(&output, "Y");
+    let expected_values: Vec<f32> = values.iter().map(|value| value.tanh()).collect();
+    let expected = dense_map_from_values(&shape, &expected_values);
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
 fn tensor_op_f32_runs_softmax_from_operator_syntax() {
     let program = br#"
 (X 0 0 1)
@@ -934,6 +1010,45 @@ fn tensor_op_f32_runs_gelu_with_dense16_cells() {
 }
 
 #[test]
+fn tensor_op_f32_runs_unary_tanh_with_dense16_cells() {
+    let shape = [2, 4];
+    let values = [-2.0_f32, -1.0, -0.25, 0.0, 0.25, 0.75, 1.5, 2.0];
+    let program = unary_tanh_program(
+        &dense16_cells("X", &shape, &values),
+        "(X dense16 2 4)",
+        "(Y dense16)",
+        &ground_strip_template("X", 2, 4),
+    );
+
+    let output = run_one_step_and_parse_dense16(&program, "Y", 2);
+    let expected_values: Vec<f32> = values.iter().map(|value| value.tanh()).collect();
+    let expected = dense_map_from_values(&shape, &expected_values);
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
+fn tensor_op_f32_unary_tanh_dense16_ragged_tail_matches_host_reference() {
+    let shape = [2, 17];
+    let values: Vec<f32> = (0..34).map(|index| index as f32 / 7.0 - 2.0).collect();
+    let program = unary_tanh_program(
+        &dense16_cells("X", &shape, &values),
+        "(X dense16 2 17)",
+        "(Y dense16)",
+        &ground_strip_template("X", 2, 16),
+    );
+
+    let mut space = Space::new();
+    let loaded = space.add_all_sexpr(&program).unwrap();
+    assert_eq!(loaded, dense16_atom_count(&shape) + 2);
+    assert_eq!(space.metta_calculus(1), 1);
+    let output = dump_dense16_selection(&space, "Y", 2);
+    let output = parse_dumped_dense16_cells(&output, "Y", 2);
+    let expected_values: Vec<f32> = values.iter().map(|value| value.tanh()).collect();
+    let expected = dense_map_from_values(&shape, &expected_values);
+    assert_dense_maps_close(&output, &expected);
+}
+
+#[test]
 fn tensor_op_f32_runs_softmax_with_dense16_cells() {
     let shape = [1, 4];
     let input = [1.0_f32, 2.0, 3.0, 4.0];
@@ -1099,6 +1214,72 @@ fn tensor_op_f32_stratified_shrink_rewrite_counts_removed_output_cells() {
     assert_eq!(
         dump_selection(&space, "[2] ready $", "[2] ready _1"),
         "(ready tensor)\n"
+    );
+}
+
+#[cfg(feature = "stratified_quiescence")]
+#[test]
+fn tensor_op_f32_unary_tanh_stratified_shrink_rewrite_counts_removed_output_cells() {
+    let values = [-0.1_f32, 0.0, 1.0, -2.0];
+    let mut program = dense_cells("X", &[4], &values);
+    program.push_str(
+        r#"
+(go)
+(Y 0 999)
+(Y 1 888)
+(Y 2 777)
+(Y 3 666)
+
+((unary rewrite)
+  (, ((unary rewrite) $p $t)
+     (go))
+  (O (tensor-op-f32
+        (op unary tanh)
+        (inputs (X dense 4))
+        (output (Y dense 4))
+        (from (X 0 0))
+        (emit threshold 0.5)
+        (backend auto))
+     (+ (exec (stage unary rewrite) $p $t))))
+
+(exec (stage unary rewrite)
+      (, ((unary rewrite) $p $t)
+         (go))
+      (O (tensor-op-f32
+            (op unary tanh)
+            (inputs (X dense 4))
+            (output (Y dense 4))
+            (from (X 0 0))
+            (emit threshold 0.5)
+            (backend auto))
+         (+ (exec (stage unary rewrite) $p $t))))
+
+(exec (quiesce unary ready)
+      (, (Y 2 $v))
+      (O (+ (ready unary))))
+"#,
+    );
+
+    let mut space = Space::new();
+    space.add_all_sexpr(program.as_bytes()).unwrap();
+
+    assert_eq!(space.metta_calculus(2), 2);
+    let output = dump_selection(&space, "[3] Y $ $", "[3] Y _1 _2");
+    let cells = parse_dumped_tensor_cells(&output, "Y");
+    let expected: BTreeMap<Vec<usize>, f32> =
+        [(vec![2], values[2].tanh()), (vec![3], values[3].tanh())]
+            .into_iter()
+            .collect();
+    assert_dense_maps_close(&cells, &expected);
+    assert!(
+        dump_selection(&space, "[2] ready $", "[2] ready _1").is_empty(),
+        "barrier advanced before the unary shrinking rewrite reached quiescence"
+    );
+
+    assert_eq!(space.metta_calculus(1), 1);
+    assert_eq!(
+        dump_selection(&space, "[2] ready $", "[2] ready _1"),
+        "(ready unary)\n"
     );
 }
 

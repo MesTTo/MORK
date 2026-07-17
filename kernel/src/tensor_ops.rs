@@ -1040,6 +1040,49 @@ fn infer_layernorm_output_shape(input_decls: &[Expr]) -> Vec<usize> {
     x_shape
 }
 
+#[derive(Clone, Copy)]
+struct UnaryF32Op {
+    name: &'static str,
+    apply: fn(f32) -> f32,
+}
+
+impl UnaryF32Op {
+    fn apply(self, value: f32) -> f32 {
+        (self.apply)(value)
+    }
+}
+
+fn unary_gelu(value: f32) -> f32 {
+    let sqrt_2_over_pi = std::f32::consts::FRAC_2_PI.sqrt();
+    let inner = sqrt_2_over_pi * (value + 0.044_715 * value * value * value);
+    0.5 * value * (1.0 + inner.tanh())
+}
+
+const UNARY_F32_OPS: &[UnaryF32Op] = &[
+    UnaryF32Op {
+        name: "gelu",
+        apply: unary_gelu,
+    },
+    UnaryF32Op {
+        name: "tanh",
+        apply: f32::tanh,
+    },
+];
+
+fn unary_f32_op(name: &str) -> Option<UnaryF32Op> {
+    UNARY_F32_OPS.iter().copied().find(|op| op.name == name)
+}
+
+fn parse_unary_f32_op(op_args: &[Expr]) -> UnaryF32Op {
+    assert_eq!(
+        op_args.len(),
+        1,
+        "unary tensor-op-f32 op clause must be (op unary name)"
+    );
+    let name = symbol_string(op_args[0]);
+    unary_f32_op(&name).unwrap_or_else(|| panic!("unsupported unary tensor-op-f32 op {name:?}"))
+}
+
 fn infer_unary_dense_output_shape(op_name: &str, input_decls: &[Expr]) -> Vec<usize> {
     assert_eq!(
         input_decls.len(),
@@ -1131,6 +1174,10 @@ fn infer_tensor_op_output_shape(
         "layernorm" => {
             parse_layernorm_eps(op_args);
             infer_layernorm_output_shape(input_decls)
+        }
+        "unary" => {
+            parse_unary_f32_op(op_args);
+            infer_unary_dense_output_shape("unary", input_decls)
         }
         "gelu" => {
             assert_empty_op_args("gelu", op_args);
@@ -1310,6 +1357,32 @@ impl DenseTensorInput {
     fn set(&mut self, cell: Expr) {
         set_dense_cell(&mut self.tensor, &self.name, self.format, cell);
     }
+
+    fn prefixes(&self) -> Vec<&'static [u8]> {
+        dense_cell_prefixes(&self.name, self.tensor.shape.len(), self.format)
+    }
+
+    fn prefix_count(&self) -> usize {
+        match self.format {
+            DenseCellFormat::Scalar => 1,
+            DenseCellFormat::Strip16 => DENSE_STRIP_WIDTH,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.tensor.clear();
+    }
+
+    fn load_from_zipper_append<Z>(&mut self, rz: &mut Z)
+    where
+        Z: ZipperAbsolutePath + ZipperIteration + ZipperValues<()>,
+    {
+        while rz.to_next_val() {
+            self.set(Expr {
+                ptr: rz.origin_path().as_ptr().cast_mut(),
+            });
+        }
+    }
 }
 
 fn build_dense_tensor_input(decl: Expr, template: Expr) -> DenseTensorInput {
@@ -1327,9 +1400,15 @@ enum TensorOpF32Kernel {
     AttentionScaledDot(Box<AttentionScaledDotKernel>),
     Add(Box<AddKernel>),
     LayerNorm(Box<LayerNormKernel>),
-    Gelu(Box<GeluKernel>),
+    Unary(Box<UnaryKernel>),
     Softmax(Box<SoftmaxKernel>),
     Reshape(Box<ReshapeKernel>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnaryInputMode {
+    MatchedCells,
+    DirectScan,
 }
 
 struct AttentionScaledDotKernel {
@@ -1357,8 +1436,10 @@ struct LayerNormKernel {
     eps: f32,
 }
 
-struct GeluKernel {
+struct UnaryKernel {
+    op: UnaryF32Op,
     input: DenseTensorInput,
+    input_mode: UnaryInputMode,
 }
 
 struct SoftmaxKernel {
@@ -1520,6 +1601,27 @@ impl TensorOpF32Plan {
                     eps,
                 }))
             }
+            "unary" => {
+                let op = parse_unary_f32_op(&syntax.op_args);
+                assert_eq!(
+                    syntax.input_decls.len(),
+                    1,
+                    "unary tensor-op-f32 needs one input declaration"
+                );
+                assert_eq!(
+                    syntax.cell_templates.len(),
+                    1,
+                    "unary tensor-op-f32 needs one cell template"
+                );
+
+                let input =
+                    build_dense_tensor_input(syntax.input_decls[0], syntax.cell_templates[0]);
+                TensorOpF32Kernel::Unary(Box::new(UnaryKernel {
+                    op,
+                    input,
+                    input_mode: UnaryInputMode::DirectScan,
+                }))
+            }
             "gelu" => {
                 assert_empty_op_args("gelu", &syntax.op_args);
                 assert_eq!(
@@ -1535,7 +1637,11 @@ impl TensorOpF32Plan {
 
                 let input =
                     build_dense_tensor_input(syntax.input_decls[0], syntax.cell_templates[0]);
-                TensorOpF32Kernel::Gelu(Box::new(GeluKernel { input }))
+                TensorOpF32Kernel::Unary(Box::new(UnaryKernel {
+                    op: unary_f32_op("gelu").expect("gelu unary op must be registered"),
+                    input,
+                    input_mode: UnaryInputMode::MatchedCells,
+                }))
             }
             "softmax" => {
                 assert_empty_op_args("softmax", &syntax.op_args);
@@ -1584,6 +1690,9 @@ impl TensorOpF32Plan {
             TensorOpF32Kernel::Einsum { inputs, .. } => {
                 inputs.iter().flat_map(EinsumInput::prefixes).collect()
             }
+            TensorOpF32Kernel::Unary(kernel) if kernel.input_mode == UnaryInputMode::DirectScan => {
+                kernel.input.prefixes()
+            }
             _ => Vec::new(),
         }
     }
@@ -1593,18 +1702,30 @@ impl TensorOpF32Plan {
             TensorOpF32Kernel::Einsum { inputs, .. } => {
                 inputs.iter().map(EinsumInput::prefix_count).collect()
             }
+            TensorOpF32Kernel::Unary(kernel) if kernel.input_mode == UnaryInputMode::DirectScan => {
+                vec![kernel.input.prefix_count()]
+            }
             _ => Vec::new(),
         }
     }
 
     pub(crate) fn uses_direct_input_scan(&self) -> bool {
         matches!(self.kernel, TensorOpF32Kernel::Einsum { .. })
+            || matches!(
+                &self.kernel,
+                TensorOpF32Kernel::Unary(kernel)
+                    if kernel.input_mode == UnaryInputMode::DirectScan
+            )
     }
 
     pub(crate) fn clear_direct_input(&mut self, index: usize) {
         match &mut self.kernel {
             TensorOpF32Kernel::Einsum { inputs, .. } => inputs[index].clear(),
-            _ => unreachable!("only einsum tensor-op-f32 uses direct input scans"),
+            TensorOpF32Kernel::Unary(kernel) if kernel.input_mode == UnaryInputMode::DirectScan => {
+                assert_eq!(index, 0, "unary tensor-op-f32 direct input index changed");
+                kernel.input.clear();
+            }
+            _ => unreachable!("this tensor-op-f32 operator does not use direct input scans"),
         }
     }
 
@@ -1614,7 +1735,11 @@ impl TensorOpF32Plan {
     {
         match &mut self.kernel {
             TensorOpF32Kernel::Einsum { inputs, .. } => inputs[index].load_from_zipper_append(rz),
-            _ => unreachable!("only einsum tensor-op-f32 uses direct input scans"),
+            TensorOpF32Kernel::Unary(kernel) if kernel.input_mode == UnaryInputMode::DirectScan => {
+                assert_eq!(index, 0, "unary tensor-op-f32 direct input index changed");
+                kernel.input.load_from_zipper_append(rz);
+            }
+            _ => unreachable!("this tensor-op-f32 operator does not use direct input scans"),
         }
     }
 
@@ -1656,9 +1781,14 @@ impl TensorOpF32Plan {
                 kernel.gamma.set(cells[1]);
                 kernel.beta.set(cells[2]);
             }
-            TensorOpF32Kernel::Gelu(kernel) => {
+            TensorOpF32Kernel::Unary(kernel) => {
                 let kernel = kernel.as_mut();
-                assert_eq!(cells.len(), 1, "gelu tensor-op-f32 cell count changed");
+                assert_eq!(
+                    kernel.input_mode,
+                    UnaryInputMode::MatchedCells,
+                    "direct-scan unary tensor-op-f32 does not accept matched cells"
+                );
+                assert_eq!(cells.len(), 1, "unary tensor-op-f32 cell count changed");
                 kernel.input.set(cells[0]);
             }
             TensorOpF32Kernel::Softmax(kernel) => {
@@ -1826,13 +1956,16 @@ impl TensorOpF32Plan {
                 }
                 output
             }
-            TensorOpF32Kernel::Gelu(kernel) => {
+            TensorOpF32Kernel::Unary(kernel) => {
                 let kernel = kernel.as_ref();
                 let mut output = Dense::<f32>::zeros(output_shape.clone());
-                let sqrt_2_over_pi = std::f32::consts::FRAC_2_PI.sqrt();
+                assert_eq!(
+                    output.data.len(),
+                    kernel.input.tensor.data.len(),
+                    "unary tensor-op-f32 output shape changed"
+                );
                 for (out, &x) in output.data.iter_mut().zip(&kernel.input.tensor.data) {
-                    let inner = sqrt_2_over_pi * (x + 0.044_715 * x * x * x);
-                    *out = 0.5 * x * (1.0 + inner.tanh());
+                    *out = kernel.op.apply(x);
                 }
                 output
             }
