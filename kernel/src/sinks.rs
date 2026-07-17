@@ -1975,6 +1975,130 @@ impl Sink for EGraphSink {
     }
 }
 
+// (eqrel <left> <right> <output>): union events with a quotient write-back.
+#[cfg(feature = "eqrel")]
+pub struct EqRelSink {
+    e: Expr,
+    output_template: Box<[u8]>,
+    output_prefix: &'static [u8],
+    eqrel: crate::eqrel::EqRel,
+}
+
+#[cfg(feature = "eqrel")]
+fn instantiate_eqrel_output(template: &[u8], member: &[u8], rep: &[u8], out: &mut Vec<u8>) -> bool {
+    let values = [member, rep];
+    let mut bindings = Vec::with_capacity(2);
+    let mut pos = 0usize;
+    instantiate_eqrel_expr(template, &mut pos, &mut bindings, values, out)
+        && pos == template.len()
+        && bindings.len() >= 2
+}
+
+#[cfg(feature = "eqrel")]
+fn instantiate_eqrel_expr<'a>(
+    bytes: &[u8],
+    pos: &mut usize,
+    bindings: &mut Vec<&'a [u8]>,
+    values: [&'a [u8]; 2],
+    out: &mut Vec<u8>,
+) -> bool {
+    if *pos >= bytes.len() {
+        return false;
+    }
+    match byte_item(bytes[*pos]) {
+        Tag::NewVar => {
+            let Some(value) = values.get(bindings.len()).copied() else { return false; };
+            bindings.push(value);
+            out.extend_from_slice(value);
+            *pos += 1;
+            true
+        }
+        Tag::VarRef(index) => {
+            let Some(value) = bindings.get(index as usize).copied() else { return false; };
+            out.extend_from_slice(value);
+            *pos += 1;
+            true
+        }
+        Tag::SymbolSize(size) => {
+            let next = *pos + size as usize + 1;
+            if next > bytes.len() {
+                return false;
+            }
+            out.extend_from_slice(&bytes[*pos..next]);
+            *pos = next;
+            true
+        }
+        Tag::Arity(arity) => {
+            out.push(bytes[*pos]);
+            *pos += 1;
+            for _ in 0..arity {
+                if !instantiate_eqrel_expr(bytes, pos, bindings, values, out) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+#[cfg(feature = "eqrel")]
+impl Sink for EqRelSink {
+    fn new(e: Expr) -> Self {
+        let mut args = Vec::with_capacity(4);
+        ExprEnv::new(0, e).args(&mut args);
+        if args.len() != 4 {
+            panic!("eqrel sink must be (eqrel <left> <right> <output-template>)");
+        }
+        let output = args[3].subsexpr();
+        let output_template = unsafe { output.span().as_ref().unwrap() }.to_vec().into_boxed_slice();
+        let output_prefix = Box::leak(
+            unsafe { output.prefix().unwrap_or_else(|x| x).as_ref().unwrap() }
+                .to_vec()
+                .into_boxed_slice(),
+        ) as &'static [u8];
+        EqRelSink {
+            e,
+            output_template,
+            output_prefix,
+            eqrel: crate::eqrel::EqRel::new(),
+        }
+    }
+    fn request(&self) -> impl Iterator<Item=WriteResourceRequest> {
+        std::iter::once(WriteResourceRequest::BTM(self.output_prefix))
+    }
+    fn sink<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, _it: It, path: &[u8], _read: &PathMap<()>) where 'a : 'w, 'k : 'w {
+        let e = Expr { ptr: path.as_ptr().cast_mut() };
+        let mut args = Vec::with_capacity(4);
+        ExprEnv::new(0, e).args(&mut args);
+        if args.len() != 4 {
+            return;
+        }
+        let left = unsafe { args[1].subsexpr().span().as_ref().unwrap() };
+        let right = unsafe { args[2].subsexpr().span().as_ref().unwrap() };
+        self.eqrel.union(left, right);
+    }
+    fn finalize<'w, 'a, 'k, It : Iterator<Item=WriteResource<'w, 'a, 'k>>>(&mut self, mut it: It) -> bool where 'a : 'w, 'k : 'w {
+        let WriteResource::BTM(wz) = it.next().unwrap() else { unreachable!() };
+        let root = wz.root_prefix_path().to_vec();
+        let mut changed = false;
+        let mut output = Vec::new();
+        self.eqrel.for_each_quotient(|member, rep| {
+            output.clear();
+            if !instantiate_eqrel_output(&self.output_template, member, rep, &mut output) {
+                return;
+            }
+            if !output.starts_with(&root) {
+                return;
+            }
+            wz.reset();
+            wz.move_to_path(&output[root.len()..]);
+            changed |= set_btm_val_and_note(wz, &output);
+        });
+        wz.reset();
+        changed
+    }
+}
+
 // (wselect <offset> <item> <weight>): a grounded weighted-selection sink. Each
 // matched fact contributes (item, weight); the weights accumulate into a signed
 // WeightedPathIndex (PR #101), and at finalize the item at cumulative-weight
@@ -2468,6 +2592,8 @@ pub enum ASink { AddSink(AddSink), RemoveSink(RemoveSink), HeadSink(HeadTailSink
     WitnessSelectSink(WitnessSelectSink),
     #[cfg(feature = "egraph")]
     EGraphSink(EGraphSink),
+    #[cfg(feature = "eqrel")]
+    EqRelSink(EqRelSink),
     #[cfg(feature = "weighted_select")]
     WeightedSelectSink(WeightedSelectSink),
     #[cfg(feature = "wasm")]
@@ -2498,7 +2624,7 @@ impl ASink {
     /// the match set of one firing (`count`, `sum`, `and`, the float
     /// reductions, `head`/`tail` extrema, `hash`), when it removes
     /// (non-monotone), or when it is effectful (`act`, `z3`, `wasm`, egraph,
-    /// weighted selection) and would simply fire a different number of times.
+    /// eqrel, weighted selection) and would simply fire a different number of times.
     ///
     /// The match is exhaustive on purpose: a new sink cannot be added without
     /// deciding this.
@@ -2533,6 +2659,8 @@ impl ASink {
             ASink::FProdSink(_) => false,
             #[cfg(feature = "egraph")]
             ASink::EGraphSink(_) => false,
+            #[cfg(feature = "eqrel")]
+            ASink::EqRelSink(_) => false,
             #[cfg(feature = "weighted_select")]
             ASink::WeightedSelectSink(_) => false,
             #[cfg(feature = "wasm")]
@@ -2637,6 +2765,11 @@ impl Sink for ASink {
             return ASink::EGraphSink(EGraphSink::new(e));
             #[cfg(not(feature = "egraph"))]
             panic!("MORK was not built with the egraph feature, yet trying to call {:?}", e);
+        } else if expr_functor_is(e, b"eqrel") {
+            #[cfg(feature = "eqrel")]
+            return ASink::EqRelSink(EqRelSink::new(e));
+            #[cfg(not(feature = "eqrel"))]
+            panic!("MORK was not built with the eqrel feature, yet trying to call {:?}", e);
         } else if unsafe { *e.ptr == item_byte(Tag::Arity(4)) && *e.ptr.offset(1) == item_byte(Tag::SymbolSize(7)) &&
             *e.ptr.offset(2) == b'w' && *e.ptr.offset(3) == b's' && *e.ptr.offset(4) == b'e' && *e.ptr.offset(5) == b'l' && *e.ptr.offset(6) == b'e' && *e.ptr.offset(7) == b'c' && *e.ptr.offset(8) == b't' } {
             #[cfg(feature = "weighted_select")]
@@ -2685,6 +2818,8 @@ impl Sink for ASink {
                 ASink::FProdSink(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "egraph")]
                 ASink::EGraphSink(s) => { for i in s.request().into_iter() { yield i } }
+                #[cfg(feature = "eqrel")]
+                ASink::EqRelSink(s) => { for i in s.request().into_iter() { yield i } }
                 #[cfg(feature = "weighted_select")]
                 ASink::WeightedSelectSink(s) => { for i in s.request().into_iter() { yield i } }
             }
@@ -2726,6 +2861,8 @@ impl Sink for ASink {
             ASink::FProdSink(s) => { s.sink(it, path, read) }
             #[cfg(feature = "egraph")]
             ASink::EGraphSink(s) => { s.sink(it, path, read) }
+            #[cfg(feature = "eqrel")]
+            ASink::EqRelSink(s) => { s.sink(it, path, read) }
             #[cfg(feature = "weighted_select")]
             ASink::WeightedSelectSink(s) => { s.sink(it, path, read) }
         }
@@ -2787,6 +2924,8 @@ impl Sink for ASink {
             ASink::FProdSink(s) => { s.finalize(it) }
             #[cfg(feature = "egraph")]
             ASink::EGraphSink(s) => { s.finalize(it) }
+            #[cfg(feature = "eqrel")]
+            ASink::EqRelSink(s) => { s.finalize(it) }
             #[cfg(feature = "weighted_select")]
             ASink::WeightedSelectSink(s) => { s.finalize(it) }
         }

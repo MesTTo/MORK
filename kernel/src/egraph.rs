@@ -31,6 +31,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::term_identity::{TermId, TermIdentitySidecar, TermKind};
+use crate::union_find::{UnionFind, UnionFindId};
 
 /// Identity of an equivalence class (a union-find node).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,6 +39,16 @@ pub struct EClassId(pub u32);
 
 impl EClassId {
     #[inline]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl UnionFindId for EClassId {
+    fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
     fn index(self) -> usize {
         self.0 as usize
     }
@@ -77,8 +88,7 @@ pub struct ENode {
 /// A scoped congruence-closure graph over interned terms.
 #[derive(Clone, Debug, Default)]
 pub struct EGraph {
-    parents: Vec<EClassId>,
-    ranks: Vec<u8>,
+    classes: UnionFind<EClassId>,
     nodes: Vec<ENode>,
     canonical: HashMap<ENodeKind, EClassId>,
     term_classes: HashMap<TermId, EClassId>,
@@ -91,7 +101,7 @@ impl EGraph {
     }
 
     pub fn class_count(&self) -> usize {
-        self.parents.len()
+        self.classes.len()
     }
 
     pub fn node_count(&self) -> usize {
@@ -103,49 +113,25 @@ impl EGraph {
     }
 
     fn make_class(&mut self) -> EClassId {
-        let id = EClassId(self.parents.len() as u32);
-        self.parents.push(id);
-        self.ranks.push(0);
-        id
+        self.classes.make_set()
     }
 
     /// Class root, read-only (no path compression).
-    pub fn find(&self, mut class: EClassId) -> EClassId {
-        while self.parents[class.index()] != class {
-            class = self.parents[class.index()];
-        }
-        class
+    pub fn find(&self, class: EClassId) -> EClassId {
+        self.classes.find(class)
     }
 
     /// Class root with path halving applied along the walk.
     fn find_mut(&mut self, class: EClassId) -> EClassId {
-        let root = self.find(class);
-        let mut current = class;
-        while self.parents[current.index()] != current {
-            let next = self.parents[current.index()];
-            self.parents[current.index()] = root;
-            current = next;
-        }
-        root
+        self.classes.find_mut(class)
     }
 
     /// Merges two classes, union by rank. Marks the graph dirty so the next
     /// [`rebuild`](Self::rebuild) re-closes congruence.
     pub fn union(&mut self, left: EClassId, right: EClassId) -> EClassId {
-        let mut left = self.find_mut(left);
-        let mut right = self.find_mut(right);
-        if left == right {
-            return left;
-        }
-        if self.ranks[left.index()] < self.ranks[right.index()] {
-            std::mem::swap(&mut left, &mut right);
-        }
-        self.parents[right.index()] = left;
-        if self.ranks[left.index()] == self.ranks[right.index()] {
-            self.ranks[left.index()] = self.ranks[left.index()].saturating_add(1);
-        }
-        self.dirty = true;
-        left
+        let (root, changed) = self.classes.union(left, right);
+        self.dirty |= changed;
+        root
     }
 
     /// Interns a term's structure into the graph, returning its class. Shares
@@ -278,8 +264,8 @@ impl EGraph {
         while self.dirty || rounds == 0 {
             rounds += 1;
             self.dirty = false;
-            for index in 0..self.parents.len() {
-                self.find_mut(EClassId(index as u32));
+            for class in self.classes.ids().collect::<Vec<_>>() {
+                self.find_mut(class);
             }
 
             let entries = self
@@ -311,13 +297,7 @@ impl EGraph {
                     self.canonical.insert(kind, root);
                 }
                 for class in self.term_classes.values_mut() {
-                    // Local root walk: borrowing all of self while the map is
-                    // mutably borrowed is not allowed, so walk parents directly.
-                    let mut root = *class;
-                    while self.parents[root.index()] != root {
-                        root = self.parents[root.index()];
-                    }
-                    *class = root;
+                    *class = self.classes.find(*class);
                 }
                 break;
             }
@@ -359,7 +339,7 @@ impl EGraph {
             encoded: Vec<u8>,
         }
         let mut best = HashMap::<EClassId, Best>::new();
-        let max_rounds = self.parents.len().saturating_add(1);
+        let max_rounds = self.classes.len().saturating_add(1);
         for _ in 0..max_rounds {
             let mut changed = false;
             for node in &self.nodes {
@@ -414,35 +394,13 @@ impl EGraph {
 
     /// Cheap structural self-check for tests and assertions.
     pub fn validate(&self) -> Result<(), String> {
-        if self.parents.len() != self.ranks.len() {
-            return Err("union-find arrays differ in length".into());
-        }
-        for (index, parent) in self.parents.iter().copied().enumerate() {
-            if parent.index() >= self.parents.len() {
-                return Err(format!("invalid parent at class {index}"));
-            }
-            let mut slow = EClassId(index as u32);
-            let mut fast = slow;
-            for _ in 0..=self.parents.len() {
-                slow = self.parents[slow.index()];
-                fast = self.parents[self.parents[fast.index()].index()];
-                if slow == fast {
-                    break;
-                }
-            }
-            if slow != self.find(slow) && self.parents[slow.index()] == slow {
-                return Err("union-find corruption".into());
-            }
-        }
+        self.classes.validate().map_err(|err| err.to_string())?;
         for node in &self.nodes {
-            if node.class.index() >= self.parents.len() {
+            if !self.classes.contains(node.class) {
                 return Err("e-node has invalid class".into());
             }
             if let ENodeKind::App { children, .. } = &node.kind {
-                if children
-                    .iter()
-                    .any(|child| child.index() >= self.parents.len())
-                {
+                if children.iter().any(|child| !self.classes.contains(*child)) {
                     return Err("e-node has invalid child class".into());
                 }
             }

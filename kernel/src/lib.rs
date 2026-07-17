@@ -14,6 +14,7 @@ pub mod json_path_query;
 pub mod zipper_join;
 mod sources;
 mod sinks;
+mod union_find;
 #[cfg(feature = "retrieval_join")]
 pub mod retrieval;
 mod pure;
@@ -21,6 +22,8 @@ mod pure;
 pub use sinks::WriteResourceRequest;
 pub use sources::ResourceRequest;
 pub mod egraph;
+#[cfg(feature = "eqrel")]
+pub mod eqrel;
 #[cfg(feature = "einsum")]
 pub mod graph_tensor;
 #[cfg(feature = "einsum")]
