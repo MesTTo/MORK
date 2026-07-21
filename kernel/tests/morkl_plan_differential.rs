@@ -36,6 +36,54 @@ const F3_EMPTY_COMPONENT: &str = r#"
 (exec 0 (, (a $i) (b $j)) (, (seen-a $i) (done)))
 "#;
 
+/// F2: Mixed template (uses both components) - planned route must DECLINE (v1) and the
+/// differential must still hold trivially.
+const F2_MIXED: &str = r#"
+(a 1) (a 2)
+(b x)
+(exec 0 (, (a $i) (b $j)) (, (pair $i $j)))
+"#;
+
+/// F4: schematic DATA (a stored fact contains a variable). Component routability must
+/// decline or handle identically - the leapfrog silent-drop hazard class.
+const F4_SCHEMATIC: &str = r#"
+(a $q)
+(a 1)
+(b x)
+(exec 0 (, (a $i) (b $j)) (, (seen-a $i) (done)))
+"#;
+
+/// F5: shared variable => ONE component - planned route must decline (no gain).
+const F5_SHARED: &str = r#"
+(a 1) (a 2)
+(b 1)
+(exec 0 (, (a $i) (b $i)) (, (seen $i)))
+"#;
+
+/// F6: compound column + repeated var inside a factor.
+const F6_COMPOUND: &str = r#"
+(a (f 1)) (a (f 2)) (a (g 1 1))
+(b x)
+(exec 0 (, (a (f $i)) (b $j)) (, (seen-f $i) (done)))
+"#;
+
+/// F7: duplicate-producing component (two factors in one component derive the same
+/// binding twice) - set semantics must dedup identically.
+const F7_DUPS: &str = r#"
+(a 1) (a2 1)
+(b x) (b y)
+(exec 0 (, (a $i) (a2 $i) (b $j)) (, (seen $i)))
+"#;
+
+/// F8 hazard pin: NewVar in a template, THREADED across the template list. v1 declines
+/// this shape (invariant I6); this test documents what stock does so any later widening
+/// has an exact target.
+const F8_NEWVAR_TEMPLATE: &str = r#"
+(a 1)
+(b x)
+(exec 0 (, (a $i) (b $j)) (, (fresh $n) (also $n $i)))
+"#;
+
 #[test]
 fn f1_stock_shape() {
     let (steps, dump) = run_and_dump(F1_HOIST, 100);
@@ -69,4 +117,57 @@ fn f3_empty_component_emits_nothing() {
         !dump.contains("(done)"),
         "ground template needs >=1 body solution:\n{dump}"
     );
+}
+
+#[test]
+fn f2_mixed_stock_shape() {
+    let (_, dump) = run_and_dump(F2_MIXED, 100);
+    assert!(
+        dump.contains("(pair 1 x)") && dump.contains("(pair 2 x)"),
+        "{dump}"
+    );
+}
+
+#[test]
+fn f4_schematic_stock_shape() {
+    let (_, dump) = run_and_dump(F4_SCHEMATIC, 100);
+    assert_eq!(
+        dump,
+        "(a $a)\n(a 1)\n(b x)\n(done)\n(seen-a $a)\n(seen-a 1)"
+    );
+}
+
+#[test]
+fn f5_shared_stock_shape() {
+    let (_, dump) = run_and_dump(F5_SHARED, 100);
+    assert!(
+        dump.contains("(seen 1)") && !dump.contains("(seen 2)"),
+        "{dump}"
+    );
+}
+
+#[test]
+fn f6_compound_stock_shape() {
+    let (_, dump) = run_and_dump(F6_COMPOUND, 100);
+    assert!(
+        dump.contains("(seen-f 1)") && dump.contains("(seen-f 2)"),
+        "{dump}"
+    );
+    assert!(
+        !dump.contains("(seen-f (g"),
+        "g-facts must not match (f $i): {dump}"
+    );
+}
+
+#[test]
+fn f7_dups_stock_shape() {
+    let (_, dump) = run_and_dump(F7_DUPS, 100);
+    let count = dump.matches("(seen 1)").count();
+    assert_eq!(count, 1, "set semantics: exactly one (seen 1): {dump}");
+}
+
+#[test]
+fn f8_newvar_template_stock_shape() {
+    let (_, dump) = run_and_dump(F8_NEWVAR_TEMPLATE, 100);
+    assert_eq!(dump, "(a 1)\n(also $a 1)\n(b x)\n(fresh $a)");
 }
