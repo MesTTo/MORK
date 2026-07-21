@@ -67,6 +67,14 @@ const F6_COMPOUND: &str = r#"
 (exec 0 (, (a (f $i)) (b $j)) (, (seen-f $i) (done)))
 "#;
 
+/// F6B: repeated query variable inside one factor. The factor itself constrains both
+/// columns to the same value, independently of the second body component.
+const F6B_REPEATED_VAR: &str = r#"
+(p 1 1) (p 1 2) (p 2 2)
+(b x)
+(exec 0 (, (p $i $i) (b $j)) (, (seen $i) (done)))
+"#;
+
 /// F7: duplicate-producing component (two factors in one component derive the same
 /// binding twice) - set semantics must dedup identically.
 const F7_DUPS: &str = r#"
@@ -160,6 +168,15 @@ fn f6_compound_stock_shape() {
 }
 
 #[test]
+fn f6b_repeated_var_stock_shape() {
+    let (_, dump) = run_and_dump(F6B_REPEATED_VAR, 100);
+    assert_eq!(
+        dump,
+        "(b x)\n(done)\n(p 1 1)\n(p 1 2)\n(p 2 2)\n(seen 1)\n(seen 2)"
+    );
+}
+
+#[test]
 fn f7_dups_stock_shape() {
     let (_, dump) = run_and_dump(F7_DUPS, 100);
     let count = dump.matches("(seen 1)").count();
@@ -208,6 +225,7 @@ fn lockstep_all_fixtures() {
         F4_SCHEMATIC,
         F5_SHARED,
         F6_COMPOUND,
+        F6B_REPEATED_VAR,
         F7_DUPS,
         F8_NEWVAR_TEMPLATE,
     ] {
