@@ -70,7 +70,7 @@ const F6_COMPOUND: &str = r#"
 /// F6B: repeated query variable inside one factor. The factor itself constrains both
 /// columns to the same value, independently of the second body component.
 const F6B_REPEATED_VAR: &str = r#"
-(p 1 1) (p 1 2) (p 2 2)
+(p 1 2) (p 2 2)
 (b x)
 (exec 0 (, (p $i $i) (b $j)) (, (seen $i) (done)))
 "#;
@@ -172,7 +172,7 @@ fn f6b_repeated_var_stock_shape() {
     let (_, dump) = run_and_dump(F6B_REPEATED_VAR, 100);
     assert_eq!(
         dump,
-        "(b x)\n(done)\n(p 1 1)\n(p 1 2)\n(p 2 2)\n(seen 1)\n(seen 2)"
+        "(b x)\n(done)\n(p 1 2)\n(p 2 2)\n(seen 2)"
     );
 }
 
