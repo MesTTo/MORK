@@ -1888,7 +1888,7 @@ pub fn query_multi_ghd<F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Exp
 /// emit, so no query or fact shape needs a decline. The check is parse-level and reads nothing
 /// from the map. The per-column byte-level union-find this gate once scanned facts for is gone;
 /// its boundary (`nonflat_uf_unsound`) constrained that mechanism, not this one.
-fn body_factors_routable_to_zipper_join(factors: &[Factor]) -> bool {
+pub(crate) fn body_factors_routable_to_zipper_join(factors: &[Factor]) -> bool {
     !factors.is_empty()
 }
 
