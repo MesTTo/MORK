@@ -20,6 +20,53 @@ use mork_expr::{Tag, maybe_byte_item};
 use crate::union_find::{UnionFind, UnionFindId};
 use crate::zipper_join::{Factor, collect_factor_vars};
 
+/// Planned-transform dispatch mode: off, the default structurally gated policy, or every
+/// structurally admissible body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchMode {
+    Off,
+    Gated,
+    All,
+}
+
+impl DispatchMode {
+    fn from_env(value: Option<&str>) -> Self {
+        match value {
+            Some("0") => Self::Off,
+            Some("all") => Self::All,
+            _ => Self::Gated,
+        }
+    }
+}
+
+thread_local! {
+    /// Per-thread planned-transform dispatch mode. `MORK_MORKL_PLAN=0` turns dispatch off at
+    /// thread start, `MORK_MORKL_PLAN=all` selects every structurally admissible body, and every
+    /// other value uses the default gated policy. The environment is read once when each thread
+    /// first accesses the knob. Thread-local state lets differentials pin one run to stock without
+    /// racing parallel tests.
+    static MORKL_PLAN_DISPATCH: std::cell::Cell<DispatchMode> = std::cell::Cell::new(
+        DispatchMode::from_env(std::env::var("MORK_MORKL_PLAN").as_deref().ok()),
+    );
+}
+
+/// Whether structurally admitted transforms may use the planned route on this thread.
+pub fn morkl_plan_dispatch_enabled() -> bool {
+    MORKL_PLAN_DISPATCH.with(|mode| mode.get()) != DispatchMode::Off
+}
+
+/// Turn the default structurally gated planned route on or off for this thread.
+/// Differentials use this to keep the reference run on the stock route.
+pub fn set_morkl_plan_dispatch(on: bool) {
+    MORKL_PLAN_DISPATCH.with(|mode| {
+        mode.set(if on {
+            DispatchMode::Gated
+        } else {
+            DispatchMode::Off
+        })
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FactorId(u32);
 
@@ -313,8 +360,8 @@ pub fn analyze(
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyPlan, MorklJoinPlan, TemplateClass, admit, analyze, classify_template,
-        partition_components,
+        BodyPlan, DispatchMode, MorklJoinPlan, TemplateClass, admit, analyze, classify_template,
+        morkl_plan_dispatch_enabled, partition_components, set_morkl_plan_dispatch,
     };
     use crate::space::Space;
     use crate::zipper_join::{Factor, parse_body_factors};
@@ -330,6 +377,23 @@ mod tests {
         let body = crate::expr!(space, source);
         let span = unsafe { body.span().as_ref().unwrap() };
         parse_body_factors(span).expect("body must parse")
+    }
+
+    #[test]
+    fn dispatch_mode_defaults_to_gated_and_honors_environment_values() {
+        assert_eq!(DispatchMode::from_env(None), DispatchMode::Gated);
+        assert_eq!(DispatchMode::from_env(Some("0")), DispatchMode::Off);
+        assert_eq!(DispatchMode::from_env(Some("all")), DispatchMode::All);
+        assert_eq!(DispatchMode::from_env(Some("unknown")), DispatchMode::Gated);
+    }
+
+    #[test]
+    fn dispatch_override_toggles_current_thread() {
+        set_morkl_plan_dispatch(false);
+        assert!(!morkl_plan_dispatch_enabled());
+
+        set_morkl_plan_dispatch(true);
+        assert!(morkl_plan_dispatch_enabled());
     }
 
     fn plan(source: &str) -> BodyPlan {
