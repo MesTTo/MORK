@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use mork::morkl_plan::{
     PLANNED_FIRINGS, planned_firings, set_morkl_plan_dispatch, set_morkl_plan_dispatch_all,
 };
-use mork::space::Space;
+use mork::space::{Space, counters, reset_counters};
 
 static ROUTING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -322,5 +322,82 @@ fn lockstep_generated_corpus() {
     for seed in 0..200u64 {
         let (program, _) = gen_program(seed, false);
         assert_lockstep(&program, 8, false);
+    }
+}
+
+fn separable_product_program(n: usize) -> String {
+    let mut program = String::new();
+    for value in 0..n {
+        program.push_str(&format!("(a a{value})\n"));
+    }
+    for value in 0..n {
+        program.push_str(&format!("(b b{value})\n"));
+    }
+    program.push_str("(exec 0 (, (a $i) (b $j)) (, (seen-a $i) (done)))\n");
+    program
+}
+
+#[derive(Clone, Copy)]
+enum ScalingRoute {
+    Off,
+    Gated,
+    All,
+}
+
+fn run_scaling_case(program: &str, route: ScalingRoute) -> (usize, usize, Vec<u8>) {
+    PLANNED_FIRINGS.store(0, Ordering::Relaxed);
+    match route {
+        ScalingRoute::Off => set_morkl_plan_dispatch(false),
+        ScalingRoute::Gated => set_morkl_plan_dispatch(true),
+        ScalingRoute::All => set_morkl_plan_dispatch_all(),
+    }
+    let mut space = Space::new();
+    space.add_all_sexpr(program.as_bytes()).unwrap();
+    reset_counters();
+    assert_eq!(space.metta_calculus(1), 1);
+    let writes = counters().2;
+    let firings = planned_firings();
+    let mut dump = Vec::new();
+    space.dump_all_sexpr(&mut dump).unwrap();
+    set_morkl_plan_dispatch(false);
+    (writes, firings, dump)
+}
+
+/// Demonstrate the factorised projection bound with deterministic template-application counts.
+/// Stock writes both templates across `A x B`. The route writes the A-local template `|A|` times
+/// and the ground template once after proving B is nonempty.
+#[test]
+#[ignore = "scaling demonstration; run explicitly in release mode"]
+fn separable_product_work_scales() {
+    let _guard = ROUTING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for n in [100usize, 1_000, 10_000] {
+        let program = separable_product_program(n);
+        let (stock_writes, stock_firings, stock_dump) =
+            run_scaling_case(&program, ScalingRoute::Off);
+        let (gated_writes, gated_firings, gated_dump) =
+            run_scaling_case(&program, ScalingRoute::Gated);
+        let (forced_writes, forced_firings, forced_dump) =
+            run_scaling_case(&program, ScalingRoute::All);
+
+        assert_eq!(stock_dump, gated_dump, "gated output differs at n={n}");
+        assert_eq!(stock_dump, forced_dump, "forced output differs at n={n}");
+        assert_eq!(stock_writes, 2 * n * n);
+        assert_eq!(stock_firings, 0);
+        assert_eq!(forced_writes, n + 1);
+        assert_eq!(forced_firings, 1);
+        if n == 100 {
+            assert_eq!(gated_writes, stock_writes);
+            assert_eq!(gated_firings, 0);
+        } else {
+            assert_eq!(gated_writes, n + 1);
+            assert_eq!(gated_firings, 1);
+        }
+        println!(
+            "n={n} stock_writes={stock_writes} gated_writes={gated_writes} \
+             gated_planned_firings={gated_firings} forced_writes={forced_writes} \
+             forced_planned_firings={forced_firings}"
+        );
     }
 }
