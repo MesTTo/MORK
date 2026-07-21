@@ -245,7 +245,7 @@ fn lockstep_all_fixtures() {
 /// Deterministic pseudo-random program generator for property differentials: k relations,
 /// random facts, one exec whose body samples 2-4 relations with fresh or shared vars.
 /// Uses a hand-rolled LCG so the corpus is reproducible without new dependencies.
-fn gen_program(seed: u64) -> (String, bool) {
+fn gen_program(seed: u64, inject_common_fact: bool) -> (String, bool) {
     let mut state = seed
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
@@ -260,7 +260,9 @@ fn gen_program(seed: u64) -> (String, bool) {
     for r in 0..nrel {
         // Keep every shared-variable component satisfiable so a structurally qualifying case must
         // emit and can prove planned-route engagement.
-        prog.push_str(&format!("(r{r} v0)\n"));
+        if inject_common_fact {
+            prog.push_str(&format!("(r{r} v0)\n"));
+        }
         for _ in 0..(1 + next(5)) {
             prog.push_str(&format!("(r{r} v{})\n", next(4)));
         }
@@ -287,7 +289,7 @@ fn lockstep_generated_corpus() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for seed in 0..200u64 {
-        let (program, qualifies) = gen_program(seed);
+        let (program, qualifies) = gen_program(seed, true);
         let firings = assert_lockstep(&program, 8);
         if qualifies {
             assert!(
@@ -297,5 +299,9 @@ fn lockstep_generated_corpus() {
         } else {
             assert_eq!(firings, 0, "single-component generated seed={seed}");
         }
+    }
+    for seed in 0..200u64 {
+        let (program, _) = gen_program(seed, false);
+        assert_lockstep(&program, 8);
     }
 }
