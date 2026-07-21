@@ -2051,7 +2051,7 @@ fn acyclic_guarded_join_profits(map: &PathMap<()>, factors: &[Factor]) -> bool {
 /// ProductZipper's straight-line constants win; the tile puzzle's 56-fact inequality tables
 /// measured a mild loss dispatched, while the demonstration's smallest hub instance (265 facts)
 /// must still dispatch.
-const DISPATCH_MIN_FACTS: usize = 128;
+pub(crate) const DISPATCH_MIN_FACTS: usize = 128;
 
 /// From this many join factors on, the relation-at-a-time product deepens multiplicatively while
 /// the join stays output-bounded, skewed instance or not: the clique bench's 6- and 10-factor
@@ -2080,13 +2080,36 @@ fn factor_scan_path(factor: &Factor) -> Vec<u8> {
 
 /// Count the facts under the factor's relation region, stopping at `cap`: a bounded walk, so the
 /// gate's cost stays independent of the space size.
-fn bounded_fact_count(map: &PathMap<()>, factor: &Factor, cap: usize) -> usize {
+pub(crate) fn bounded_fact_count(map: &PathMap<()>, factor: &Factor, cap: usize) -> usize {
     let mut rz = map.read_zipper_at_path(&factor_scan_path(factor));
     let mut n = 0;
     while n < cap && rz.to_next_val() {
         n += 1;
     }
     n
+}
+
+/// Whether [`bounded_fact_count`] is a lower bound on one single-factor component's solutions.
+/// A ground head and distinct whole-column variables after it make every row below
+/// [`factor_scan_path`] a match. Wildcard-headed data lives outside that path and can only make the
+/// true solution count larger. Constants, repeated variables, and compound filters decline because
+/// a relation-row count would only be an upper bound for those shapes.
+pub(crate) fn factor_count_lower_bounds_single_factor_solutions(factor: &Factor) -> bool {
+    let Some(FactorColumn::Term(head)) = factor.cols.first() else {
+        return false;
+    };
+    if !head.is_ground() {
+        return false;
+    }
+    let tail = &factor.cols[1..];
+    tail.iter().enumerate().all(|(index, column)| {
+        let FactorColumn::Var(var) = column else {
+            return false;
+        };
+        !tail[..index]
+            .iter()
+            .any(|previous| matches!(previous, FactorColumn::Var(seen) if seen == var))
+    })
 }
 
 /// Sample up to [`DISPATCH_HEAVY_SAMPLES`] first-argument values of the factor's relation, in

@@ -14,9 +14,13 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mork_expr::{Tag, maybe_byte_item};
+use pathmap::PathMap;
 
 use crate::union_find::{UnionFind, UnionFindId};
-use crate::zipper_join::{Factor, collect_factor_vars};
+use crate::zipper_join::{
+    DISPATCH_MIN_FACTS, Factor, bounded_fact_count, collect_factor_vars,
+    factor_count_lower_bounds_single_factor_solutions,
+};
 
 /// Number of planned-route firings that emitted at least one template application.
 pub static PLANNED_FIRINGS: AtomicUsize = AtomicUsize::new(0);
@@ -66,6 +70,11 @@ pub fn morkl_plan_dispatch_enabled() -> bool {
     MORKL_PLAN_DISPATCH.with(|mode| mode.get()) != DispatchMode::Off
 }
 
+/// Whether this thread uses the default profitability gate rather than the explicit `all` mode.
+pub(crate) fn morkl_plan_profitability_required() -> bool {
+    MORKL_PLAN_DISPATCH.with(|mode| mode.get()) == DispatchMode::Gated
+}
+
 /// Turn the default structurally gated planned route on or off for this thread.
 /// Differentials use this to keep the reference run on the stock route.
 pub fn set_morkl_plan_dispatch(on: bool) {
@@ -76,6 +85,11 @@ pub fn set_morkl_plan_dispatch(on: bool) {
             DispatchMode::Off
         })
     })
+}
+
+#[cfg(test)]
+pub(crate) fn set_morkl_plan_dispatch_all() {
+    MORKL_PLAN_DISPATCH.with(|mode| mode.set(DispatchMode::All));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,27 +349,109 @@ pub fn admit(body: BodyPlan, template_spans: &[&[u8]]) -> Option<MorklJoinPlan> 
     })
 }
 
-/// Partition and admit a parsed body as a pure function of its rule shape.
-///
-/// The constant-time factor-count check and allocation-free template preflight precede component
-/// construction.
-pub fn analyze(
+fn analysis_preflight(factors: &[Factor], template_spans: &[&[u8]]) -> bool {
+    factors.len() >= 2
+        && !template_spans
+            .iter()
+            .any(|span| scan_template_vars(span) == TemplateVars::Unsupported)
+}
+
+fn analyze_preflighted(
     factors: &[Factor],
     nvars: usize,
     template_spans: &[&[u8]],
 ) -> Option<MorklJoinPlan> {
-    if factors.len() < 2 {
+    let body = partition_components(factors, nvars);
+    admit(body, template_spans)
+}
+
+/// Whether a factorised projection has enough certified work to avoid before it is admitted.
+///
+/// For a Cartesian product, projection can be pushed through an independent component with an
+/// emptiness guard: `pi_A(A x B) = A` when `B` is nonempty, and `{}` otherwise. This is the
+/// factorised result bound from Olteanu and Zavodny, ACM TODS 2015, doi:10.1145/2656335. A flat
+/// template writes across the product; the plan writes each component-local template only across
+/// its component and each ground template once.
+///
+/// A relation count contributes only for a single-factor component whose scan is a certified lower
+/// bound on solutions. Every other shape returns zero and therefore declines. Capping a positive
+/// lower bound preserves the direction of the estimate because avoided applications are monotone
+/// in every independent component size. This intentionally misses possible wins rather than admit
+/// a relation whose joins or filters could collapse its apparent size.
+fn profitable(factor_counts: &[usize], factors: &[Factor], plan: &MorklJoinPlan) -> bool {
+    let mut component_lower_bounds = Vec::with_capacity(plan.body().component_count());
+    for component in plan.body().components() {
+        let [factor_index] = component else {
+            return false;
+        };
+        if !factor_count_lower_bounds_single_factor_solutions(&factors[*factor_index]) {
+            return false;
+        }
+        let lower_bound = factor_counts[*factor_index];
+        if lower_bound == 0 {
+            return false;
+        }
+        component_lower_bounds.push(lower_bound);
+    }
+
+    let flat_applications = component_lower_bounds
+        .iter()
+        .copied()
+        .fold(plan.template_classes().len(), usize::saturating_mul);
+    let factorised_applications = plan
+        .template_classes()
+        .iter()
+        .map(|class| match class {
+            TemplateClass::Ground => 1,
+            TemplateClass::SingleComponent(component) => component_lower_bounds[*component],
+            TemplateClass::Mixed | TemplateClass::Unsupported => unreachable!(),
+        })
+        .fold(0usize, usize::saturating_add);
+
+    flat_applications.saturating_sub(factorised_applications) >= DISPATCH_MIN_FACTS
+}
+
+/// Partition and admit a parsed body as a pure function of the map, rule shape, and templates.
+///
+/// The constant-time factor-count check and allocation-free `NewVar` preflight precede trie reads.
+/// The bounded counts run before component construction. Every relation below the existing
+/// [`DISPATCH_MIN_FACTS`] boundary declines, matching the measured tile-puzzle boundary where
+/// 56-fact inequality tables lost on extra join machinery.
+pub fn analyze(
+    map: &PathMap<()>,
+    factors: &[Factor],
+    nvars: usize,
+    template_spans: &[&[u8]],
+) -> Option<MorklJoinPlan> {
+    if !analysis_preflight(factors, template_spans) {
         return None;
     }
-    if template_spans
+
+    let factor_counts = factors
         .iter()
-        .any(|span| scan_template_vars(span) == TemplateVars::Unsupported)
+        .map(|factor| bounded_fact_count(map, factor, DISPATCH_MIN_FACTS))
+        .collect::<Vec<_>>();
+    if factor_counts
+        .iter()
+        .all(|count| *count < DISPATCH_MIN_FACTS)
     {
         return None;
     }
 
-    let body = partition_components(factors, nvars);
-    admit(body, template_spans)
+    let plan = analyze_preflighted(factors, nvars, template_spans)?;
+    profitable(&factor_counts, factors, &plan).then_some(plan)
+}
+
+/// Structural admission for the explicit `MORK_MORKL_PLAN=all` diagnostic mode.
+pub(crate) fn analyze_ungated(
+    factors: &[Factor],
+    nvars: usize,
+    template_spans: &[&[u8]],
+) -> Option<MorklJoinPlan> {
+    if !analysis_preflight(factors, template_spans) {
+        return None;
+    }
+    analyze_preflighted(factors, nvars, template_spans)
 }
 
 #[cfg(test)]
@@ -483,7 +579,8 @@ mod tests {
     fn analysis_is_rejected(body: &str, template: &str) -> bool {
         let (factors, nvars) = parsed_body(body);
         let template = encoded(template);
-        analyze(&factors, nvars, &[template.as_slice()]).is_none()
+        let map = Space::new();
+        analyze(&map.btm, &factors, nvars, &[template.as_slice()]).is_none()
     }
 
     #[test]
@@ -496,4 +593,45 @@ mod tests {
         assert!(analysis_is_rejected("[3] , [2] a $ [2] b $", "[2] fresh $"));
     }
 
+    fn product_is_admitted(a_count: usize, b_count: usize) -> bool {
+        let mut space = Space::new();
+        let mut facts = String::new();
+        for value in 0..a_count {
+            facts.push_str(&format!("(a a{value})\n"));
+        }
+        for value in 0..b_count {
+            facts.push_str(&format!("(b b{value})\n"));
+        }
+        space.add_all_sexpr(facts.as_bytes()).unwrap();
+        let body = crate::expr!(space, "[3] , [2] a $ [2] b $");
+        let body_span = unsafe { body.span().as_ref().unwrap() };
+        let (factors, nvars) = parse_body_factors(body_span).unwrap();
+        let templates = [encoded("[2] seen-a _1"), encoded("[1] done")];
+        let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        analyze(&space.btm, &factors, nvars, &spans).is_some()
+    }
+
+    #[test]
+    fn analyze_declines_when_every_relation_is_below_the_measured_boundary() {
+        assert!(!product_is_admitted(
+            crate::zipper_join::DISPATCH_MIN_FACTS - 1,
+            crate::zipper_join::DISPATCH_MIN_FACTS - 1,
+        ));
+    }
+
+    #[test]
+    fn analyze_declines_when_avoided_applications_stay_below_the_boundary() {
+        assert!(!product_is_admitted(
+            crate::zipper_join::DISPATCH_MIN_FACTS,
+            1,
+        ));
+    }
+
+    #[test]
+    fn analyze_admits_when_bounded_product_savings_cross_the_boundary() {
+        assert!(product_is_admitted(
+            crate::zipper_join::DISPATCH_MIN_FACTS,
+            2,
+        ));
+    }
 }

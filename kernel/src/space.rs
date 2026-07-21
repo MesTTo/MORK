@@ -427,7 +427,11 @@ struct MorklPlanComponent {
 }
 
 #[cfg(feature = "morkl_plan")]
-fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> Option<MorklPlannedRule> {
+fn analyze_morkl_rule(
+    map: &PathMap<()>,
+    pat_expr: Expr,
+    tpl_expr: Expr,
+) -> Option<MorklPlannedRule> {
     use crate::morkl_plan::TemplateClass;
 
     if unsafe { *tpl_expr.ptr.add(2) } != b',' {
@@ -446,7 +450,12 @@ fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> Option<MorklPlannedRule
         .iter()
         .map(|template| unsafe { template.span().as_ref().unwrap() })
         .collect();
-    let Some(plan) = crate::morkl_plan::analyze(&factors, nvars, &template_spans) else {
+    let plan = if crate::morkl_plan::morkl_plan_profitability_required() {
+        crate::morkl_plan::analyze(map, &factors, nvars, &template_spans)
+    } else {
+        crate::morkl_plan::analyze_ungated(&factors, nvars, &template_spans)
+    };
+    let Some(plan) = plan else {
         return None;
     };
 
@@ -2363,7 +2372,7 @@ impl Space {
         if !crate::morkl_plan::morkl_plan_dispatch_enabled() {
             return None;
         }
-        let Some(rule) = analyze_morkl_rule(pat_expr, tpl_expr) else {
+        let Some(rule) = analyze_morkl_rule(&self.btm, pat_expr, tpl_expr) else {
             return None;
         };
 
@@ -3744,7 +3753,7 @@ mod tests {
             "[4] exec 0 [3] , [2] a $ [2] b $ [3] , [2] seen-a _1 [1] done"
         );
 
-        crate::morkl_plan::set_morkl_plan_dispatch(true);
+        crate::morkl_plan::set_morkl_plan_dispatch_all();
         let result = space.transform_multi_multi_planned(pattern, template, add);
         crate::morkl_plan::set_morkl_plan_dispatch(false);
 
