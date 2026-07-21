@@ -171,3 +171,89 @@ fn f8_newvar_template_stock_shape() {
     let (_, dump) = run_and_dump(F8_NEWVAR_TEMPLATE, 100);
     assert_eq!(dump, "(a 1)\n(also $a 1)\n(b x)\n(fresh $a)");
 }
+
+/// Run one program on two spaces and assert byte-identical dumps per metta_calculus step.
+/// `planned` toggles the (future) plan dispatch; in PR1 both run stock, so this asserts
+/// determinism of the harness itself.
+fn assert_lockstep(prog: &str, max_steps: usize) {
+    let mut stock = Space::new();
+    let mut plan = Space::new();
+    stock.add_all_sexpr(prog.as_bytes()).unwrap();
+    plan.add_all_sexpr(prog.as_bytes()).unwrap();
+    #[cfg(feature = "morkl_plan")]
+    {
+        // set_morkl_plan_dispatch exists from PR2 on; until then this block is a no-op
+        // via the cfg on the module. Wire it in PR3 Task 10 step 3.
+    }
+    for step in 0..max_steps {
+        let a = stock.metta_calculus(1);
+        let b = plan.metta_calculus(1);
+        assert_eq!(a, b, "step-count divergence at step {step}");
+        let (mut va, mut vb) = (Vec::new(), Vec::new());
+        stock.dump_all_sexpr(&mut va).unwrap();
+        plan.dump_all_sexpr(&mut vb).unwrap();
+        assert_eq!(va, vb, "space divergence after step {step}");
+        if a == 0 {
+            break;
+        }
+    }
+}
+
+#[test]
+fn lockstep_all_fixtures() {
+    for prog in [
+        F1_HOIST,
+        F2_MIXED,
+        F3_EMPTY_COMPONENT,
+        F4_SCHEMATIC,
+        F5_SHARED,
+        F6_COMPOUND,
+        F7_DUPS,
+        F8_NEWVAR_TEMPLATE,
+    ] {
+        assert_lockstep(prog, 32);
+    }
+}
+
+/// Deterministic pseudo-random program generator for property differentials: k relations,
+/// random facts, one exec whose body samples 2-4 relations with fresh or shared vars.
+/// Uses a hand-rolled LCG so the corpus is reproducible without new dependencies.
+fn gen_program(seed: u64) -> String {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let mut next = move |m: u64| {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % m
+    };
+    let nrel = 2 + next(3) as usize; // 2..=4 relations r0..r3
+    let mut prog = String::new();
+    for r in 0..nrel {
+        for _ in 0..(1 + next(5)) {
+            prog.push_str(&format!("(r{r} v{})\n", next(4)));
+        }
+    }
+    let mut body = String::new();
+    let mut vars_used = 0usize;
+    for r in 0..nrel {
+        let v = if vars_used > 0 && next(3) == 0 {
+            next(vars_used as u64) as usize
+        } else {
+            vars_used += 1;
+            vars_used - 1
+        };
+        body.push_str(&format!(" (r{r} $x{v})"));
+    }
+    // template uses the first variable only => SingleComponent on split bodies
+    prog.push_str(&format!("(exec 0 (,{body}) (, (out $x0) (done)))\n"));
+    prog
+}
+
+#[test]
+fn lockstep_generated_corpus() {
+    for seed in 0..200u64 {
+        assert_lockstep(&gen_program(seed), 8);
+    }
+}
