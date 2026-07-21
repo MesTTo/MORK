@@ -2,7 +2,6 @@ use std::io::{BufRead, Read, Write};
 use std::{mem, process, ptr};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
-use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::hint::unreachable_unchecked;
 use std::mem::MaybeUninit;
@@ -413,15 +412,7 @@ pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
 #[cfg(feature = "morkl_plan")]
-#[derive(Clone)]
-enum MorklPlanMemoEntry {
-    Admitted(std::sync::Arc<MorklPlannedRule>),
-    Declined,
-}
-
-#[cfg(feature = "morkl_plan")]
 struct MorklPlannedRule {
-    plan: crate::morkl_plan::MorklJoinPlan,
     nvars: usize,
     components: Box<[MorklPlanComponent]>,
     ground_template_indices: Box<[usize]>,
@@ -436,27 +427,16 @@ struct MorklPlanComponent {
 }
 
 #[cfg(feature = "morkl_plan")]
-fn morkl_rule_key(pat_expr: Expr, tpl_expr: Expr) -> Vec<u8> {
-    let pat_span = unsafe { pat_expr.span().as_ref().unwrap() };
-    let tpl_span = unsafe { tpl_expr.span().as_ref().unwrap() };
-    let mut key = Vec::with_capacity(pat_span.len() + tpl_span.len() + 1);
-    key.extend_from_slice(pat_span);
-    key.push(0xff);
-    key.extend_from_slice(tpl_span);
-    key
-}
-
-#[cfg(feature = "morkl_plan")]
-fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
+fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> Option<MorklPlannedRule> {
     use crate::morkl_plan::TemplateClass;
 
     if unsafe { *tpl_expr.ptr.add(2) } != b',' {
-        return MorklPlanMemoEntry::Declined;
+        return None;
     }
 
     let body = unsafe { pat_expr.span().as_ref().unwrap() };
     let Some((factors, nvars)) = crate::zipper_join::parse_body_factors(body) else {
-        return MorklPlanMemoEntry::Declined;
+        return None;
     };
 
     let mut tpl_args = Vec::with_capacity(64);
@@ -467,7 +447,7 @@ fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
         .map(|template| unsafe { template.span().as_ref().unwrap() })
         .collect();
     let Some(plan) = crate::morkl_plan::analyze(&factors, nvars, &template_spans) else {
-        return MorklPlanMemoEntry::Declined;
+        return None;
     };
 
     let mut ground_template_indices = Vec::new();
@@ -479,7 +459,7 @@ fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
                 templates_by_component[component].push(template_index)
             }
             TemplateClass::Mixed | TemplateClass::Unsupported => {
-                return MorklPlanMemoEntry::Declined;
+                return None;
             }
         }
     }
@@ -491,7 +471,7 @@ fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
             .map(|&factor_index| factors[factor_index].clone())
             .collect::<Vec<_>>();
         if !crate::zipper_join::body_factors_routable_to_zipper_join(&component_factors) {
-            return MorklPlanMemoEntry::Declined;
+            return None;
         }
         let var_order = (0..nvars)
             .filter(|&var| plan.body().var_component(var) == Some(component_index))
@@ -505,12 +485,11 @@ fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
         });
     }
 
-    MorklPlanMemoEntry::Admitted(std::sync::Arc::new(MorklPlannedRule {
-        plan,
+    Some(MorklPlannedRule {
         nvars,
         components: components.into_boxed_slice(),
         ground_template_indices: ground_template_indices.into_boxed_slice(),
-    }))
+    })
 }
 
 #[cfg(feature = "morkl_plan")]
@@ -538,11 +517,6 @@ fn morkl_component_bindings(
 }
 
 pub struct Space {
-    /// Rule-shape analysis for this Space. Both admissions and declines live until the Space is
-    /// dropped; `fork_empty` starts empty. Analysis depends only on the key bytes, so retaining an
-    /// entry after its rule fact is consumed cannot change semantics. It can only retain memory.
-    #[cfg(feature = "morkl_plan")]
-    morkl_plan_memo: HashMap<Vec<u8>, MorklPlanMemoEntry>,
     /// Per-rule frontiers for the semi-naive immediate-consequence delta, armed by
     /// `metta_calculus` for the duration of its loop (None on every other caller, so
     /// every default path stays the naive full-space match).
@@ -1196,8 +1170,6 @@ macro_rules! sexpr {
 impl Space {
     pub fn new() -> Self {
         Self {
-            #[cfg(feature = "morkl_plan")]
-            morkl_plan_memo: HashMap::new(),
             #[cfg(feature = "semi_naive_ic")]
             sni_rule_seen: None,
             #[cfg(feature = "semi_naive_ic")]
@@ -1217,8 +1189,6 @@ impl Space {
 
     pub fn fork_empty(&self) -> Self {
         Self {
-            #[cfg(feature = "morkl_plan")]
-            morkl_plan_memo: HashMap::new(),
             #[cfg(feature = "semi_naive_ic")]
             sni_rule_seen: None,
             #[cfg(feature = "semi_naive_ic")]
@@ -2380,23 +2350,6 @@ impl Space {
         self.transform_multi_multi_naive(pat_expr, tpl_expr, add)
     }
 
-    #[cfg(feature = "morkl_plan")]
-    fn morkl_plan_for_rule(&mut self, pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
-        if !crate::morkl_plan::morkl_plan_memo_enabled() {
-            return analyze_morkl_rule(pat_expr, tpl_expr);
-        }
-
-        let key = morkl_rule_key(pat_expr, tpl_expr);
-        match self.morkl_plan_memo.entry(key) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let analysis = analyze_morkl_rule(pat_expr, tpl_expr);
-                entry.insert(analysis.clone());
-                analysis
-            }
-        }
-    }
-
     /// Execute a separable plain-template transform through independent unifying joins. The
     /// returned count is the number of successful template applications, not the stock full-product
     /// match count. No semantic caller consumes this count; `any_new` retains its stock meaning.
@@ -2410,15 +2363,13 @@ impl Space {
         if !crate::morkl_plan::morkl_plan_dispatch_enabled() {
             return None;
         }
-        let MorklPlanMemoEntry::Admitted(rule) = self.morkl_plan_for_rule(pat_expr, tpl_expr)
-        else {
+        let Some(rule) = analyze_morkl_rule(pat_expr, tpl_expr) else {
             return None;
         };
 
         let mut tpl_args = Vec::with_capacity(64);
         ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
         let templates: Vec<Expr> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
-        debug_assert_eq!(rule.plan.template_classes().len(), templates.len());
 
         let mut pat_args = Vec::with_capacity(64);
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
@@ -3783,38 +3734,6 @@ mod tests {
 
     #[cfg(feature = "morkl_plan")]
     #[test]
-    fn morkl_plan_memo_caches_admissions_and_declines() {
-        let mut space = Space::new();
-        let pattern = crate::expr!(space, "[3] , [2] a $ [2] b $");
-        let admitted_template = crate::expr!(space, "[3] , [2] seen _1 [1] done");
-        let declined_template = crate::expr!(space, "[2] , [3] pair _1 _2");
-
-        let MorklPlanMemoEntry::Admitted(first) =
-            space.morkl_plan_for_rule(pattern, admitted_template)
-        else {
-            panic!("separable rule must be admitted");
-        };
-        let MorklPlanMemoEntry::Admitted(second) =
-            space.morkl_plan_for_rule(pattern, admitted_template)
-        else {
-            panic!("cached separable rule must stay admitted");
-        };
-        assert!(std::sync::Arc::ptr_eq(&first, &second));
-        assert_eq!(space.morkl_plan_memo.len(), 1);
-
-        assert!(matches!(
-            space.morkl_plan_for_rule(pattern, declined_template),
-            MorklPlanMemoEntry::Declined
-        ));
-        assert!(matches!(
-            space.morkl_plan_for_rule(pattern, declined_template),
-            MorklPlanMemoEntry::Declined
-        ));
-        assert_eq!(space.morkl_plan_memo.len(), 2);
-    }
-
-    #[cfg(feature = "morkl_plan")]
-    #[test]
     fn morkl_empty_component_is_handled_without_emission() {
         let mut space = Space::new();
         space.add_all_sexpr(b"(a 1) (a 2)").unwrap();
@@ -3830,10 +3749,6 @@ mod tests {
         crate::morkl_plan::set_morkl_plan_dispatch(false);
 
         assert_eq!(result, Some((0, false)));
-        assert!(matches!(
-            space.morkl_plan_memo.values().next(),
-            Some(MorklPlanMemoEntry::Admitted(_))
-        ));
     }
 
     fn pattern_sources(space: &mut Space, pattern: &str) -> Vec<ExprEnv> {

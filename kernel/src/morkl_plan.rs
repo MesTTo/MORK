@@ -8,12 +8,9 @@
 //! not prove that the whole body has a solution. The planned transform must existence-check every
 //! component before emitting any template, including a ground template.
 //!
-//! The PR3 dispatch must memoize analysis by the stable `pattern || 0xff || template` rule key,
-//! following `sni_rule_seen`. Any dispatch change must pass `ai-bench-guard` in every feature
-//! configuration. Declining the plan on a small firing must not add repeated analysis cost.
+//! Any dispatch change must pass `ai-bench-guard` in every feature configuration.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mork_expr::{Tag, maybe_byte_item};
@@ -32,23 +29,6 @@ pub fn planned_firings() -> usize {
 #[inline]
 pub(crate) fn record_planned_firing() {
     PLANNED_FIRINGS.fetch_add(1, Ordering::Relaxed);
-}
-
-fn memo_enabled_from_env(value: Option<&str>) -> bool {
-    value != Some("0")
-}
-
-thread_local! {
-    /// Per-thread memoization toggle. Analysis caching is on by default and can be disabled at
-    /// thread start with `MORK_MORKL_PLAN_MEMO=0` for measurement. The environment is read once so
-    /// a memo hit does not pay an environment lookup.
-    static MORKL_PLAN_MEMO_ENABLED: bool =
-        memo_enabled_from_env(std::env::var("MORK_MORKL_PLAN_MEMO").as_deref().ok());
-}
-
-/// Whether this thread caches planned-transform admission by rule shape.
-pub fn morkl_plan_memo_enabled() -> bool {
-    MORKL_PLAN_MEMO_ENABLED.with(|enabled| *enabled)
 }
 
 /// Planned-transform dispatch mode: off, the default structurally gated policy, or every
@@ -112,7 +92,7 @@ impl UnionFindId for FactorId {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct BodyPlanData {
+pub struct BodyPlan {
     component_offsets: Box<[usize]>,
     factor_indices: Box<[usize]>,
     var_components: Box<[Option<usize>]>,
@@ -120,40 +100,37 @@ struct BodyPlanData {
 
 /// Independent factor components and the component that owns each query variable.
 ///
-/// Components use factor indices from the parsed body. The flat, shared representation keeps
-/// construction allocation-light and makes a cached plan constant-time to clone.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BodyPlan(Arc<BodyPlanData>);
+/// Components use factor indices from the parsed body. The flat representation keeps construction
+/// allocation-light.
 
 impl BodyPlan {
     /// Number of independent body components.
     pub fn component_count(&self) -> usize {
-        self.0.component_offsets.len() - 1
+        self.component_offsets.len() - 1
     }
 
     /// Factors in one component, in body order.
     pub fn component(&self, component: usize) -> Option<&[usize]> {
-        let start = *self.0.component_offsets.get(component)?;
-        let end = *self.0.component_offsets.get(component + 1)?;
-        Some(&self.0.factor_indices[start..end])
+        let start = *self.component_offsets.get(component)?;
+        let end = *self.component_offsets.get(component + 1)?;
+        Some(&self.factor_indices[start..end])
     }
 
     /// Every component in first-factor order.
     pub fn components(&self) -> impl ExactSizeIterator<Item = &[usize]> + '_ {
-        self.0
-            .component_offsets
+        self.component_offsets
             .windows(2)
-            .map(|range| &self.0.factor_indices[range[0]..range[1]])
+            .map(|range| &self.factor_indices[range[0]..range[1]])
     }
 
     /// Component containing `var`, or `None` when the parsed body does not use it.
     pub fn var_component(&self, var: usize) -> Option<usize> {
-        self.0.var_components.get(var).copied().flatten()
+        self.var_components.get(var).copied().flatten()
     }
 
     /// Component ownership for all query-variable ids below the parser's `nvars`.
     pub fn var_components(&self) -> &[Option<usize>] {
-        &self.0.var_components
+        &self.var_components
     }
 }
 
@@ -226,11 +203,11 @@ pub fn partition_components(factors: &[Factor], nvars: usize) -> BodyPlan {
         .map(|factor| factor.map(|factor| factor_components[factor.index()]))
         .collect::<Vec<_>>();
 
-    BodyPlan(Arc::new(BodyPlanData {
+    BodyPlan {
         component_offsets: component_offsets.into_boxed_slice(),
         factor_indices: factor_indices.into_boxed_slice(),
         var_components: var_components.into_boxed_slice(),
-    }))
+    }
 }
 
 /// Dependency class of one output template.
@@ -313,41 +290,34 @@ pub fn classify_template(span: &[u8], body: &BodyPlan) -> TemplateClass {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct MorklJoinPlanData {
+pub struct MorklJoinPlan {
     body: BodyPlan,
     template_classes: Box<[TemplateClass]>,
 }
 
-/// Owned admission result suitable for a per-rule cache.
-///
-/// Cloning shares the complete result through one `Arc`; it does not copy component or template
-/// arrays.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MorklJoinPlan(Arc<MorklJoinPlanData>);
-
 impl MorklJoinPlan {
     /// Partition of the body factors.
     pub fn body(&self) -> &BodyPlan {
-        &self.0.body
+        &self.body
     }
 
     /// Classification corresponding positionally to the analyzed template spans.
     pub fn template_classes(&self) -> &[TemplateClass] {
-        &self.0.template_classes
+        &self.template_classes
     }
 }
 
 /// Admit a pre-partitioned body when every template is ground or component-local.
 ///
 /// Declined templates allocate nothing. Successful classification is repeated once to build the
-/// owned cache value after the allocation-free admission pass.
-pub fn admit(body: &BodyPlan, template_spans: &[&[u8]]) -> Option<MorklJoinPlan> {
+/// owned result after the allocation-free admission pass.
+pub fn admit(body: BodyPlan, template_spans: &[&[u8]]) -> Option<MorklJoinPlan> {
     if body.component_count() < 2 {
         return None;
     }
     if template_spans.iter().any(|span| {
         !matches!(
-            classify_template(span, body),
+            classify_template(span, &body),
             TemplateClass::Ground | TemplateClass::SingleComponent(_)
         )
     }) {
@@ -356,19 +326,19 @@ pub fn admit(body: &BodyPlan, template_spans: &[&[u8]]) -> Option<MorklJoinPlan>
 
     let template_classes = template_spans
         .iter()
-        .map(|span| classify_template(span, body))
+        .map(|span| classify_template(span, &body))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    Some(MorklJoinPlan(Arc::new(MorklJoinPlanData {
-        body: body.clone(),
+    Some(MorklJoinPlan {
+        body,
         template_classes,
-    })))
+    })
 }
 
 /// Partition and admit a parsed body as a pure function of its rule shape.
 ///
 /// The constant-time factor-count check and allocation-free template preflight precede component
-/// construction. PR3 can cache the owned result by pattern and template bytes.
+/// construction.
 pub fn analyze(
     factors: &[Factor],
     nvars: usize,
@@ -385,15 +355,14 @@ pub fn analyze(
     }
 
     let body = partition_components(factors, nvars);
-    admit(&body, template_spans)
+    admit(body, template_spans)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyPlan, DispatchMode, MorklJoinPlan, TemplateClass, admit, analyze, classify_template,
-        memo_enabled_from_env, morkl_plan_dispatch_enabled, partition_components,
-        set_morkl_plan_dispatch,
+        BodyPlan, DispatchMode, TemplateClass, admit, analyze, classify_template,
+        morkl_plan_dispatch_enabled, partition_components, set_morkl_plan_dispatch,
     };
     use crate::space::Space;
     use crate::zipper_join::{Factor, parse_body_factors};
@@ -426,13 +395,6 @@ mod tests {
 
         set_morkl_plan_dispatch(true);
         assert!(morkl_plan_dispatch_enabled());
-    }
-
-    #[test]
-    fn memoization_defaults_on_and_zero_disables_it() {
-        assert!(memo_enabled_from_env(None));
-        assert!(memo_enabled_from_env(Some("1")));
-        assert!(!memo_enabled_from_env(Some("0")));
     }
 
     fn plan(source: &str) -> BodyPlan {
@@ -501,7 +463,7 @@ mod tests {
         let templates = [encoded("[2] seen-a _1"), encoded("[1] done")];
         let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
-        let admitted = admit(&body, &spans).expect("F1 must be admitted");
+        let admitted = admit(body, &spans).expect("F1 must be admitted");
 
         assert_eq!(
             admitted.template_classes(),
@@ -515,7 +477,7 @@ mod tests {
         let templates = [encoded("[2] seen _1")];
         let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
 
-        assert!(admit(&body, &spans).is_none());
+        assert!(admit(body, &spans).is_none());
     }
 
     fn analysis_is_rejected(body: &str, template: &str) -> bool {
@@ -534,18 +496,4 @@ mod tests {
         assert!(analysis_is_rejected("[3] , [2] a $ [2] b $", "[2] fresh $"));
     }
 
-    fn owned_analysis() -> MorklJoinPlan {
-        let (factors, nvars) = parsed_body("[3] , [2] a $ [2] b $");
-        let templates = [encoded("[2] seen-a _1"), encoded("[1] done")];
-        let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        analyze(&factors, nvars, &spans).expect("F1 must be admitted")
-    }
-
-    #[test]
-    fn analysis_result_owns_cacheable_plan_data() {
-        let admitted = owned_analysis();
-        let cached = admitted.clone();
-
-        assert_eq!(cached, admitted);
-    }
 }
