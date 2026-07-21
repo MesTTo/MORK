@@ -45,6 +45,10 @@ weighted_select = []
 factorized_aggregate = [] # experimental: route COUNT/SUM/MIN/MAX/AND sinks to the factorized aggregation engine
 compiled_matcher = [] # experimental: route VarRef-free plain queries through the compiled match program (diverges on the HE conformance corpus; keep off until repaired)
 leapfrog = [] # experimental: route flat conjunctive exec bodies to the WCO leapfrog join
+# Symbolic MORKL plan: independent-component analysis + per-template routing of the
+# transform, executing components through the unifying join instead of enumerating the
+# full product. Differential-gated; see morkl_plan.rs.
+morkl_plan = []
 guarded_emit = [] # experimental: sink-side output filter by schema-table generalization retrieval
 retrieval_join = [] # experimental: unifiability retrieval into stored regions as a join-side operation
 no_search = []
@@ -73,3 +77,7 @@ required-features = ["einsum"]
 name = "eqrel_sink"
 path = "tests/eqrel_sink.rs"
 required-features = ["eqrel"]
+
+[[test]]
+name = "morkl_plan_differential"
+required-features = ["morkl_plan"]
