@@ -416,6 +416,8 @@ struct MorklPlannedRule {
     nvars: usize,
     components: Box<[MorklPlanComponent]>,
     ground_template_indices: Box<[usize]>,
+    folded_component: Option<usize>,
+    probe_order: Box<[usize]>,
 }
 
 #[cfg(feature = "morkl_plan")]
@@ -424,6 +426,7 @@ struct MorklPlanComponent {
     factors: Box<[crate::zipper_join::Factor]>,
     var_order: Box<[usize]>,
     template_indices: Box<[usize]>,
+    probe_cost: usize,
 }
 
 #[cfg(feature = "morkl_plan")]
@@ -490,19 +493,60 @@ fn analyze_morkl_rule(
         let var_order = (0..nvars)
             .filter(|&var| plan.body().var_component(var) == Some(component_index))
             .collect::<Vec<_>>();
+        let probe_cost = plan.factor_counts().map_or_else(
+            || {
+                component_factors
+                    .iter()
+                    .map(|factor| {
+                        crate::zipper_join::bounded_fact_count(
+                            map,
+                            factor,
+                            crate::zipper_join::DISPATCH_MIN_FACTS,
+                        )
+                    })
+                    .min()
+                    .unwrap_or(0)
+            },
+            |factor_counts| {
+                source_indices
+                    .iter()
+                    .map(|factor_index| factor_counts[*factor_index])
+                    .min()
+                    .unwrap_or(0)
+            },
+        );
         components.push(MorklPlanComponent {
             source_indices: source_indices.to_vec().into_boxed_slice(),
             factors: component_factors.into_boxed_slice(),
             var_order: var_order.into_boxed_slice(),
             template_indices: std::mem::take(&mut templates_by_component[component_index])
                 .into_boxed_slice(),
+            probe_cost,
         });
     }
+
+    let mut folded_component: Option<usize> = None;
+    for (component_index, component) in components.iter().enumerate() {
+        if component.template_indices.is_empty() {
+            continue;
+        }
+        if folded_component.is_none_or(|folded| {
+            component.probe_cost > components[folded].probe_cost
+        }) {
+            folded_component = Some(component_index);
+        }
+    }
+    let mut probe_order = (0..components.len())
+        .filter(|component| Some(*component) != folded_component)
+        .collect::<Vec<_>>();
+    probe_order.sort_unstable_by_key(|component| (components[*component].probe_cost, *component));
 
     Some(MorklPlannedRule {
         nvars,
         components: components.into_boxed_slice(),
         ground_template_indices: ground_template_indices.into_boxed_slice(),
+        folded_component,
+        probe_order: probe_order.into_boxed_slice(),
     })
 }
 
@@ -2393,8 +2437,10 @@ impl Space {
         read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
 
         // A full-body solution exists exactly when every independent component has a unifiable
-        // tuple. Probe every component before opening a writer or applying any template.
-        for component in rule.components.iter() {
+        // tuple. Probe every other component cheapest first. The folded emitting component proves
+        // its own existence while it enumerates, avoiding one redundant join setup.
+        for &component_index in rule.probe_order.iter() {
+            let component = &rule.components[component_index];
             let mut nonempty = false;
             crate::zipper_join::run_unify_join_stream(
                 &read_copy,
@@ -2498,16 +2544,20 @@ impl Space {
 
         let empty_bindings = BTreeMap::new();
         let mut ground_oi = 0;
-        for &template_index in rule.ground_template_indices.iter() {
-            if let Some(next_oi) = apply_template(template_index, ground_oi, 0, &empty_bindings) {
-                ground_oi = next_oi;
+        if rule.folded_component.is_none() {
+            for &template_index in rule.ground_template_indices.iter() {
+                if let Some(next_oi) =
+                    apply_template(template_index, ground_oi, 0, &empty_bindings)
+                {
+                    ground_oi = next_oi;
+                }
             }
         }
 
-        for component in rule.components.iter() {
-            if component.template_indices.is_empty() {
-                continue;
-            }
+        let mut enumerate_component =
+            |component_index: usize, emit_ground_on_first: bool| -> bool {
+            let component = &rule.components[component_index];
+            let mut nonempty = false;
             crate::zipper_join::run_unify_join_stream(
                 &read_copy,
                 &component.factors,
@@ -2534,6 +2584,21 @@ impl Space {
                     }) else {
                         return true;
                     };
+                    if !nonempty {
+                        nonempty = true;
+                        if emit_ground_on_first {
+                            for &template_index in rule.ground_template_indices.iter() {
+                                if let Some(next_oi) = apply_template(
+                                    template_index,
+                                    ground_oi,
+                                    0,
+                                    &empty_bindings,
+                                ) {
+                                    ground_oi = next_oi;
+                                }
+                            }
+                        }
+                    }
                     for &template_index in component.template_indices.iter() {
                         if let Some(next_oi) = apply_template(template_index, oi, ni, &bindings) {
                             oi = next_oi;
@@ -2542,8 +2607,24 @@ impl Space {
                     true
                 },
             );
+            nonempty
+        };
+
+        let folded_nonempty = rule
+            .folded_component
+            .is_none_or(|component| enumerate_component(component, true));
+        if folded_nonempty {
+            for (component_index, component) in rule.components.iter().enumerate() {
+                if Some(component_index) == rule.folded_component
+                    || component.template_indices.is_empty()
+                {
+                    continue;
+                }
+                enumerate_component(component_index, false);
+            }
         }
 
+        drop(enumerate_component);
         drop(apply_template);
         #[cfg(feature = "bulk_emit")]
         bulk.flush(&mut template_wzs, &mut any_new);
@@ -3747,22 +3828,61 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "morkl_plan")]
-    #[test]
-    fn morkl_empty_component_is_handled_without_emission() {
+    fn run_morkl_plan_direct(
+        facts: &[u8],
+        pattern: &str,
+        template: &str,
+        add: &str,
+    ) -> Option<(usize, bool)> {
         let mut space = Space::new();
-        space.add_all_sexpr(b"(a 1) (a 2)").unwrap();
-        let pattern = crate::expr!(space, "[3] , [2] a $ [2] b $");
-        let template = crate::expr!(space, "[3] , [2] seen-a _1 [1] done");
-        let add = crate::expr!(
-            space,
-            "[4] exec 0 [3] , [2] a $ [2] b $ [3] , [2] seen-a _1 [1] done"
-        );
+        space.add_all_sexpr(facts).unwrap();
+        let pattern = crate::expr!(space, pattern);
+        let template = crate::expr!(space, template);
+        let add = crate::expr!(space, add);
 
         crate::morkl_plan::set_morkl_plan_dispatch_all();
         let result = space.transform_multi_multi_planned(pattern, template, add);
         crate::morkl_plan::set_morkl_plan_dispatch(false);
+        result
+    }
 
-        assert_eq!(result, Some((0, false)));
+    #[cfg(feature = "morkl_plan")]
+    #[test]
+    fn morkl_empty_component_is_handled_without_emission() {
+        let local_and_ground = "[3] , [2] seen-a _1 [1] done";
+        let add =
+            "[4] exec 0 [3] , [2] a $ [2] b $ [3] , [2] seen-a _1 [1] done";
+
+        assert_eq!(
+            run_morkl_plan_direct(
+                b"(a 1) (a 2)",
+                "[3] , [2] a $ [2] b $",
+                local_and_ground,
+                add,
+            ),
+            Some((0, false)),
+            "an empty non-emitting component must block local and ground templates",
+        );
+        assert_eq!(
+            run_morkl_plan_direct(
+                b"(b x)",
+                "[3] , [2] a $ [2] b $",
+                local_and_ground,
+                add,
+            ),
+            Some((0, false)),
+            "an empty folded emitting component must block every template",
+        );
+        assert_eq!(
+            run_morkl_plan_direct(
+                b"(a 1)",
+                "[3] , [2] a $ [2] b $",
+                "[2] , [1] done",
+                "[4] exec 0 [3] , [2] a $ [2] b $ [2] , [1] done",
+            ),
+            Some((0, false)),
+            "a ground-only plan must retain every existence probe",
+        );
     }
 
     fn pattern_sources(space: &mut Space, pattern: &str) -> Vec<ExprEnv> {

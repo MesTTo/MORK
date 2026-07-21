@@ -7,7 +7,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use mork::morkl_plan::{PLANNED_FIRINGS, planned_firings, set_morkl_plan_dispatch};
+use mork::morkl_plan::{
+    PLANNED_FIRINGS, planned_firings, set_morkl_plan_dispatch, set_morkl_plan_dispatch_all,
+};
 use mork::space::Space;
 
 static ROUTING_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -37,6 +39,13 @@ const F1_HOIST: &str = r#"
 /// be emitted - not even the ground template. The existential trap fixture.
 const F3_EMPTY_COMPONENT: &str = r#"
 (a 1) (a 2)
+(exec 0 (, (a $i) (b $j)) (, (seen-a $i) (done)))
+"#;
+
+/// F3B: the emitting component is empty while the non-emitting guard has a fact. Folding the
+/// existence check into enumeration must still suppress the ground template.
+const F3B_EMPTY_EMITTING_COMPONENT: &str = r#"
+(b x)
 (exec 0 (, (a $i) (b $j)) (, (seen-a $i) (done)))
 "#;
 
@@ -191,7 +200,7 @@ fn f8_newvar_template_stock_shape() {
 }
 
 /// Run one program on stock and planned routes and return the planned emission count.
-fn assert_lockstep(prog: &str, max_steps: usize) -> usize {
+fn assert_lockstep(prog: &str, max_steps: usize, force_all: bool) -> usize {
     PLANNED_FIRINGS.store(0, Ordering::Relaxed);
     let mut stock = Space::new();
     let mut plan = Space::new();
@@ -200,7 +209,11 @@ fn assert_lockstep(prog: &str, max_steps: usize) -> usize {
     for step in 0..max_steps {
         set_morkl_plan_dispatch(false);
         let a = stock.metta_calculus(1);
-        set_morkl_plan_dispatch(true);
+        if force_all {
+            set_morkl_plan_dispatch_all();
+        } else {
+            set_morkl_plan_dispatch(true);
+        }
         let b = plan.metta_calculus(1);
         assert_eq!(a, b, "step-count divergence at step {step}");
         let (mut va, mut vb) = (Vec::new(), Vec::new());
@@ -231,7 +244,7 @@ fn lockstep_all_fixtures() {
         ("F7", F7_DUPS, Some(false)),
         ("F8", F8_NEWVAR_TEMPLATE, Some(false)),
     ] {
-        let firings = assert_lockstep(prog, 32);
+        let firings = assert_lockstep(prog, 32, false);
         println!("{name} PLANNED_FIRINGS={firings}");
         match should_emit {
             Some(true) => assert!(firings > 0, "{name} must emit through the planned route"),
@@ -239,6 +252,20 @@ fn lockstep_all_fixtures() {
             None => {}
         }
     }
+    assert!(
+        assert_lockstep(F1_HOIST, 32, true) > 0,
+        "F1 must emit through forced structural admission",
+    );
+    assert_eq!(
+        assert_lockstep(F3_EMPTY_COMPONENT, 32, true),
+        0,
+        "F3 must not emit when the standalone guard is empty",
+    );
+    assert_eq!(
+        assert_lockstep(F3B_EMPTY_EMITTING_COMPONENT, 32, true),
+        0,
+        "F3B must not emit when the folded component is empty",
+    );
 }
 
 /// Deterministic pseudo-random program generator for property differentials: k relations,
@@ -289,11 +316,11 @@ fn lockstep_generated_corpus() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     for seed in 0..200u64 {
         let (program, _) = gen_program(seed, true);
-        let firings = assert_lockstep(&program, 8);
+        let firings = assert_lockstep(&program, 8, false);
         assert_eq!(firings, 0, "small generated case seed={seed}");
     }
     for seed in 0..200u64 {
         let (program, _) = gen_program(seed, false);
-        assert_lockstep(&program, 8);
+        assert_lockstep(&program, 8, false);
     }
 }

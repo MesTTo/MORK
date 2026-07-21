@@ -87,8 +87,9 @@ pub fn set_morkl_plan_dispatch(on: bool) {
     })
 }
 
-#[cfg(test)]
-pub(crate) fn set_morkl_plan_dispatch_all() {
+/// Force structural admission for the current thread, bypassing only the profitability gate.
+/// Differential and scaling tests use this to exercise the planned executor on small fixtures.
+pub fn set_morkl_plan_dispatch_all() {
     MORKL_PLAN_DISPATCH.with(|mode| mode.set(DispatchMode::All));
 }
 
@@ -307,6 +308,7 @@ pub fn classify_template(span: &[u8], body: &BodyPlan) -> TemplateClass {
 pub struct MorklJoinPlan {
     body: BodyPlan,
     template_classes: Box<[TemplateClass]>,
+    factor_counts: Option<Box<[usize]>>,
 }
 
 impl MorklJoinPlan {
@@ -318,6 +320,11 @@ impl MorklJoinPlan {
     /// Classification corresponding positionally to the analyzed template spans.
     pub fn template_classes(&self) -> &[TemplateClass] {
         &self.template_classes
+    }
+
+    /// Capped relation counts retained by gated analysis for deterministic probe ordering.
+    pub(crate) fn factor_counts(&self) -> Option<&[usize]> {
+        self.factor_counts.as_deref()
     }
 }
 
@@ -346,6 +353,7 @@ pub fn admit(body: BodyPlan, template_spans: &[&[u8]]) -> Option<MorklJoinPlan> 
     Some(MorklJoinPlan {
         body,
         template_classes,
+        factor_counts: None,
     })
 }
 
@@ -441,8 +449,12 @@ pub fn analyze(
         return None;
     }
 
-    let plan = analyze_preflighted(factors, nvars, template_spans)?;
-    profitable(&factor_counts, factors, &plan).then_some(plan)
+    let mut plan = analyze_preflighted(factors, nvars, template_spans)?;
+    if !profitable(&factor_counts, factors, &plan) {
+        return None;
+    }
+    plan.factor_counts = Some(factor_counts.into_boxed_slice());
+    Some(plan)
 }
 
 /// Structural admission for the explicit `MORK_MORKL_PLAN=all` diagnostic mode.
@@ -451,10 +463,9 @@ pub(crate) fn analyze_ungated(
     nvars: usize,
     template_spans: &[&[u8]],
 ) -> Option<MorklJoinPlan> {
-    if !analysis_preflight(factors, template_spans) {
-        return None;
-    }
-    analyze_preflighted(factors, nvars, template_spans)
+    analysis_preflight(factors, template_spans)
+        .then(|| analyze_preflighted(factors, nvars, template_spans))
+        .flatten()
 }
 
 #[cfg(test)]
