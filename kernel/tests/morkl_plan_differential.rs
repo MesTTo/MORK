@@ -1,15 +1,20 @@
 //! Differential oracle for the MORKL symbolic plan route.
 //!
-//! Every fixture runs the same MM2 program on two Spaces - stock dispatch pinned off via
-//! set_morkl_plan_dispatch(false), planned dispatch on - and asserts byte-identical
-//! dump_all_sexpr output plus identical metta_calculus step counts. In PR1 the planned
-//! route does not exist yet, so both sides run stock and the tests pin TODAY's behavior
-//! (dumps recorded as insta-style string constants would rot; we compare live-vs-live).
+//! Every fixture runs the same MM2 program on two Spaces. Stock dispatch is pinned off and planned
+//! dispatch is pinned on before each corresponding step. The runner asserts byte-identical
+//! `dump_all_sexpr` output and identical `metta_calculus` step counts.
 
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+
+use mork::morkl_plan::{PLANNED_FIRINGS, planned_firings, set_morkl_plan_dispatch};
 use mork::space::Space;
+
+static ROUTING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Run `prog` to quiescence and return (steps, sorted dump).
 fn run_and_dump(prog: &str, max_steps: usize) -> (usize, String) {
+    set_morkl_plan_dispatch(false);
     let mut s = Space::new();
     s.add_all_sexpr(prog.as_bytes()).unwrap();
     let steps = s.metta_calculus(max_steps);
@@ -170,10 +175,7 @@ fn f6_compound_stock_shape() {
 #[test]
 fn f6b_repeated_var_stock_shape() {
     let (_, dump) = run_and_dump(F6B_REPEATED_VAR, 100);
-    assert_eq!(
-        dump,
-        "(b x)\n(done)\n(p 1 2)\n(p 2 2)\n(seen 2)"
-    );
+    assert_eq!(dump, "(b x)\n(done)\n(p 1 2)\n(p 2 2)\n(seen 2)");
 }
 
 #[test]
@@ -189,21 +191,17 @@ fn f8_newvar_template_stock_shape() {
     assert_eq!(dump, "(a 1)\n(also $a 1)\n(b x)\n(fresh $a)");
 }
 
-/// Run one program on two spaces and assert byte-identical dumps per metta_calculus step.
-/// `planned` toggles the (future) plan dispatch; in PR1 both run stock, so this asserts
-/// determinism of the harness itself.
-fn assert_lockstep(prog: &str, max_steps: usize) {
+/// Run one program on stock and planned routes and return the planned emission count.
+fn assert_lockstep(prog: &str, max_steps: usize) -> usize {
+    PLANNED_FIRINGS.store(0, Ordering::Relaxed);
     let mut stock = Space::new();
     let mut plan = Space::new();
     stock.add_all_sexpr(prog.as_bytes()).unwrap();
     plan.add_all_sexpr(prog.as_bytes()).unwrap();
-    #[cfg(feature = "morkl_plan")]
-    {
-        // set_morkl_plan_dispatch exists from PR2 on; until then this block is a no-op
-        // via the cfg on the module. Wire it in PR3 Task 10 step 3.
-    }
     for step in 0..max_steps {
+        set_morkl_plan_dispatch(false);
         let a = stock.metta_calculus(1);
+        set_morkl_plan_dispatch(true);
         let b = plan.metta_calculus(1);
         assert_eq!(a, b, "step-count divergence at step {step}");
         let (mut va, mut vb) = (Vec::new(), Vec::new());
@@ -214,29 +212,40 @@ fn assert_lockstep(prog: &str, max_steps: usize) {
             break;
         }
     }
+    set_morkl_plan_dispatch(false);
+    planned_firings()
 }
 
 #[test]
 fn lockstep_all_fixtures() {
-    for prog in [
-        F1_HOIST,
-        F2_MIXED,
-        F3_EMPTY_COMPONENT,
-        F4_SCHEMATIC,
-        F5_SHARED,
-        F6_COMPOUND,
-        F6B_REPEATED_VAR,
-        F7_DUPS,
-        F8_NEWVAR_TEMPLATE,
+    let _guard = ROUTING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (name, prog, should_emit) in [
+        ("F1", F1_HOIST, Some(true)),
+        ("F2", F2_MIXED, Some(false)),
+        ("F3", F3_EMPTY_COMPONENT, None),
+        ("F4", F4_SCHEMATIC, None),
+        ("F5", F5_SHARED, Some(false)),
+        ("F6", F6_COMPOUND, Some(true)),
+        ("F6B", F6B_REPEATED_VAR, Some(true)),
+        ("F7", F7_DUPS, Some(true)),
+        ("F8", F8_NEWVAR_TEMPLATE, Some(false)),
     ] {
-        assert_lockstep(prog, 32);
+        let firings = assert_lockstep(prog, 32);
+        println!("{name} PLANNED_FIRINGS={firings}");
+        match should_emit {
+            Some(true) => assert!(firings > 0, "{name} must emit through the planned route"),
+            Some(false) => assert_eq!(firings, 0, "{name} must decline the planned route"),
+            None => {}
+        }
     }
 }
 
 /// Deterministic pseudo-random program generator for property differentials: k relations,
 /// random facts, one exec whose body samples 2-4 relations with fresh or shared vars.
 /// Uses a hand-rolled LCG so the corpus is reproducible without new dependencies.
-fn gen_program(seed: u64) -> String {
+fn gen_program(seed: u64) -> (String, bool) {
     let mut state = seed
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
@@ -249,6 +258,9 @@ fn gen_program(seed: u64) -> String {
     let nrel = 2 + next(3) as usize; // 2..=4 relations r0..r3
     let mut prog = String::new();
     for r in 0..nrel {
+        // Keep every shared-variable component satisfiable so a structurally qualifying case must
+        // emit and can prove planned-route engagement.
+        prog.push_str(&format!("(r{r} v0)\n"));
         for _ in 0..(1 + next(5)) {
             prog.push_str(&format!("(r{r} v{})\n", next(4)));
         }
@@ -266,12 +278,24 @@ fn gen_program(seed: u64) -> String {
     }
     // template uses the first variable only => SingleComponent on split bodies
     prog.push_str(&format!("(exec 0 (,{body}) (, (out $x0) (done)))\n"));
-    prog
+    (prog, vars_used >= 2)
 }
 
 #[test]
 fn lockstep_generated_corpus() {
+    let _guard = ROUTING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for seed in 0..200u64 {
-        assert_lockstep(&gen_program(seed), 8);
+        let (program, qualifies) = gen_program(seed);
+        let firings = assert_lockstep(&program, 8);
+        if qualifies {
+            assert!(
+                firings > 0,
+                "qualifying generated case seed={seed} must emit through the planned route"
+            );
+        } else {
+            assert_eq!(firings, 0, "single-component generated seed={seed}");
+        }
     }
 }

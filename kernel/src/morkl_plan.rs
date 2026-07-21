@@ -14,11 +14,42 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mork_expr::{Tag, maybe_byte_item};
 
 use crate::union_find::{UnionFind, UnionFindId};
 use crate::zipper_join::{Factor, collect_factor_vars};
+
+/// Number of planned-route firings that emitted at least one template application.
+pub static PLANNED_FIRINGS: AtomicUsize = AtomicUsize::new(0);
+
+/// Read the process-wide planned-route emission count.
+pub fn planned_firings() -> usize {
+    PLANNED_FIRINGS.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub(crate) fn record_planned_firing() {
+    PLANNED_FIRINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+fn memo_enabled_from_env(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+thread_local! {
+    /// Per-thread memoization toggle. Analysis caching is on by default and can be disabled at
+    /// thread start with `MORK_MORKL_PLAN_MEMO=0` for measurement. The environment is read once so
+    /// a memo hit does not pay an environment lookup.
+    static MORKL_PLAN_MEMO_ENABLED: bool =
+        memo_enabled_from_env(std::env::var("MORK_MORKL_PLAN_MEMO").as_deref().ok());
+}
+
+/// Whether this thread caches planned-transform admission by rule shape.
+pub fn morkl_plan_memo_enabled() -> bool {
+    MORKL_PLAN_MEMO_ENABLED.with(|enabled| *enabled)
+}
 
 /// Planned-transform dispatch mode: off, the default structurally gated policy, or every
 /// structurally admissible body.
@@ -361,7 +392,8 @@ pub fn analyze(
 mod tests {
     use super::{
         BodyPlan, DispatchMode, MorklJoinPlan, TemplateClass, admit, analyze, classify_template,
-        morkl_plan_dispatch_enabled, partition_components, set_morkl_plan_dispatch,
+        memo_enabled_from_env, morkl_plan_dispatch_enabled, partition_components,
+        set_morkl_plan_dispatch,
     };
     use crate::space::Space;
     use crate::zipper_join::{Factor, parse_body_factors};
@@ -394,6 +426,13 @@ mod tests {
 
         set_morkl_plan_dispatch(true);
         assert!(morkl_plan_dispatch_enabled());
+    }
+
+    #[test]
+    fn memoization_defaults_on_and_zero_disables_it() {
+        assert!(memo_enabled_from_env(None));
+        assert!(memo_enabled_from_env(Some("1")));
+        assert!(!memo_enabled_from_env(Some("0")));
     }
 
     fn plan(source: &str) -> BodyPlan {

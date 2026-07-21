@@ -412,7 +412,137 @@ fn stratified_non_exec_count_delta() -> isize {
 pub static ACT_PATH: &'static str = "/dev/shm/";
 // pub static ACT_PATH: &'static str = "/mnt/data/";
 
+#[cfg(feature = "morkl_plan")]
+#[derive(Clone)]
+enum MorklPlanMemoEntry {
+    Admitted(std::sync::Arc<MorklPlannedRule>),
+    Declined,
+}
+
+#[cfg(feature = "morkl_plan")]
+struct MorklPlannedRule {
+    plan: crate::morkl_plan::MorklJoinPlan,
+    nvars: usize,
+    components: Box<[MorklPlanComponent]>,
+    ground_template_indices: Box<[usize]>,
+}
+
+#[cfg(feature = "morkl_plan")]
+struct MorklPlanComponent {
+    source_indices: Box<[usize]>,
+    factors: Box<[crate::zipper_join::Factor]>,
+    var_order: Box<[usize]>,
+    template_indices: Box<[usize]>,
+}
+
+#[cfg(feature = "morkl_plan")]
+fn morkl_rule_key(pat_expr: Expr, tpl_expr: Expr) -> Vec<u8> {
+    let pat_span = unsafe { pat_expr.span().as_ref().unwrap() };
+    let tpl_span = unsafe { tpl_expr.span().as_ref().unwrap() };
+    let mut key = Vec::with_capacity(pat_span.len() + tpl_span.len() + 1);
+    key.extend_from_slice(pat_span);
+    key.push(0xff);
+    key.extend_from_slice(tpl_span);
+    key
+}
+
+#[cfg(feature = "morkl_plan")]
+fn analyze_morkl_rule(pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
+    use crate::morkl_plan::TemplateClass;
+
+    if unsafe { *tpl_expr.ptr.add(2) } != b',' {
+        return MorklPlanMemoEntry::Declined;
+    }
+
+    let body = unsafe { pat_expr.span().as_ref().unwrap() };
+    let Some((factors, nvars)) = crate::zipper_join::parse_body_factors(body) else {
+        return MorklPlanMemoEntry::Declined;
+    };
+
+    let mut tpl_args = Vec::with_capacity(64);
+    ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+    let templates: Vec<Expr> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+    let template_spans: Vec<&[u8]> = templates
+        .iter()
+        .map(|template| unsafe { template.span().as_ref().unwrap() })
+        .collect();
+    let Some(plan) = crate::morkl_plan::analyze(&factors, nvars, &template_spans) else {
+        return MorklPlanMemoEntry::Declined;
+    };
+
+    let mut ground_template_indices = Vec::new();
+    let mut templates_by_component = vec![Vec::new(); plan.body().component_count()];
+    for (template_index, class) in plan.template_classes().iter().enumerate() {
+        match *class {
+            TemplateClass::Ground => ground_template_indices.push(template_index),
+            TemplateClass::SingleComponent(component) => {
+                templates_by_component[component].push(template_index)
+            }
+            TemplateClass::Mixed | TemplateClass::Unsupported => {
+                return MorklPlanMemoEntry::Declined;
+            }
+        }
+    }
+
+    let mut components = Vec::with_capacity(plan.body().component_count());
+    for (component_index, source_indices) in plan.body().components().enumerate() {
+        let component_factors = source_indices
+            .iter()
+            .map(|&factor_index| factors[factor_index].clone())
+            .collect::<Vec<_>>();
+        if !crate::zipper_join::body_factors_routable_to_zipper_join(&component_factors) {
+            return MorklPlanMemoEntry::Declined;
+        }
+        let var_order = (0..nvars)
+            .filter(|&var| plan.body().var_component(var) == Some(component_index))
+            .collect::<Vec<_>>();
+        components.push(MorklPlanComponent {
+            source_indices: source_indices.to_vec().into_boxed_slice(),
+            factors: component_factors.into_boxed_slice(),
+            var_order: var_order.into_boxed_slice(),
+            template_indices: std::mem::take(&mut templates_by_component[component_index])
+                .into_boxed_slice(),
+        });
+    }
+
+    MorklPlanMemoEntry::Admitted(std::sync::Arc::new(MorklPlannedRule {
+        plan,
+        nvars,
+        components: components.into_boxed_slice(),
+        ground_template_indices: ground_template_indices.into_boxed_slice(),
+    }))
+}
+
+#[cfg(feature = "morkl_plan")]
+fn morkl_component_bindings(
+    sources: &[ExprEnv],
+    source_indices: &[usize],
+    tuple: &[Vec<u8>],
+) -> Option<BTreeMap<(u8, u8), ExprEnv>> {
+    debug_assert_eq!(source_indices.len(), tuple.len());
+    count_unifications(1);
+    let mut pairs = Vec::with_capacity(tuple.len());
+    for (tuple_index, fact) in tuple.iter().enumerate() {
+        let source_index = source_indices[tuple_index];
+        pairs.push((
+            sources[source_index],
+            ExprEnv::new(
+                (source_index + 1) as u8,
+                Expr {
+                    ptr: fact.as_ptr().cast_mut(),
+                },
+            ),
+        ));
+    }
+    unify(&mut pairs).ok()
+}
+
 pub struct Space {
+    /// Rule-shape analysis for this Space. Both admissions and declines live until the Space is
+    /// dropped; `fork_empty` starts empty. Analysis depends only on the key bytes, so retaining an
+    /// entry after its rule fact is consumed cannot change semantics. It can only retain memory.
+    #[cfg(feature = "morkl_plan")]
+    morkl_plan_memo: HashMap<Vec<u8>, MorklPlanMemoEntry>,
     /// Per-rule frontiers for the semi-naive immediate-consequence delta, armed by
     /// `metta_calculus` for the duration of its loop (None on every other caller, so
     /// every default path stays the naive full-space match).
@@ -451,7 +581,7 @@ pub struct Space {
     /// and the z3 table is touched only at transform boundaries, which lock once.
     pub z3s: std::sync::Mutex<HashMap<OwnedSourceItem, Box<Popen>>>,
     pub last_merkleize: Instant,
-    pub timing: bool
+    pub timing: bool,
 }
 
 /// One rule's semi-naive frontier: the match input (`btm` plus the consumed exec)
@@ -1066,6 +1196,8 @@ macro_rules! sexpr {
 impl Space {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "morkl_plan")]
+            morkl_plan_memo: HashMap::new(),
             #[cfg(feature = "semi_naive_ic")]
             sni_rule_seen: None,
             #[cfg(feature = "semi_naive_ic")]
@@ -1085,6 +1217,8 @@ impl Space {
 
     pub fn fork_empty(&self) -> Self {
         Self {
+            #[cfg(feature = "morkl_plan")]
+            morkl_plan_memo: HashMap::new(),
             #[cfg(feature = "semi_naive_ic")]
             sni_rule_seen: None,
             #[cfg(feature = "semi_naive_ic")]
@@ -1197,7 +1331,7 @@ impl Space {
 
         Ok(i)
     }
-     */
+    */
 
 
     pub fn load_csv(&mut self, r: &[u8], pattern: Expr, template: Expr, seperator: u8) -> Result<usize, String> {
@@ -2246,11 +2380,232 @@ impl Space {
         self.transform_multi_multi_naive(pat_expr, tpl_expr, add)
     }
 
+    #[cfg(feature = "morkl_plan")]
+    fn morkl_plan_for_rule(&mut self, pat_expr: Expr, tpl_expr: Expr) -> MorklPlanMemoEntry {
+        if !crate::morkl_plan::morkl_plan_memo_enabled() {
+            return analyze_morkl_rule(pat_expr, tpl_expr);
+        }
+
+        let key = morkl_rule_key(pat_expr, tpl_expr);
+        match self.morkl_plan_memo.entry(key) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let analysis = analyze_morkl_rule(pat_expr, tpl_expr);
+                entry.insert(analysis.clone());
+                analysis
+            }
+        }
+    }
+
+    /// Execute a separable plain-template transform through independent unifying joins. The
+    /// returned count is the number of successful template applications, not the stock full-product
+    /// match count. No semantic caller consumes this count; `any_new` retains its stock meaning.
+    #[cfg(feature = "morkl_plan")]
+    fn transform_multi_multi_planned(
+        &mut self,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+        add: Expr,
+    ) -> Option<(usize, bool)> {
+        if !crate::morkl_plan::morkl_plan_dispatch_enabled() {
+            return None;
+        }
+        let MorklPlanMemoEntry::Admitted(rule) = self.morkl_plan_for_rule(pat_expr, tpl_expr)
+        else {
+            return None;
+        };
+
+        let mut tpl_args = Vec::with_capacity(64);
+        ExprEnv::new(0, tpl_expr).args(&mut tpl_args);
+        let templates: Vec<Expr> = tpl_args[1..].iter().map(|ee| ee.subsexpr()).collect();
+        debug_assert_eq!(rule.plan.template_classes().len(), templates.len());
+
+        let mut pat_args = Vec::with_capacity(64);
+        ExprEnv::new(0, pat_expr).args(&mut pat_args);
+        let sources = &pat_args[1..];
+
+        let mut read_copy = self.btm.clone();
+        read_copy.insert(unsafe { add.span().as_ref().unwrap() }, ());
+
+        // A full-body solution exists exactly when every independent component has a unifiable
+        // tuple. Probe every component before opening a writer or applying any template.
+        for component in rule.components.iter() {
+            let mut nonempty = false;
+            crate::zipper_join::run_unify_join_stream(
+                &read_copy,
+                &component.factors,
+                &component.var_order,
+                rule.nvars,
+                &mut |tuple| {
+                    if morkl_component_bindings(sources, &component.source_indices, tuple).is_some()
+                    {
+                        nonempty = true;
+                        false
+                    } else {
+                        true
+                    }
+                },
+            );
+            if !nonempty {
+                return Some((0, false));
+            }
+        }
+
+        let mut buffer = Vec::with_capacity(1 << 32);
+        unsafe {
+            buffer.set_len(1 << 32);
+        }
+        let template_prefixes: Vec<_> = templates
+            .iter()
+            .map(|template| unsafe {
+                template
+                    .prefix()
+                    .unwrap_or_else(|span| span)
+                    .as_ref()
+                    .unwrap()
+            })
+            .collect();
+        let mut subsumption = Self::prefix_subsumption(&template_prefixes);
+        let mut placements = subsumption.clone();
+        let mut zh = self.btm.zipper_head();
+        let mut template_wzs: Vec<_> = Vec::with_capacity(64);
+        template_prefixes
+            .iter()
+            .enumerate()
+            .for_each(|(i, prefix)| {
+                if subsumption[i] == i {
+                    placements[i] = template_wzs.len();
+                    template_wzs
+                        .push(unsafe { zh.write_zipper_at_exclusive_path_unchecked(prefix) });
+                }
+            });
+        for i in 0..subsumption.len() {
+            subsumption[i] = placements[subsumption[i]];
+        }
+
+        let mut ass = Vec::with_capacity(64);
+        let mut astack = Vec::with_capacity(64);
+        let mut assignments: Vec<(u8, u8)> = Vec::new();
+        let mut apply_trace: Vec<(u8, u8)> = Vec::new();
+        let mut any_new = false;
+        let mut touched = 0usize;
+        #[cfg(feature = "bulk_emit")]
+        let mut bulk = BulkEmit::new(template_wzs.len());
+
+        let mut apply_template = |template_index: usize,
+                                  oi: u8,
+                                  ni: u8,
+                                  bindings: &BTreeMap<(u8, u8), ExprEnv>|
+         -> Option<u8> {
+            count_writes(1);
+            buffer.clear();
+            let (next_oi, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(
+                0,
+                oi,
+                ni,
+                templates[template_index],
+                bindings,
+                buffer,
+                astack,
+                ass
+            ) else {
+                return None;
+            };
+            #[cfg(not(feature = "bulk_emit"))]
+            {
+                let wz = &mut template_wzs[subsumption[template_index]];
+                wz.move_to_path(&buffer[wz.root_prefix_path().len()..]);
+                let inserted = wz.set_val(()).is_none();
+                stratified_note_btm_insert(&buffer, inserted);
+                any_new |= inserted;
+            }
+            #[cfg(feature = "bulk_emit")]
+            bulk_queue_output(
+                &mut bulk,
+                &mut template_wzs,
+                subsumption[template_index],
+                &buffer,
+                &mut any_new,
+            );
+            touched += 1;
+            Some(next_oi)
+        };
+
+        let empty_bindings = BTreeMap::new();
+        let mut ground_oi = 0;
+        for &template_index in rule.ground_template_indices.iter() {
+            if let Some(next_oi) = apply_template(template_index, ground_oi, 0, &empty_bindings) {
+                ground_oi = next_oi;
+            }
+        }
+
+        for component in rule.components.iter() {
+            if component.template_indices.is_empty() {
+                continue;
+            }
+            crate::zipper_join::run_unify_join_stream(
+                &read_copy,
+                &component.factors,
+                &component.var_order,
+                rule.nvars,
+                &mut |tuple| {
+                    let Some(bindings) =
+                        morkl_component_bindings(sources, &component.source_indices, tuple)
+                    else {
+                        return true;
+                    };
+                    let (mut oi, ni, true) = ({
+                        let mut void = std::io::sink();
+                        mork_expr::apply_e_clears_stacks_and_cycles_check!(
+                            0,
+                            0,
+                            0,
+                            pat_expr,
+                            &bindings,
+                            void,
+                            apply_trace,
+                            assignments
+                        )
+                    }) else {
+                        return true;
+                    };
+                    for &template_index in component.template_indices.iter() {
+                        if let Some(next_oi) = apply_template(template_index, oi, ni, &bindings) {
+                            oi = next_oi;
+                        }
+                    }
+                    true
+                },
+            );
+        }
+
+        drop(apply_template);
+        #[cfg(feature = "bulk_emit")]
+        bulk.flush(&mut template_wzs, &mut any_new);
+        for wz in template_wzs {
+            zh.cleanup_write_zipper(wz);
+        }
+        if touched > 0 {
+            crate::morkl_plan::record_planned_firing();
+        }
+        Some((touched, any_new))
+    }
+
     /// The naive full-space match for a `,`->`,` rule: match the whole body against
     /// `btm` plus the consumed exec and emit every template instantiation. The
     /// unconditional, always-correct path every default caller and every semi-naive
     /// fall-through routes to.
-    pub fn transform_multi_multi_naive(&mut self, pat_expr: Expr, tpl_expr: Expr, add: Expr) -> (usize, bool) {
+    pub fn transform_multi_multi_naive(
+        &mut self,
+        pat_expr: Expr,
+        tpl_expr: Expr,
+        add: Expr,
+    ) -> (usize, bool) {
+        #[cfg(feature = "morkl_plan")]
+        if let Some(result) = self.transform_multi_multi_planned(pat_expr, tpl_expr, add) {
+            return result;
+        }
+
         let mut buffer = Vec::with_capacity(1 << 32);
         unsafe { buffer.set_len(1 << 32); }
         let mut tpl_args = Vec::with_capacity(64);
@@ -3425,6 +3780,61 @@ impl Drop for Space {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "morkl_plan")]
+    #[test]
+    fn morkl_plan_memo_caches_admissions_and_declines() {
+        let mut space = Space::new();
+        let pattern = crate::expr!(space, "[3] , [2] a $ [2] b $");
+        let admitted_template = crate::expr!(space, "[3] , [2] seen _1 [1] done");
+        let declined_template = crate::expr!(space, "[2] , [3] pair _1 _2");
+
+        let MorklPlanMemoEntry::Admitted(first) =
+            space.morkl_plan_for_rule(pattern, admitted_template)
+        else {
+            panic!("separable rule must be admitted");
+        };
+        let MorklPlanMemoEntry::Admitted(second) =
+            space.morkl_plan_for_rule(pattern, admitted_template)
+        else {
+            panic!("cached separable rule must stay admitted");
+        };
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(space.morkl_plan_memo.len(), 1);
+
+        assert!(matches!(
+            space.morkl_plan_for_rule(pattern, declined_template),
+            MorklPlanMemoEntry::Declined
+        ));
+        assert!(matches!(
+            space.morkl_plan_for_rule(pattern, declined_template),
+            MorklPlanMemoEntry::Declined
+        ));
+        assert_eq!(space.morkl_plan_memo.len(), 2);
+    }
+
+    #[cfg(feature = "morkl_plan")]
+    #[test]
+    fn morkl_empty_component_is_handled_without_emission() {
+        let mut space = Space::new();
+        space.add_all_sexpr(b"(a 1) (a 2)").unwrap();
+        let pattern = crate::expr!(space, "[3] , [2] a $ [2] b $");
+        let template = crate::expr!(space, "[3] , [2] seen-a _1 [1] done");
+        let add = crate::expr!(
+            space,
+            "[4] exec 0 [3] , [2] a $ [2] b $ [3] , [2] seen-a _1 [1] done"
+        );
+
+        crate::morkl_plan::set_morkl_plan_dispatch(true);
+        let result = space.transform_multi_multi_planned(pattern, template, add);
+        crate::morkl_plan::set_morkl_plan_dispatch(false);
+
+        assert_eq!(result, Some((0, false)));
+        assert!(matches!(
+            space.morkl_plan_memo.values().next(),
+            Some(MorklPlanMemoEntry::Admitted(_))
+        ));
+    }
 
     fn pattern_sources(space: &mut Space, pattern: &str) -> Vec<ExprEnv> {
         let pattern = crate::expr!(space, pattern);
