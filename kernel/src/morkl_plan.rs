@@ -8,13 +8,14 @@
 //! not prove that the whole body has a solution. The planned transform must existence-check every
 //! component before emitting any template, including a ground template.
 //!
-//! The PR3 dispatch must memoize analysis by the stable rule key formed from pattern bytes followed
-//! by template bytes, following `sni_rule_seen`. Any dispatch change must pass `ai-bench-guard` in
-//! every feature configuration. Declining the plan on a small firing must not add repeated analysis
-//! cost.
+//! The PR3 dispatch must memoize analysis by the stable `pattern || 0xff || template` rule key,
+//! following `sni_rule_seen`. Any dispatch change must pass `ai-bench-guard` in every feature
+//! configuration. Declining the plan on a small firing must not add repeated analysis cost.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+use mork_expr::{Tag, maybe_byte_item};
 
 use crate::union_find::{UnionFind, UnionFindId};
 use crate::zipper_join::{Factor, collect_factor_vars};
@@ -154,23 +155,197 @@ pub fn partition_components(factors: &[Factor], nvars: usize) -> BodyPlan {
     }))
 }
 
+/// Dependency class of one output template.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TemplateClass {
+    /// No variable occurrence. Emit once only after every body component is known nonempty.
+    Ground,
+    /// Every referenced query variable belongs to one body component.
+    SingleComponent(usize),
+    /// Referenced query variables belong to more than one component.
+    Mixed,
+    /// Contains a fresh `NewVar`, an unowned `VarRef`, or invalid encoded bytes.
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TemplateVars {
+    Unsupported,
+    Refs(u64),
+}
+
+/// Scan one exact encoded template without allocating. Symbol payload bytes must be skipped because
+/// their high bits overlap tag encodings.
+fn scan_template_vars(span: &[u8]) -> TemplateVars {
+    if span.is_empty() {
+        return TemplateVars::Unsupported;
+    }
+
+    let mut refs = 0u64;
+    let mut offset = 0;
+    while offset < span.len() {
+        let Ok(tag) = maybe_byte_item(span[offset]) else {
+            return TemplateVars::Unsupported;
+        };
+        match tag {
+            Tag::NewVar => return TemplateVars::Unsupported,
+            Tag::VarRef(var) => {
+                refs |= 1u64 << var;
+                offset += 1;
+            }
+            Tag::SymbolSize(size) => {
+                let next = offset + 1 + size as usize;
+                if next > span.len() {
+                    return TemplateVars::Unsupported;
+                }
+                offset = next;
+            }
+            Tag::Arity(_) => offset += 1,
+        }
+    }
+    TemplateVars::Refs(refs)
+}
+
+/// Classify a template against query-variable ownership in `body`.
+pub fn classify_template(span: &[u8], body: &BodyPlan) -> TemplateClass {
+    let TemplateVars::Refs(mut refs) = scan_template_vars(span) else {
+        return TemplateClass::Unsupported;
+    };
+    if refs == 0 {
+        return TemplateClass::Ground;
+    }
+
+    let mut owner = None;
+    while refs != 0 {
+        let var = refs.trailing_zeros() as usize;
+        refs &= refs - 1;
+        let Some(component) = body.var_component(var) else {
+            return TemplateClass::Unsupported;
+        };
+        match owner {
+            None => owner = Some(component),
+            Some(first) if first != component => return TemplateClass::Mixed,
+            Some(_) => {}
+        }
+    }
+    let Some(owner) = owner else {
+        return TemplateClass::Unsupported;
+    };
+    TemplateClass::SingleComponent(owner)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct MorklJoinPlanData {
+    body: BodyPlan,
+    template_classes: Box<[TemplateClass]>,
+}
+
+/// Owned admission result suitable for a per-rule cache.
+///
+/// Cloning shares the complete result through one `Arc`; it does not copy component or template
+/// arrays.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MorklJoinPlan(Arc<MorklJoinPlanData>);
+
+impl MorklJoinPlan {
+    /// Partition of the body factors.
+    pub fn body(&self) -> &BodyPlan {
+        &self.0.body
+    }
+
+    /// Classification corresponding positionally to the analyzed template spans.
+    pub fn template_classes(&self) -> &[TemplateClass] {
+        &self.0.template_classes
+    }
+}
+
+/// Admit a pre-partitioned body when every template is ground or component-local.
+///
+/// Declined templates allocate nothing. Successful classification is repeated once to build the
+/// owned cache value after the allocation-free admission pass.
+pub fn admit(body: &BodyPlan, template_spans: &[&[u8]]) -> Option<MorklJoinPlan> {
+    if body.component_count() < 2 {
+        return None;
+    }
+    if template_spans.iter().any(|span| {
+        !matches!(
+            classify_template(span, body),
+            TemplateClass::Ground | TemplateClass::SingleComponent(_)
+        )
+    }) {
+        return None;
+    }
+
+    let template_classes = template_spans
+        .iter()
+        .map(|span| classify_template(span, body))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Some(MorklJoinPlan(Arc::new(MorklJoinPlanData {
+        body: body.clone(),
+        template_classes,
+    })))
+}
+
+/// Partition and admit a parsed body as a pure function of its rule shape.
+///
+/// The constant-time factor-count check and allocation-free template preflight precede component
+/// construction. PR3 can cache the owned result by pattern and template bytes.
+pub fn analyze(
+    factors: &[Factor],
+    nvars: usize,
+    template_spans: &[&[u8]],
+) -> Option<MorklJoinPlan> {
+    if factors.len() < 2 {
+        return None;
+    }
+    if template_spans
+        .iter()
+        .any(|span| scan_template_vars(span) == TemplateVars::Unsupported)
+    {
+        return None;
+    }
+
+    let body = partition_components(factors, nvars);
+    admit(&body, template_spans)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BodyPlan, partition_components};
+    use super::{
+        BodyPlan, MorklJoinPlan, TemplateClass, admit, analyze, classify_template,
+        partition_components,
+    };
     use crate::space::Space;
-    use crate::zipper_join::parse_body_factors;
+    use crate::zipper_join::{Factor, parse_body_factors};
 
-    fn plan(source: &str) -> BodyPlan {
+    type PartitionCase = (
+        &'static str,
+        &'static [&'static [usize]],
+        &'static [Option<usize>],
+    );
+
+    fn parsed_body(source: &str) -> (Vec<Factor>, usize) {
         let space = Space::new();
         let body = crate::expr!(space, source);
         let span = unsafe { body.span().as_ref().unwrap() };
-        let (factors, nvars) = parse_body_factors(span).expect("body must parse");
+        parse_body_factors(span).expect("body must parse")
+    }
+
+    fn plan(source: &str) -> BodyPlan {
+        let (factors, nvars) = parsed_body(source);
         partition_components(&factors, nvars)
+    }
+
+    fn encoded(source: &str) -> Vec<u8> {
+        let space = Space::new();
+        let expression = crate::expr!(space, source);
+        unsafe { expression.span().as_ref().unwrap() }.to_vec()
     }
 
     #[test]
     fn partition_components_follows_shared_query_variables() {
-        let cases: &[(&str, &[&[usize]], &[Option<usize>])] = &[
+        let cases: &[PartitionCase] = &[
             ("[3] , [2] a $ [2] b $", &[&[0], &[1]], &[Some(0), Some(1)]),
             ("[3] , [2] a $ [2] b _1", &[&[0, 1]], &[Some(0)]),
             (
@@ -196,5 +371,78 @@ mod tests {
                 source
             );
         }
+    }
+
+    #[test]
+    fn classify_template_covers_f1_f2_and_f8_shapes() {
+        let body = plan("[3] , [2] a $ [2] b $");
+        let cases = [
+            ("[2] seen-a _1", TemplateClass::SingleComponent(0)),
+            ("[1] done", TemplateClass::Ground),
+            ("[3] pair _1 _2", TemplateClass::Mixed),
+            ("[2] fresh $", TemplateClass::Unsupported),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(
+                classify_template(&encoded(source), &body),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn admit_accepts_f1_supported_templates() {
+        let body = plan("[3] , [2] a $ [2] b $");
+        let templates = [encoded("[2] seen-a _1"), encoded("[1] done")];
+        let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+        let admitted = admit(&body, &spans).expect("F1 must be admitted");
+
+        assert_eq!(
+            admitted.template_classes(),
+            &[TemplateClass::SingleComponent(0), TemplateClass::Ground]
+        );
+    }
+
+    #[test]
+    fn admit_rejects_single_component_body() {
+        let body = plan("[3] , [2] a $ [2] b _1");
+        let templates = [encoded("[2] seen _1")];
+        let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+        assert!(admit(&body, &spans).is_none());
+    }
+
+    fn analysis_is_rejected(body: &str, template: &str) -> bool {
+        let (factors, nvars) = parsed_body(body);
+        let template = encoded(template);
+        analyze(&factors, nvars, &[template.as_slice()]).is_none()
+    }
+
+    #[test]
+    fn analyze_rejects_one_factor_before_partitioning() {
+        assert!(analysis_is_rejected("[2] , [2] a $", "[2] seen _1"));
+    }
+
+    #[test]
+    fn analyze_rejects_new_var_before_partitioning() {
+        assert!(analysis_is_rejected("[3] , [2] a $ [2] b $", "[2] fresh $"));
+    }
+
+    fn owned_analysis() -> MorklJoinPlan {
+        let (factors, nvars) = parsed_body("[3] , [2] a $ [2] b $");
+        let templates = [encoded("[2] seen-a _1"), encoded("[1] done")];
+        let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        analyze(&factors, nvars, &spans).expect("F1 must be admitted")
+    }
+
+    #[test]
+    fn analysis_result_owns_cacheable_plan_data() {
+        let admitted = owned_analysis();
+        let cached = admitted.clone();
+
+        assert_eq!(cached, admitted);
     }
 }
