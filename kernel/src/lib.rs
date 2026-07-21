@@ -9,6 +9,8 @@ pub mod path_dnf;
 #[cfg(feature = "pathspace_oracles")]
 pub mod path_space_ops;
 pub mod ghd;
+#[cfg(feature = "morkl_plan")]
+pub mod morkl_plan;
 pub mod space;
 pub mod json_path_query;
 pub mod zipper_join;
