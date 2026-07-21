@@ -384,9 +384,6 @@ fn profitable(factor_counts: &[usize], factors: &[Factor], plan: &MorklJoinPlan)
         let [factor_index] = component else {
             return false;
         };
-        if !factor_count_lower_bounds_single_factor_solutions(&factors[*factor_index]) {
-            return false;
-        }
         let lower_bound = factor_counts[*factor_index];
         if lower_bound == 0 {
             return false;
@@ -424,6 +421,12 @@ pub fn analyze(
     template_spans: &[&[u8]],
 ) -> Option<MorklJoinPlan> {
     if !analysis_preflight(factors, template_spans) {
+        return None;
+    }
+    if !factors
+        .iter()
+        .all(factor_count_lower_bounds_single_factor_solutions)
+    {
         return None;
     }
 
@@ -609,6 +612,29 @@ mod tests {
         let templates = [encoded("[2] seen-a _1"), encoded("[1] done")];
         let spans = templates.iter().map(Vec::as_slice).collect::<Vec<_>>();
         analyze(&space.btm, &factors, nvars, &spans).is_some()
+    }
+
+    fn encoded_body_passes_cardinality_preflight(body: &str) -> bool {
+        let mut space = Space::new();
+        let body = crate::expr!(space, body);
+        let span = unsafe { body.span().as_ref().unwrap() };
+        crate::zipper_join::body_has_independent_full_relation_scans(span)
+    }
+
+    #[test]
+    fn encoded_cardinality_preflight_accepts_only_independent_full_relation_scans() {
+        assert!(encoded_body_passes_cardinality_preflight(
+            "[3] , [2] a $ [2] b $"
+        ));
+        assert!(!encoded_body_passes_cardinality_preflight(
+            "[3] , [2] a $ [2] b _1"
+        ));
+        assert!(!encoded_body_passes_cardinality_preflight(
+            "[3] , [2] a [2] f $ [2] b $"
+        ));
+        assert!(!encoded_body_passes_cardinality_preflight(
+            "[3] , [3] a $ _1 [2] b $"
+        ));
     }
 
     #[test]

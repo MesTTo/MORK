@@ -439,6 +439,11 @@ fn analyze_morkl_rule(
     }
 
     let body = unsafe { pat_expr.span().as_ref().unwrap() };
+    if crate::morkl_plan::morkl_plan_profitability_required()
+        && !crate::zipper_join::body_has_independent_full_relation_scans(body)
+    {
+        return None;
+    }
     let Some((factors, nvars)) = crate::zipper_join::parse_body_factors(body) else {
         return None;
     };

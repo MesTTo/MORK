@@ -1291,6 +1291,72 @@ pub fn parse_body_factors(body: &[u8]) -> Option<(Vec<Factor>, usize)> {
     Some((factors, nvars))
 }
 
+/// Whether a body can pass morkl's conservative relation-count profitability proof.
+///
+/// This allocation-free preflight accepts only independent single-relation components with a
+/// ground head and distinct top-level variable columns. It mirrors
+/// [`factor_count_lower_bounds_single_factor_solutions`] on encoded bytes and rejects shared
+/// variables as soon as they would join two factors into one component. Rejection is conservative;
+/// the parsed-factor check remains authoritative before any bounded trie walk.
+pub(crate) fn body_has_independent_full_relation_scans(body: &[u8]) -> bool {
+    let Some(&body_tag) = body.first() else {
+        return false;
+    };
+    let Tag::Arity(body_arity) = byte_item(body_tag) else {
+        return false;
+    };
+    if body_arity < 3 {
+        return false;
+    }
+
+    let mut offset = 1usize;
+    let Some((head_len, true)) = try_parse_first_subterm(&body[offset..]) else {
+        return false;
+    };
+    offset += head_len;
+
+    let mut next_var = 0usize;
+    let mut seen_vars = [false; u8::MAX as usize + 1];
+    for _ in 1..body_arity {
+        let Some(&factor_tag) = body.get(offset) else {
+            return false;
+        };
+        let Tag::Arity(factor_arity) = byte_item(factor_tag) else {
+            return false;
+        };
+        if factor_arity < 2 {
+            return false;
+        }
+        offset += 1;
+
+        let Some((relation_len, true)) = try_parse_first_subterm(&body[offset..]) else {
+            return false;
+        };
+        offset += relation_len;
+
+        for _ in 1..factor_arity {
+            let Some(&column) = body.get(offset) else {
+                return false;
+            };
+            let var = match byte_item(column) {
+                Tag::NewVar if next_var < seen_vars.len() => {
+                    let var = next_var;
+                    next_var += 1;
+                    var
+                }
+                Tag::VarRef(var) if (var as usize) < next_var => var as usize,
+                Tag::NewVar | Tag::VarRef(_) | Tag::SymbolSize(_) | Tag::Arity(_) => return false,
+            };
+            if seen_vars[var] {
+                return false;
+            }
+            seen_vars[var] = true;
+            offset += 1;
+        }
+    }
+    offset == body.len()
+}
+
 /// One conjunct `(rel arg..)` to a factor. The prefix is the arity byte alone, and the relation
 /// head is column 0 like any argument: a variable query head then unifies with every stored head,
 /// and a wildcard stored head is captured under a ground query head, neither of which a head baked
