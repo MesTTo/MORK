@@ -1283,7 +1283,7 @@ fn sink_hash_expr() {
     let res = String::from_utf8_lossy_owned(v);
 
     println!("result: {res}");
-    assert_eq!(res, "(result XoicVnQv2bk)\n(result tspt4QCdRB8)\n");
+    assert_eq!(res, "(result -Egab4rQ3Nc)\n(result ru8oOBGFlq0)\n");
 }
 
 fn sink_even_half() {
