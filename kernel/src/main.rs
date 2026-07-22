@@ -308,12 +308,31 @@ fn process_calculus_bench(steps: usize, x: usize, y: usize) {
     // 200+200 (1000 steps) in 42716559 µs
 }
 
+/// Build one consumable addition receiver for every recursive value of `x`, plus the base case.
+/// The source/sink benchmark removes a matched receiver, so the generic reusable definitions used
+/// by `process_calculus_bench` would stop after one recursive call.
+fn process_calculus_linear_receivers(x: usize, y: usize) -> String {
+    let y_term = peano(y);
+    let mut receivers = String::new();
+    for predecessor in 0..x {
+        let x_term = peano(predecessor);
+        receivers.push_str(&format!(r#"
+(petri (? (add $ret) ((S {x_term}) {y_term})
+          (| (! (add (PN {x_term} {y_term})) ({x_term} {y_term}))
+             (? (PN {x_term} {y_term}) $z (! $ret (S $z))))))
+"#));
+    }
+    receivers.push_str(&format!("(petri (? (add $ret) (Z {y_term}) (! $ret {y_term})))\n"));
+    receivers
+}
+
 fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
     let mut s = Space::new();
+    let receivers = process_calculus_linear_receivers(x, y);
 
     // note 'idle' MM2-like statement that can be activated by moving it to the exec space
     let space_exprs = format!(r#"
-(exec (IC 0 1 {})
+(exec (IC 0 1 {step_term})
                (, (exec (IC $x $y (S $c)) $sp $st)
                   ((exec $x) $p $t))
                (, (exec (IC $y $x $c) $sp $st)
@@ -330,11 +349,13 @@ fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
          (- $par)
          ))
 
-(petri (? (add $ret) ((S $x) $y) (| (! (add (PN $x $y)) ($x $y))
-                                    (? (PN $x $y) $z (! $ret (S $z)))  )  ))
-(petri (? (add $ret) (Z $y) (! $ret $y)))
-(petri (! (add result) ({} {})))
-    "#, peano(steps), peano(x), peano(y));
+{receivers}
+(petri (! (add result) ({x_term} {y_term})))
+    "#,
+        step_term = peano(steps),
+        x_term = peano(x),
+        y_term = peano(y),
+    );
 
     s.add_sexpr(space_exprs.as_bytes(), expr!(s, "$"), expr!(s, "_1")).unwrap();
 
@@ -350,8 +371,8 @@ fn process_calculus_source_sink_bench(steps: usize, x: usize, y: usize) {
 
     println!("{x}+{y} ({} steps) in {} µs result: {res}", steps, elapsed.as_micros());
     assert_eq!(res, format!("{}\n", peano(x+y)));
-    let (t9, u9, _) = counters();
-    println!("unifications {u9}, instructions {t9}");
+    let (t9, u9, w9) = counters();
+    println!("unifications {u9}, writes {w9}, instructions {t9}");
     // (badbad)
     // 200+200 (1000 steps) in 42716559 µs
 }
@@ -6202,7 +6223,7 @@ fn main() {
                         match rest.split_once("_n") {
                             Some((steps_str, n_str)) => {
                                 match (steps_str.parse::<usize>(), n_str.parse::<usize>()) {
-                                    (Ok(steps), Ok(n)) => process_calculus_bench(steps, n, n),
+                                    (Ok(steps), Ok(n)) => process_calculus_source_sink_bench(steps, n, n),
                                     _ => println!(
                                         "bad process_calculus params in {s}: steps={steps_str} n={n_str}"
                                     ),
