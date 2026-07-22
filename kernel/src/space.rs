@@ -2034,12 +2034,12 @@ impl Space {
         factors: &[ExprEnv],
         effect: &mut F,
     ) -> Option<usize> {
-        let occurrences = Self::query_variable_occurrences(pat_expr)?;
         let mut search_sources = Vec::with_capacity(factors.len());
         let mut captures = Vec::with_capacity(factors.len());
+        let mut args = Vec::with_capacity(3);
 
         for factor in factors {
-            let mut args = Vec::with_capacity(3);
+            args.clear();
             factor.args(&mut args);
             if args.len() == 2 && Self::query_source_head_is(args[0], b"BTM") {
                 search_sources.push(args[1]);
@@ -2047,8 +2047,8 @@ impl Space {
                 continue;
             }
             if args.len() == 3 && Self::query_source_head_is(args[0], b"==") {
-                let (namespace, capture_var) = args[2].var_opt()?;
-                if namespace != 0 || occurrences.get(capture_var as usize).copied()? != 1 {
+                let (namespace, _) = args[2].var_opt()?;
+                if namespace != 0 {
                     return None;
                 }
                 search_sources.push(args[1]);
@@ -2056,6 +2056,16 @@ impl Space {
                 continue;
             }
             return None;
+        }
+
+        if captures.iter().any(Option::is_some) {
+            let occurrences = Self::query_variable_occurrences(pat_expr)?;
+            for capture in captures.iter().flatten() {
+                let (_, capture_var) = capture.var_opt()?;
+                if occurrences.get(capture_var as usize).copied()? != 1 {
+                    return None;
+                }
+            }
         }
 
         let plan: Vec<usize> = (0..search_sources.len()).collect();
@@ -2100,7 +2110,7 @@ impl Space {
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
 
         #[cfg(feature = "leapfrog")]
-        if !no_source {
+        if !no_source && crate::zipper_join::leapfrog_dispatch_enabled() {
             if let Some(touched) = Self::query_multi_i_eq_leapfrog(
                 btm,
                 pat_expr,
