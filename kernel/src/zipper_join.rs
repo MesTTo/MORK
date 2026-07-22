@@ -2883,9 +2883,13 @@ impl UnifyJoin<'_> {
         n
     }
 
+    #[inline(always)]
     fn factor_path(&self, f: usize) -> Vec<u8> {
-        let mut path = self.factors[f].prefix.clone();
-        path.extend_from_slice(&self.bound[f]);
+        let prefix = &self.factors[f].prefix;
+        let bound = &self.bound[f];
+        let mut path = Vec::with_capacity(prefix.len() + bound.len());
+        path.extend_from_slice(prefix);
+        path.extend_from_slice(bound);
         path
     }
 
