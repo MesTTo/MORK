@@ -6218,18 +6218,25 @@ fn main() {
                     "tile_puzzle_states" => { bench_tile_puzzle_states() }
                     "taxi_lts" => { bench_taxi_lts() }
                     "bfc" => { bfc(19) }
-                    s if s.starts_with("process_calculus_s") => {
-                        let rest = &s["process_calculus_s".len()..];
+                    s if s.starts_with("process_calculus_io_s")
+                        || s.starts_with("process_calculus_s") => {
+                        let (prefix, bench): (&str, fn(usize, usize, usize)) =
+                            if s.starts_with("process_calculus_io_s") {
+                                ("process_calculus_io_s", process_calculus_source_sink_bench)
+                            } else {
+                                ("process_calculus_s", process_calculus_bench)
+                            };
+                        let rest = &s[prefix.len()..];
                         match rest.split_once("_n") {
                             Some((steps_str, n_str)) => {
                                 match (steps_str.parse::<usize>(), n_str.parse::<usize>()) {
-                                    (Ok(steps), Ok(n)) => process_calculus_source_sink_bench(steps, n, n),
+                                    (Ok(steps), Ok(n)) => bench(steps, n, n),
                                     _ => println!(
                                         "bad process_calculus params in {s}: steps={steps_str} n={n_str}"
                                     ),
                                 }
                             }
-                            None => println!("expected process_calculus_s<steps>_n<n>, got {s}"),
+                            None => println!("expected {prefix}<steps>_n<n>, got {s}"),
                         }
                     }
                     s => { println!("bench not known: {s}") }
