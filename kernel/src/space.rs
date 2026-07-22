@@ -1984,6 +1984,104 @@ impl Space {
         }
     }
 
+    #[cfg(feature = "leapfrog")]
+    fn query_variable_occurrences(pat_expr: Expr) -> Option<[u8; 64]> {
+        let mut occurrences = [0u8; 64];
+        let mut next_var = 0usize;
+        let mut ez = ExprZipper::new(pat_expr);
+        loop {
+            match ez.tag() {
+                Tag::NewVar => {
+                    let count = occurrences.get_mut(next_var)?;
+                    *count = count.saturating_add(1);
+                    next_var += 1;
+                }
+                Tag::VarRef(var) => {
+                    let index = var as usize;
+                    if index >= next_var {
+                        return None;
+                    }
+                    occurrences[index] = occurrences[index].saturating_add(1);
+                }
+                Tag::SymbolSize(_) | Tag::Arity(_) => {}
+            }
+            if !ez.next() {
+                return Some(occurrences);
+            }
+        }
+    }
+
+    #[cfg(feature = "leapfrog")]
+    fn query_source_head_is(source: ExprEnv, expected: &[u8]) -> bool {
+        let expr = source.subsexpr();
+        unsafe {
+            match byte_item(*expr.ptr) {
+                Tag::SymbolSize(size) if size as usize == expected.len() => {
+                    slice_from_raw_parts(expr.ptr.byte_add(1), expected.len()).as_ref().unwrap() == expected
+                }
+                Tag::SymbolSize(_) | Tag::Arity(_) | Tag::NewVar | Tag::VarRef(_) => false,
+            }
+        }
+    }
+
+    /// Translate eligible interpreted sources to their stored-fact patterns and dispatch them to
+    /// the existing unifying leapfrog join. Equality captures are retained separately so the join
+    /// can bind each one to the whole reconstructed fact after it finds a tuple.
+    #[cfg(feature = "leapfrog")]
+    fn query_multi_i_eq_leapfrog<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(
+        btm: &PathMap<()>,
+        pat_expr: Expr,
+        factors: &[ExprEnv],
+        effect: &mut F,
+    ) -> Option<usize> {
+        let occurrences = Self::query_variable_occurrences(pat_expr)?;
+        let mut search_sources = Vec::with_capacity(factors.len());
+        let mut captures = Vec::with_capacity(factors.len());
+
+        for factor in factors {
+            let mut args = Vec::with_capacity(3);
+            factor.args(&mut args);
+            if args.len() == 2 && Self::query_source_head_is(args[0], b"BTM") {
+                search_sources.push(args[1]);
+                captures.push(None);
+                continue;
+            }
+            if args.len() == 3 && Self::query_source_head_is(args[0], b"==") {
+                let (namespace, capture_var) = args[2].var_opt()?;
+                if namespace != 0 || occurrences.get(capture_var as usize).copied()? != 1 {
+                    return None;
+                }
+                search_sources.push(args[1]);
+                captures.push(Some(args[2]));
+                continue;
+            }
+            return None;
+        }
+
+        let plan: Vec<usize> = (0..search_sources.len()).collect();
+        let (buffers, _) = Self::renormalize_query_factors(&search_sources, &plan)?;
+        let arity = u8::try_from(buffers.len().checked_add(1)?).ok()?;
+        if arity > 63 {
+            return None;
+        }
+        let capacity = 3usize + buffers.iter().map(Vec::len).sum::<usize>();
+        let mut translated = Vec::with_capacity(capacity);
+        translated.push(item_byte(Tag::Arity(arity)));
+        translated.push(item_byte(Tag::SymbolSize(1)));
+        translated.push(b',');
+        for buffer in &buffers {
+            translated.extend_from_slice(buffer);
+        }
+        let translated_expr = Expr { ptr: translated.as_mut_ptr() };
+        crate::zipper_join::query_multi_i_eq_leapfrog(
+            btm,
+            translated_expr,
+            &search_sources,
+            &captures,
+            effect,
+        )
+    }
+
     pub fn query_multi_i<F : FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool>(no_source: bool,
             mmaps: &mut HashMap<OwnedSourceItem, ArenaCompactTree<memmap2::Mmap>>,
             z3s: &mut HashMap<OwnedSourceItem, Box<Popen>>,
@@ -2000,6 +2098,18 @@ impl Space {
         }
         let mut pat_args = Vec::with_capacity(n_factors);
         ExprEnv::new(0, pat_expr).args(&mut pat_args);
+
+        #[cfg(feature = "leapfrog")]
+        if !no_source {
+            if let Some(touched) = Self::query_multi_i_eq_leapfrog(
+                btm,
+                pat_expr,
+                &pat_args[1..],
+                &mut effect,
+            ) {
+                return touched;
+            }
+        }
 
         trace!(target: "query_multi_i", "z3s {:?}", z3s.keys().collect::<Vec<_>>());
         let mut srcs: Vec<_> = Vec::with_capacity(n_factors);

@@ -1499,6 +1499,10 @@ thread_local! {
             _ => DispatchMode::Intersecting,
         },
     );
+
+    /// Number of interpreted equality-source queries admitted to this route on this thread.
+    /// The differential uses the count to prove that equality fixtures exercised the new path.
+    static IO_EQ_LEAPFROG_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the space-to-space transform routes conjunctive bodies to the leapfrog join on this
@@ -1517,6 +1521,94 @@ pub fn set_leapfrog_dispatch(on: bool) {
             DispatchMode::Off
         })
     })
+}
+
+/// Force every eligible interpreted equality-source body through the leapfrog route on this
+/// thread. This is the test and benchmark counterpart of `MORK_LEAPFROG=all`.
+pub fn set_leapfrog_dispatch_all() {
+    LEAPFROG_DISPATCH.with(|c| c.set(DispatchMode::All));
+}
+
+/// Reset the current thread's interpreted equality-source route count.
+pub fn reset_io_eq_leapfrog_queries() {
+    IO_EQ_LEAPFROG_QUERIES.with(|c| c.set(0));
+}
+
+/// Return the current thread's interpreted equality-source route count.
+pub fn io_eq_leapfrog_queries() -> usize {
+    IO_EQ_LEAPFROG_QUERIES.with(|c| c.get())
+}
+
+/// Route an already classified interpreted equality-source body through the existing unifying
+/// leapfrog join. `pat_expr` is the translated conjunction of stored-fact patterns. `sources` are
+/// the original equality left sides or positive BTM patterns, and each optional capture is the
+/// original equality right-side variable. Re-unifying those expressions against the join's
+/// reconstructed facts preserves the stock interpreted-source binding namespace.
+pub(crate) fn query_multi_i_eq_leapfrog<
+    F: FnMut(Result<&[u32], BTreeMap<(u8, u8), ExprEnv>>, Expr) -> bool,
+>(
+    map: &PathMap<()>,
+    pat_expr: Expr,
+    sources: &[ExprEnv],
+    captures: &[Option<ExprEnv>],
+    mut effect: F,
+) -> Option<usize> {
+    catch_unwind(AssertUnwindSafe(|| {
+        let body = unsafe { pat_expr.span().as_ref().unwrap() };
+        let (factors, nvars) = parse_body_factors(body)?;
+        if factors.len() != sources.len() || sources.len() != captures.len() {
+            return None;
+        }
+        if LEAPFROG_DISPATCH.with(|c| c.get()) == DispatchMode::Off {
+            return None;
+        }
+        if LEAPFROG_DISPATCH.with(|c| c.get()) != DispatchMode::All
+            && !io_eq_factors_profit_from_leapfrog(map, &factors)
+        {
+            return None;
+        }
+
+        IO_EQ_LEAPFROG_QUERIES.with(|c| c.set(c.get() + 1));
+        let var_order: Vec<usize> = (0..nvars).collect();
+        let mut candidate = 0usize;
+        let mut on_tuple = |tuple: &[Vec<u8>]| -> bool {
+            crate::space::count_unifications(1);
+            let loc = Expr { ptr: tuple[0].as_ptr().cast_mut() };
+            let capture_count = captures.iter().filter(|capture| capture.is_some()).count();
+            let mut pairs = Vec::with_capacity(sources.len() + capture_count);
+            for (factor, fact) in tuple.iter().enumerate() {
+                pairs.push((
+                    sources[factor],
+                    ExprEnv::new(
+                        (pairs.len() + 1) as u8,
+                        Expr { ptr: fact.as_ptr().cast_mut() },
+                    ),
+                ));
+            }
+            for (factor, capture) in captures.iter().enumerate() {
+                if let Some(capture) = capture {
+                    pairs.push((
+                        *capture,
+                        ExprEnv::new(
+                            (pairs.len() + 1) as u8,
+                            Expr { ptr: tuple[factor].as_ptr().cast_mut() },
+                        ),
+                    ));
+                }
+            }
+            match unify(&mut pairs) {
+                Ok(bindings) => {
+                    candidate += 1;
+                    effect(Err(bindings), loc)
+                }
+                Err(_) => true,
+            }
+        };
+        run_unify_join_stream(map, &factors, &var_order, nvars, &mut on_tuple);
+        Some(candidate)
+    }))
+    .ok()
+    .flatten()
 }
 
 /// The engine-facing dispatch entry: stream every product tuple the leapfrog accepts through the
@@ -2153,6 +2245,87 @@ pub(crate) fn bounded_fact_count(map: &PathMap<()>, factor: &Factor, cap: usize)
         n += 1;
     }
     n
+}
+
+/// Extend `out` through the ground prefix of one encoded term. A query variable stops the prefix
+/// immediately before that variable, leaving the zipper at the most selective path known without
+/// binding anything.
+fn append_ground_term_prefix(term: &EncodedTerm, out: &mut Vec<u8>) -> bool {
+    let mut offset = 0usize;
+    while offset < term.bytes.len() {
+        let tag = term.bytes[offset];
+        match byte_item(tag) {
+            Tag::NewVar | Tag::VarRef(_) => return false,
+            Tag::Arity(_) => {
+                out.push(tag);
+                offset += 1;
+            }
+            Tag::SymbolSize(size) => {
+                let end = offset + 1 + size as usize;
+                out.extend_from_slice(&term.bytes[offset..end]);
+                offset = end;
+            }
+        }
+    }
+    true
+}
+
+/// The factor path known before its first query variable, including ground structure nested in a
+/// column. Equality-source process-calculus factors therefore count the separate `petri (?)` and
+/// `petri (!)` regions instead of treating both as one `petri` relation.
+fn factor_selective_scan_path(factor: &Factor) -> Vec<u8> {
+    let mut path = factor.prefix.clone();
+    for column in &factor.cols {
+        match column {
+            FactorColumn::Var(_) => break,
+            FactorColumn::Term(term) if !append_ground_term_prefix(term, &mut path) => break,
+            FactorColumn::Term(_) => {}
+        }
+    }
+    path
+}
+
+/// Count facts under the path fixed before a factor's first variable. The value at the path itself
+/// counts too when the factor is ground.
+fn bounded_selective_fact_count(map: &PathMap<()>, factor: &Factor, cap: usize) -> usize {
+    let mut rz = map.read_zipper_at_path(&factor_selective_scan_path(factor));
+    let mut n = usize::from(rz.val().is_some());
+    while n < cap && rz.to_next_val() {
+        n += 1;
+    }
+    n
+}
+
+/// Deterministic profitability gate for interpreted equality sources. It reuses the engine's
+/// fixed fact threshold and bounded trie walks, but counts through nested ground structure because
+/// that is where source wrappers expose their selective relation. A shared variable must connect a
+/// bounded-small factor to a large one. No elapsed-time observation participates in the decision.
+fn io_eq_factors_profit_from_leapfrog(map: &PathMap<()>, factors: &[Factor]) -> bool {
+    if factors.len() < 2 {
+        return false;
+    }
+    let variables: Vec<BTreeSet<usize>> = factors
+        .iter()
+        .map(|factor| {
+            let mut vars = BTreeSet::new();
+            collect_factor_vars(factor, &mut vars);
+            vars
+        })
+        .collect();
+    let counts: Vec<usize> = factors
+        .iter()
+        .map(|factor| bounded_selective_fact_count(map, factor, DISPATCH_MIN_FACTS))
+        .collect();
+
+    (0..factors.len()).any(|left| {
+        (left + 1..factors.len()).any(|right| {
+            !variables[left].is_disjoint(&variables[right])
+                && ((counts[left] < DISPATCH_MIN_FACTS
+                    && counts[right] >= DISPATCH_MIN_FACTS)
+                    || (counts[right] < DISPATCH_MIN_FACTS
+                        && counts[left] >= DISPATCH_MIN_FACTS))
+        })
+    })
 }
 
 /// Whether [`bounded_fact_count`] is a lower bound on one single-factor component's solutions.
