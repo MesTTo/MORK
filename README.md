@@ -1,22 +1,25 @@
-# This branch: the MesTTo release lineage
+# This branch: GPT-2 runs natively in the store
 
-`metta-on-mork-base` is the kernel lineage behind
+This lineage carries the einsum/tensor sink layer that ran the full 12-layer GPT-2 (124M)
+forward pass natively inside MORK: weights and activations as expressions in the space, the
+forward pass as the kernel's own rule application through dense sinks, logits matched to the
+reference implementation at a maximum relative error of 6.06e-6 with argmax agreement, and
+exact incremental decode. The kernel-side source is `kernel/src/tensor_ops.rs`,
+`kernel/src/graph_tensor.rs`, `kernel/tests/einsum_sink.rs`, and the `linalg/` crate; the
+measurement record is the
+[metta-quantimork-transformer report](https://github.com/MesTTo/metta-on-mork/blob/main/metta-quantimork-transformer.pdf).
+The Python driving harness is not yet published.
+
+`metta-on-mork-base` is also the kernel base behind
 [metta-on-mork](https://github.com/MesTTo/metta-on-mork), the in-process Hyperon atomspace
-on MORK. It is upstream main plus the full open MesTTo PR set
+on MORK: upstream main plus the full open MesTTo PR set
 ([`upstream-plus-prs`](https://github.com/MesTTo/MORK/tree/upstream-plus-prs) is exactly
 that merge) plus the features beyond it: `stratified_quiescence`, `guarded_emit`,
-`retrieval_join`, `bulk_emit`, `witness_select`, and the einsum/tensor sink layer. Build the
-demo kernel with
+`retrieval_join`, `bulk_emit`, `witness_select`, and the tensor layer above. Build the demo
+kernel with
 `--features semi_naive_ic,leapfrog,stratified_quiescence,guarded_emit,retrieval_join,witness_select`
-(nightly, `RUSTFLAGS="-C target-cpu=native"`).
-
-The tensor layer (`kernel/src/tensor_ops.rs`, `kernel/src/graph_tensor.rs`,
-`kernel/tests/einsum_sink.rs`, and the `linalg/` crate) is the kernel-side source of the
-in-store GPT-2 result: the full 12-layer GPT-2 (124M) forward pass executes natively in the
-store, matched to the reference implementation at a maximum relative logit error of
-6.06e-6 with argmax agreement, with exact incremental decode. The measurement record is the
-[metta-quantimork-transformer report](https://github.com/MesTTo/metta-on-mork/blob/main/metta-quantimork-transformer.pdf);
-the Python driving harness is not yet published. Everything below is upstream's README.
+(nightly, `RUSTFLAGS="-C target-cpu=native --cfg gxhash"`). Everything below is upstream's
+README.
 
 ---
 
