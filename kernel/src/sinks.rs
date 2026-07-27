@@ -1119,7 +1119,6 @@ impl Sink for PureSink {
         let prz_ptr = (&prz) as *const OneFactor<_>;
         let mut changed = false;
         let mut buffer: Vec<u8> = Vec::with_capacity(1 << 32);
-        let mut wrap: Vec<u8> = Vec::new();
         let mut wargs: Vec<ExprEnv> = Vec::new();
         let mut pbuffer: Vec<u8> = Vec::new();
         let mut pstack = Vec::new();
@@ -1137,16 +1136,14 @@ impl Sink for PureSink {
                     debug_assert!(prz.path_exists());
                     let mut rz = prz.fork_read_zipper();
                     'triples: while rz.to_next_val() {
-                        // The value path is the concatenated (template pattern call) triple;
-                        // wrapping it in an Arity(3) gives the three subexpressions one shared
-                        // variable namespace, so the pattern's VarRefs resolve to the
-                        // template's introductions.
+                        // The value path is the concatenated (template pattern call) triple, the
+                        // request having stripped `(pure`. `subterms` splits the run in place and
+                        // threads the de Bruijn base across the three, so they share one variable
+                        // namespace and the pattern's VarRefs resolve to the template's
+                        // introductions.
                         let full = rz.origin_path();
-                        wrap.clear();
-                        wrap.push(item_byte(Tag::Arity(3)));
-                        wrap.extend_from_slice(full);
                         wargs.clear();
-                        ExprEnv::new(0, Expr { ptr: wrap.as_mut_ptr() }).args(&mut wargs);
+                        ExprEnv::new(0, Expr { ptr: full.as_ptr().cast_mut() }).subterms(3, &mut wargs);
                         let &[tpl_env, pat_env, call_env] = &wargs[..] else {
                             trace!(target: "sink", "pure malformed triple {}", serialize(full));
                             continue 'triples

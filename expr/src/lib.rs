@@ -1814,31 +1814,39 @@ impl ExprEnv {
         }
     }
 
+    /// Split the `k` subterms laid out consecutively at this env's focus into `dest`, threading the
+    /// de Bruijn base across them: each one's `v` is this env's `v` plus every introduction in its
+    /// preceding siblings, so all `k` resolve against a single variable namespace.
+    ///
+    /// The focus is the first subterm, not a parent tag, so this does not need the run to be
+    /// wrapped in an `Arity(k)`. That matters for the sinks, whose stored path is the bare operand
+    /// run of a fixed-arity form with the head already stripped: they call this directly on the
+    /// path with the form's operand count, rather than copying the run under a synthetic arity byte
+    /// just to hand `args` something to read `k` off.
+    pub fn subterms(&self, k: u8, dest: &mut Vec<Self>) {
+        let mut env = self.clone();
+        for _ in 0..k {
+            let (se_c, _, se_offset) = traverseh!((), (), u8, env.subsexpr(), 0,
+                |c: &mut u8, o| { *c += 1; },
+                |_, o, r| {},
+                |_, o, _| {},
+                |_, o, _| {},
+                |_, o, x, y| {},
+                |_, _, _| {});
+
+            let ne = env.clone();
+            dest.push(ne);
+            env.offset += se_offset as u32;
+            env.v += se_c;
+        }
+    }
+
     pub fn args(&self, dest: &mut Vec<Self>) {
         unsafe {
         match byte_item(*self.subsexpr().ptr) {
             Tag::NewVar | Tag::VarRef(_) | Tag::SymbolSize(_) => { }
             Tag::Arity(k) => {
-                let mut env = ExprEnv{
-                    n: self.n,
-                    v: self.v,
-                    offset: self.offset + 1,
-                    base: self.base,
-                };
-                for sk in 0..k {
-                    let (se_c, _, se_offset) = traverseh!((), (), u8, env.subsexpr(), 0,
-                        |c: &mut u8, o| { *c += 1; },
-                        |_, o, r| {},
-                        |_, o, _| {},
-                        |_, o, _| {},
-                        |_, o, x, y| {},
-                        |_, _, _| {});
-
-                    let ne = env.clone();
-                    dest.push(ne);
-                    env.offset += se_offset as u32;
-                    env.v += se_c;
-                }
+                self.offset(1).subterms(k, dest)
             }
         }
         }
