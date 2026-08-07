@@ -1168,23 +1168,23 @@ impl Sink for PureSink {
                         };
                         trace!(target: "sink", "pattern guard result {:?}", serialize(&res[..]));
 
-                        let mut pairs = vec![(pat_env, ExprEnv::new(1, Expr { ptr: res.as_mut_ptr() }))];
+                        // eval returns the result still numbered in the stored triple's
+                        // namespace, so it unifies at that base (#135), which `subterms` has
+                        // already computed as `call_env.v`.
+                        let mut pairs = vec![(pat_env, ExprEnv { n: 0, v: call_env.v, offset: 0, base: Expr { ptr: res.as_mut_ptr() } })];
                         match unify(&mut pairs) {
                             Ok(bindings) => {
                                 pbuffer.clear();
                                 if let (_, _, true) = mork_expr::apply_e_clears_stacks_and_cycles_check!(0, 0, 0, tpl_env.subsexpr(), &bindings, pbuffer, pstack, passignments) {
+                                    // The root is a proper prefix of the template and the
+                                    // template's prefix holds no variables, so an instantiation
+                                    // always extends the root by at least one byte.
                                     let rooted = wz.root_prefix_path().len();
-                                    if pbuffer.len() > rooted {
-                                        trace!(target: "sink", "pattern guard emit '{}'", serialize(&pbuffer[..]));
-                                        wz.move_to_path(&pbuffer[rooted..]);
-                                        wz.set_val(());
-                                        changed |= true;
-                                    } else {
-                                        // A fully constant template makes the write request root
-                                        // cover the whole sink expression; nothing can be emitted
-                                        // below it. Same limitation as the variable arms.
-                                        trace!(target: "sink", "pure template within its request root, skipping");
-                                    }
+                                    debug_assert!(pbuffer.len() > rooted);
+                                    trace!(target: "sink", "pattern guard emit '{}'", serialize(&pbuffer[..]));
+                                    wz.move_to_path(&pbuffer[rooted..]);
+                                    wz.set_val(());
+                                    changed |= true;
                                 }
                             }
                             Err(f) => {

@@ -1225,6 +1225,72 @@ fn sink_pure_symbol_guard() {
     assert_eq!(res, "(ok 123)\n");
 }
 
+fn sink_pure_constant_template_guard() {
+    let mut s = Space::new();
+
+    // A guard whose template holds no variable must still emit. reverse_symbol(123) is
+    // 321, so the accepting guards are execs 0, 1 and 3, and the rejecting ones are
+    // execs 2 and 5. Templates: 0 and 1 are constant (a bare symbol and a compound),
+    // 3 and 5 carry a variable, and 4 reaches a constant template through the NewVar
+    // arm rather than the pattern arm.
+    //
+    // The controls are what make a missing `yes` diagnostic rather than ambiguous.
+    // exec 3 emitting proves the guard accepts, so `yes` and `(ok const)` are not being
+    // rejected. exec 4 emitting proves a constant template is representable at all, so
+    // they are not being dropped for want of somewhere to live. exec 5 staying absent
+    // pins rejection independently of the constant-template question, which exec 2
+    // alone cannot do since it is both rejecting and constant.
+    const SPACE_EXPRS: &str = r#"
+(exec 0 (,) (O (pure yes 321 (reverse_symbol 123))))
+(exec 1 (,) (O (pure (ok const) 321 (reverse_symbol 123))))
+(exec 2 (,) (O (pure (no const) 999 (reverse_symbol 123))))
+(exec 3 (,) (O (pure (ctl $z) 321 (reverse_symbol 123))))
+(exec 4 (,) (O (pure ignored $ (reverse_symbol 123))))
+(exec 5 (,) (O (pure (rej $z) 999 (reverse_symbol 123))))
+    "#;
+
+    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_sexpr(expr!(s, "$"), expr!(s, "_1"), &mut v);
+    let dumped = String::from_utf8_lossy_owned(v);
+    let mut lines: Vec<&str> = dumped.lines().filter(|l| !l.is_empty()).collect();
+    lines.sort();
+    let res = lines.join("\n");
+
+    println!("result: {res}");
+    assert_eq!(res, "(ctl $a)\n(ok const)\nignored\nyes");
+}
+
+fn sink_pure_compound_quoted_variable_identity() {
+    let mut s = Space::new();
+
+    // #135 through the pattern arm. eval preserves the numbering of the expression it
+    // was handed, so a variable introduced inside the call comes back carrying its index
+    // in the sink expression's namespace; unifying the result in a fresh namespace left
+    // the repeated reference dangling and it printed as a fresh variable.
+    const SPACE_EXPRS: &str = r#"
+(exec 0 (,) (O (pure (C $x) (Q $x) (tuple Q (' ($a $a))))))
+    "#;
+
+    s.add_all_sexpr(SPACE_EXPRS.as_bytes()).unwrap();
+
+    let mut t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    println!("elapsed {} steps {} size {}", t0.elapsed().as_millis(), steps, s.btm.val_count());
+
+    let mut v = vec![];
+    s.dump_sexpr(expr!(s, "[2] C $"), expr!(s, "[2] C _1"), &mut v);
+    let res = String::from_utf8_lossy_owned(v);
+
+    println!("result: {res}");
+    assert_eq!(res, "(C ($a $a))\n");
+}
+
 fn sink_pure_compound_multiplicity() {
     let mut s = Space::new();
 
@@ -3486,6 +3552,40 @@ fn sink_wasm_add() {
 
     // println!("result: {res}");
     // assert_eq!(res, "(1 x P)\n(2 x P)\n(3 x P)\n(1 y P)\n(2 y P)\n(3 y P)\n(1 x Q)\n")
+}
+
+/// The pure sink's two capture arms over the same workload, so the cost of the bare-var
+/// specialization against the generic pattern arm is a direct comparison rather than an
+/// argument. Both do one `tuple` evaluation per row and emit one expression per row; they
+/// differ only in how the result is captured, which is the thing being measured.
+///
+/// `which`: "var" is the specialized arm, `(pure (out $c) $c ...)`, whose pattern is a bare
+/// var-ref. "compound" is the generic arm, `(pure (out $x $y) ($x $y) ...)`, whose pattern
+/// leads with an arity byte. "guard" is the generic arm's rejecting path, where the pattern
+/// is a ground symbol that never matches, so no template is ever instantiated.
+fn bench_sink_pure(which: &str, rows: usize) {
+    let mut s = Space::new();
+
+    let sink = match which {
+        "var" => "(pure (out $c) $c (tuple $i $i))",
+        "compound" => "(pure (out $x $y) ($x $y) (tuple $i $i))",
+        "guard" => "(pure (out $i) nomatch (tuple $i $i))",
+        _ => { println!("unknown pure bench arm: {which}"); return }
+    };
+    let program = format!("(exec 0 (, (N $i))\n        (O {sink}))\n");
+
+    let facts: String = (0..rows).map(|x| format!("(N {x})\n")).collect();
+    s.add_all_sexpr(facts.as_bytes()).unwrap();
+    s.add_all_sexpr(program.as_bytes()).unwrap();
+
+    // The counters are process-cumulative statics, so take them as deltas across the run
+    // -- otherwise every arm after the first reports the ones before it too.
+    let (u0, w0, t0c) = unsafe { (unifications, writes, transitions) };
+    let t0 = Instant::now();
+    let steps = s.metta_calculus(1000000000000000);
+    let (u1, w1, t1c) = unsafe { (unifications, writes, transitions) };
+    println!("arm {} rows {} elapsed {} steps {} size {}", which, rows, t0.elapsed().as_millis(), steps, s.btm.val_count());
+    println!("unifications {}, writes {}, transitions {}", u1 - u0, w1 - w0, t1c - t0c);
 }
 
 fn bench_sink_odd_even_sort(elements: usize) {
@@ -6275,6 +6375,7 @@ fn main() {
             if selected.remove("default") { selected.extend(&["taxi_lts", "counter_machine", "transitive", "clique", "finite_domain", "process_calculus", "tile_puzzle_states", "bfc"]) }
             if selected.remove("all") { selected.extend(&["taxi_lts", "counter_machine", "transitive", "clique", "finite_domain", "process_calculus", "exponential", "exponential_fringe", "odd_even_sort", "logic_query", "tile_puzzle_states", "bfc"]) }
             if selected.remove("sinks") { selected.extend(&["taxi_lts", "odd_even_sort"]) }
+            if selected.remove("pure") { selected.extend(&["pure_var", "pure_compound", "pure_guard"]) }
 
             for b in selected {
                 println!("=== benchmarking {} ===", b);
@@ -6287,6 +6388,9 @@ fn main() {
                     "exponential" => { exponential(32); }
                     "exponential_fringe" => { exponential_fringe(15); }
                     "odd_even_sort" => { bench_sink_odd_even_sort(2000); }
+                    "pure_var" => { bench_sink_pure("var", 100_000); }
+                    "pure_compound" => { bench_sink_pure("compound", 100_000); }
+                    "pure_guard" => { bench_sink_pure("guard", 100_000); }
                     "logic_query" => { bench_logic_query() }
                     "logic_query_act" => { bench_logic_query_act() }
                     "flybase" => { bench_flybase() }
@@ -6369,6 +6473,8 @@ fn main() {
             sink_pure_compound_capture();
             sink_pure_pattern_rejection();
             sink_pure_symbol_guard();
+            sink_pure_constant_template_guard();
+            sink_pure_compound_quoted_variable_identity();
             sink_pure_compound_multiplicity();
             sink_bass64url_ident();
             sink_hex_ident();
